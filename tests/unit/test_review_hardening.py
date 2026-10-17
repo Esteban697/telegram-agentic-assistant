@@ -217,7 +217,11 @@ def test_a_configured_development_box_warns_about_nothing_by_default() -> None:
 
 def test_production_never_produces_access_warnings() -> None:
     settings = make_settings(
-        app_env="production", store_backend="postgres", telegram_allowed_user_ids=frozenset({1})
+        app_env="production",
+        store_backend="postgres",
+        telegram_allowed_user_ids=frozenset({1}),
+        gcs_bucket="b",
+        google_cloud_project="p",
     )
     assert settings.access_warnings() == []
 
@@ -325,6 +329,8 @@ def _production(**overrides: object) -> object:
         "app_env": "production",
         "store_backend": "postgres",
         "telegram_allowed_user_ids": frozenset({1}),
+        "gcs_bucket": "b",
+        "google_cloud_project": "p",
     }
     base.update(overrides)
     return make_settings(**base)

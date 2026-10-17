@@ -83,6 +83,53 @@ class Settings(BaseSettings):
     request_budget_seconds: float = Field(default=45.0, gt=0)
     rate_limit_per_minute: int = Field(default=20, gt=0)
 
+    # --- Documents and RAG (Phase 4) ---------------------------------------- #
+    # `vertex` everywhere for the application (§13.1, decided 2026-10-17): one provider, one code
+    # path, 768 dimensions. `stub` is the lexical double the credential-free suites use, and it is
+    # a production startup error.
+    embed_provider: Literal["vertex", "stub"] = "vertex"
+    embed_model: str = "gemini-embedding-001"
+    embed_dim: int = Field(default=768, gt=0)
+    embed_timeout_seconds: float = Field(default=30.0, gt=0)
+    google_cloud_project: str = ""
+    google_cloud_region: str = "europe-west1"
+    gcs_bucket: str = ""
+    max_upload_mb: int = Field(default=20, gt=0)
+    max_pdf_pages: int = Field(default=200, gt=0)
+    max_ingest_seconds: float = Field(default=120.0, gt=0)
+    rag_chunk_chars: int = Field(default=1500, gt=0)
+    rag_chunk_overlap_chars: int = Field(default=200, ge=0)
+    rag_chunk_max_chars: int = Field(default=4000, gt=0)
+    rag_chunk_min_chars: int = Field(default=200, ge=0)
+    rag_top_k: int = Field(default=5, gt=0)
+    rag_max_context_chars: int = Field(default=6000, gt=0)
+    # The retrieval floor, in cosine similarity, applied in the single chokepoint. It is a
+    # **degenerate-match filter, not a relevance threshold**, and the difference is measured, not
+    # stylistic:
+    #
+    # * with the lexical stub it removes exactly the chunks that share no content word with the
+    #   query (they score 0.0000, while the weakest genuine match on the fixture corpus scores
+    #   0.1931);
+    # * on the **deployed** provider it removes nothing. Measured with `gemini-embedding-001` on
+    #   the two-page live fixture: the page that answers the question scored 0.7332 and an
+    #   unrelated question scored 0.5425 — Vertex compresses "unrelated" and "paraphrase" into one
+    #   band, so **no single global threshold separates them**. A floor between those two numbers
+    #   (0.55) would also reject legitimate paraphrases: rephrased questions whose answer *is* in
+    #   the corpus score 0.25-0.28 with the stub.
+    #
+    # The no-evidence rule therefore does not live here: it is carried by the prompt (spec §9
+    # "Instruir al modelo para distinguir entre evidencia, inferencia e información no
+    # encontrada"), which receives the scores and the excerpts and judges. `search_documents`
+    # reports `found`, `evidence`, `best_score` and this floor so that judgement has something
+    # truthful to work with. The earlier default (0.35) and the note that called it "the
+    # relevance floor" both claimed a separation that does not exist on the shipping provider.
+    rag_min_score: float = Field(default=0.10, ge=0.0, le=1.0)
+    # The *ceiling* for inline ingestion (spec §6.1: inline only if the budget allows). It is a
+    # ceiling, not a deadline: `main.py` takes the smaller of this and a fraction of
+    # REQUEST_BUDGET_SECONDS, so a deliberately tight request budget is never exceeded by an
+    # ingest that was configured to run for longer. The rest belongs to the Phase 5 job.
+    ingest_inline_budget_seconds: float = Field(default=30.0, gt=0)
+
     # --- Approvals (Phase 3) ------------------------------------------------ #
     # Spec §12: APPROVAL_TTL_MINUTES. An approval is only valid for this long, and the claim
     # re-checks it, so a stale button cannot execute an action hours later.
@@ -243,12 +290,44 @@ class Settings(BaseSettings):
         if self.notifications_transport == "record" and not self.notify_record_path:
             found.append("NOTIFICATIONS_TRANSPORT=record requires NOTIFY_RECORD_PATH")
 
+        if self.rag_chunk_overlap_chars >= self.rag_chunk_chars:
+            found.append(
+                "RAG_CHUNK_OVERLAP_CHARS must be smaller than RAG_CHUNK_CHARS, or the splitter "
+                "cannot make progress"
+            )
+        if self.rag_chunk_chars > self.rag_chunk_max_chars:
+            found.append("RAG_CHUNK_CHARS must not exceed RAG_CHUNK_MAX_CHARS")
+        if self.rag_chunk_max_chars > self.rag_max_context_chars:
+            # Otherwise the largest chunk a retriever can emit cannot fit in the context the
+            # model is given, and every answer would be assembled from a truncated passage —
+            # quietly, because the block renderer keeps the citation either way.
+            found.append(
+                "RAG_CHUNK_MAX_CHARS must not exceed RAG_MAX_CONTEXT_CHARS: the largest chunk "
+                "could never fit in the context sent to the model, so retrieval would answer "
+                "from a truncated passage "
+                f"({self.rag_chunk_max_chars} > {self.rag_max_context_chars})"
+            )
+        if self.embed_provider == "vertex" and not self.google_cloud_project:
+            found.append(
+                "EMBED_PROVIDER=vertex requires GOOGLE_CLOUD_PROJECT (and Application Default "
+                "Credentials: `gcloud auth application-default login`)"
+            )
+
         # --- The fail-fast list of PLAN.md §7.2 (production only) ---------- #
         if self.app_env == "production":
             if self.store_backend == "memory":
                 found.append(
                     "STORE_BACKEND=memory is not allowed in production: the in-memory "
                     "stores lose update-id idempotency across instances (PLAN.md §7.2)"
+                )
+            if self.embed_provider == "stub":
+                found.append(
+                    "EMBED_PROVIDER=stub is not allowed in production: it is the lexical test "
+                    "double, not an embedding model"
+                )
+            if not self.gcs_bucket:
+                found.append(
+                    "GCS_BUCKET is required in production: originals must be stored durably"
                 )
             if self.notifications_transport == "record":
                 found.append(

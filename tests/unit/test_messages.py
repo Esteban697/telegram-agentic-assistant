@@ -88,6 +88,9 @@ _ALLOWED_PLACEHOLDERS = frozenset(
         "preview",
         "minutes",
         "detail",
+        "name",
+        "chunks",
+        "pages",
     }
 )
 

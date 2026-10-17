@@ -102,8 +102,19 @@ class EmbeddingProvider(Protocol):
     model: str
     dim: int
 
-    async def embed(self, texts: list[str], *, timeout: float | None = None) -> list[list[float]]:
-        """Return one vector per input text."""
+    async def embed(
+        self,
+        texts: list[str],
+        *,
+        timeout: float | None = None,
+        task: str = "document",
+    ) -> list[list[float]]:
+        """Return one vector per input text.
+
+        ``task`` is ``"document"`` for chunk ingestion and ``"query"`` for a search, because the
+        production model declares the two sides differently (asymmetric retrieval). A provider
+        that cannot honour it must still accept the parameter, so the port stays uniform.
+        """
         ...
 
 

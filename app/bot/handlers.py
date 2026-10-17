@@ -85,6 +85,8 @@ class TelegramHandlers:
         approvals: ApprovalService | None = None,
         work_queue: WorkQueue | None = None,
         registry: ToolRegistry | None = None,
+        ingestion: Any | None = None,
+        document_tools: Any | None = None,
     ) -> None:
         self._settings = settings
         self._telegram = telegram
@@ -95,6 +97,8 @@ class TelegramHandlers:
         self._approvals = approvals
         self._queue = work_queue
         self._registry = registry
+        self._ingestion = ingestion
+        self._documents = document_tools
 
     # ------------------------------------------------------------------ #
     # Entry point
@@ -119,8 +123,18 @@ class TelegramHandlers:
         self, update: dict[str, Any], identity: TelegramIdentity
     ) -> HandlerOutcome:
         message = update.get("message") or {}
-        text = _text_of(message)
 
+        # **The document branch comes first.** `_text_of` returns `caption` when there is no
+        # `text`, so a PDF sent with a caption ("aquí tienes el contrato") took the text branch
+        # and the file was silently ignored — documented Telegram behaviour, not an edge case.
+        document = message.get("document")
+        if isinstance(document, dict):
+            if self._ingestion is not None:
+                return await self._ingest_document(identity, document)
+            await self._reply(identity.chat_id, messages.render("documents.unavailable"))
+            return HandlerOutcome(status=STATUS_IGNORED, replied=True, detail="documents_disabled")
+
+        text = _text_of(message)
         if text is None:
             await self._reply(identity.chat_id, messages.render("unsupported.content"))
             return HandlerOutcome(status=STATUS_PROCESSED, replied=True, detail="unsupported_content")
@@ -136,6 +150,59 @@ class TelegramHandlers:
             )
 
         return await self._run_turn(text, identity, update_id=update.get("update_id"))
+
+    async def _ingest_document(
+        self, identity: TelegramIdentity, document: dict[str, Any]
+    ) -> HandlerOutcome:
+        """Spec §9 stage 1: a document arrives by Telegram, and the pipeline indexes it."""
+
+        from app.errors import CapabilityUnavailable
+
+        assert self._ingestion is not None
+        try:
+            downloaded = await self._telegram.get_file(
+                file_id=str(document.get("file_id", "")),
+                max_bytes=self._settings.max_upload_mb * 1024 * 1024,
+            )
+            outcome = await self._ingestion.ingest(
+                user_id=identity.user_id,
+                filename=str(document.get("file_name") or "documento.pdf"),
+                data=downloaded.content,
+                declared_mime=str(document.get("mime_type") or "application/octet-stream"),
+            )
+        except CapabilityUnavailable as exc:
+            await self._reply(identity.chat_id, messages.render(exc.message_key))
+            return HandlerOutcome(status=STATUS_IGNORED, replied=True, detail=exc.code)
+        except AssistantError as exc:
+            _logger.warning("document ingest failed", extra=exc.as_log_fields())
+            await self._reply(identity.chat_id, messages.render(exc.message_key))
+            return HandlerOutcome(status=STATUS_FAILED, replied=True, detail=exc.code)
+
+        if outcome.deduplicated:
+            await self._reply(identity.chat_id, messages.render("documents.already_indexed"))
+            return HandlerOutcome(status=STATUS_PROCESSED, replied=True, detail="deduplicated")
+
+        if outcome.status != "ready":
+            # The loser of a concurrent `ON CONFLICT` race on the same bytes comes back
+            # `status="pending", chunk_count=0`, and the inline budget running out comes back
+            # `pending` too. Falling through to "He indexado «x»: 0 fragmentos" told the user the
+            # document was searchable when nothing had been written yet — and if the winner's
+            # ingest then failed, that claim was never corrected.
+            await self._reply(identity.chat_id, messages.render("documents.queued"))
+            return HandlerOutcome(
+                status=STATUS_PROCESSED, replied=True, detail=f"not_ready:{outcome.status}"
+            )
+
+        await self._reply(
+            identity.chat_id,
+            messages.render(
+                "documents.indexed",
+                name=str(document.get("file_name") or "documento.pdf"),
+                chunks=outcome.chunk_count,
+                pages=outcome.page_count or 0,
+            ),
+        )
+        return HandlerOutcome(status=STATUS_PROCESSED, replied=True, detail="ingested")
 
     async def _handle_edited_message(
         self, update: dict[str, Any], identity: TelegramIdentity

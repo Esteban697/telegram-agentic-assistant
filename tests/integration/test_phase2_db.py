@@ -561,6 +561,9 @@ async def test_search_chunks_filters_by_owner_and_document_version(db_settings) 
                 query_embedding=[0.1] * 768,
                 embed_model="embeddinggemma",
                 top_k=5,
+                # Explicit: a floor is required now, so "no floor" is a decision rather than a
+                # forgotten default.
+                min_score=0.0,
             )
 
         assert len(matches) == 1

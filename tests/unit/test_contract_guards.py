@@ -15,6 +15,12 @@ APP = REPO / "app"
 
 VECTOR_DISTANCE_ATTRS = frozenset({"cosine_distance", "l2_distance", "max_inner_product"})
 SQL_CALLS = frozenset({"text", "execute", "exec_driver_sql", "from_statement", "literal_column"})
+# The raw pgvector distance operators. A second retrieval path does not have to use the
+# SQLAlchemy construct: `sa.text("SELECT ... ORDER BY embedding <=> :v")` is the same vector
+# ordering and the attribute scan walks straight past it. That was the gap in this guard — it
+# only ever looked for `.cosine_distance`.
+VECTOR_OPERATORS = ("<=>", "<->", "<#>")
+CHOKEPOINT_FUNCTION = "search_chunks"
 
 
 def _modules() -> list[Path]:
@@ -41,23 +47,67 @@ def _callee_name(node: ast.Call) -> str:
 # --------------------------------------------------------------------------- #
 # item 6: the vector chokepoint, over the whole tree
 # --------------------------------------------------------------------------- #
+def function_offences(
+    tree: ast.AST, *, label: str, chokepoint: str = CHOKEPOINT_FUNCTION
+) -> list[str]:
+    """Every non-chokepoint function in `tree` that orders by vector distance.
+
+    Two shapes count, because a second retrieval path can take either:
+
+    * a SQLAlchemy distance construct (`Chunk.embedding.cosine_distance(...)`);
+    * a **raw pgvector operator inside a SQL string** (`sa.text("... ORDER BY embedding <=> :v")`),
+      which the attribute scan alone never saw.
+    """
+
+    found: set[str] = set()
+    for node in _functions(tree):
+        if node.name == chokepoint:
+            continue
+        for inner in ast.walk(node):
+            if isinstance(inner, ast.Attribute) and inner.attr in VECTOR_DISTANCE_ATTRS:
+                found.add(f"{label}::{node.name} (.{inner.attr})")
+            elif isinstance(inner, ast.Call) and _callee_name(inner) in SQL_CALLS:
+                # Only string *arguments to SQL calls*: a docstring that mentions `<=>` is
+                # documentation, not a retrieval path.
+                for constant in ast.walk(inner):
+                    if not isinstance(constant, ast.Constant) or not isinstance(
+                        constant.value, str
+                    ):
+                        continue
+                    for operator in VECTOR_OPERATORS:
+                        if operator in constant.value:
+                            found.add(f"{label}::{node.name} ({operator} in SQL)")
+                            break
+    # A set, because one SQL string can be reached through two nested calls (`execute(text(...))`);
+    # the offence is the function, not the number of ways to walk to the string.
+    return sorted(found)
+
+
+def vector_ordering_offenders(app_root: Path = APP) -> list[str]:
+    """Scan `app_root` for vector ordering outside the single chokepoint."""
+
+    offenders: list[str] = []
+    for module in sorted(
+        path for path in app_root.rglob("*.py") if "__pycache__" not in path.parts
+    ):
+        tree = ast.parse(module.read_text(encoding="utf-8"))
+        offenders.extend(function_offences(tree, label=module.name))
+    return offenders
+
+
 def test_only_search_chunks_issues_a_vector_distance_ordering() -> None:
     """PLAN.md §6.5: exactly one function may order by vector distance."""
 
-    offenders: list[str] = []
-    for module in _modules():
-        tree = ast.parse(module.read_text(encoding="utf-8"))
-        for node in _functions(tree):
-            if node.name == "search_chunks":
-                continue
-            for inner in ast.walk(node):
-                if isinstance(inner, ast.Attribute) and inner.attr in VECTOR_DISTANCE_ATTRS:
-                    offenders.append(f"{module.relative_to(REPO)}::{node.name}")
+    offenders = vector_ordering_offenders()
     assert offenders == [], f"vector ordering outside search_chunks: {offenders}"
 
 
 def test_the_chokepoint_scan_actually_would_catch_a_second_path(tmp_path: Path) -> None:
-    """A guard that cannot fail is worthless: prove the detector fires on a planted offender."""
+    """A guard that cannot fail is worthless: prove the detector fires on planted offenders.
+
+    Two plants, because the first version of this proof only exercised the attribute branch and
+    the raw operator was the hole.
+    """
 
     planted = tmp_path / "documents.py"
     planted.write_text(
@@ -69,14 +119,41 @@ def test_the_chokepoint_scan_actually_would_catch_a_second_path(tmp_path: Path) 
         "    )\n",
         encoding="utf-8",
     )
-    tree = ast.parse(planted.read_text(encoding="utf-8"))
-    found = [
-        inner.attr
-        for node in _functions(tree)
-        for inner in ast.walk(node)
-        if isinstance(inner, ast.Attribute) and inner.attr in VECTOR_DISTANCE_ATTRS
-    ]
-    assert found == ["cosine_distance"], "the detector must find a planted second retrieval path"
+    found = function_offences(
+        ast.parse(planted.read_text(encoding="utf-8")), label="documents.py"
+    )
+    assert "documents.py::sneaky_search (.cosine_distance)" in found, (
+        f"the detector must find a planted second retrieval path: {found}"
+    )
+    assert "documents.py::sneaky_search (<=> in SQL)" in found, (
+        f"the raw operator inside the same plant must be caught too: {found}"
+    )
+
+    raw = tmp_path / "raw.py"
+    raw.write_text(
+        "import sqlalchemy as sa\n"
+        "async def sneaky_raw_search(session, embedding):\n"
+        "    return await session.execute(\n"
+        "        sa.text('SELECT id FROM document_chunks ORDER BY embedding <=> :v LIMIT 5')\n"
+        "    )\n",
+        encoding="utf-8",
+    )
+    raw_found = function_offences(ast.parse(raw.read_text(encoding="utf-8")), label="raw.py")
+    assert raw_found == ["raw.py::sneaky_raw_search (<=> in SQL)"], (
+        f"a raw `<=>` inside sa.text() is a second retrieval path and must be caught: {raw_found}"
+    )
+
+
+def test_the_chokepoint_scan_does_not_flag_the_chokepoint_itself() -> None:
+    """The negative side: the single legitimate function must not be reported."""
+
+    source = (APP / "storage" / "repositories.py").read_text(encoding="utf-8")
+    assert function_offences(ast.parse(source), label="repositories.py") == []
+    chokepoint = [node for node in _functions(ast.parse(source)) if node.name == "search_chunks"]
+    assert chokepoint, "precondition: the chokepoint function must exist"
+    assert function_offences(
+        ast.parse(source), label="repositories.py", chokepoint="not-the-chokepoint"
+    ), "precondition: the chokepoint itself would be flagged if it were not exempt"
 
 
 # --------------------------------------------------------------------------- #

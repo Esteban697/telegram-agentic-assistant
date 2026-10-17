@@ -21,6 +21,7 @@ Four things in this module are load-bearing and were heavily reviewed:
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from collections.abc import Sequence
@@ -786,6 +787,333 @@ async def upsert_embedding_model(
         )
 
 
+@dataclass(frozen=True, slots=True)
+class DocumentRows:
+    """The columns the ingestion pipeline actually needs."""
+
+    id: UUID
+    user_id: int
+    original_filename: str
+    sanitized_filename: str
+    mime_type: str
+    size_bytes: int
+    content_sha256: str
+    ingest_status: str
+    pipeline_version: int
+    chunk_count: int
+    gcs_uri: str
+    page_count: int | None
+    delete_state: str
+
+
+# There is no `_DOCUMENT_COLUMNS` constant here any more: it was a second, unused copy of the
+# column list that the three statements below already spell out, so it could only drift.
+
+
+# The document reads below use pre-built statements rather than f-strings: §7.3's guard
+# forbids an f-string reaching `sa.text()`, and a column list is not an exception.
+_SELECT_DOCUMENT = (
+    "SELECT id, user_id, original_filename, sanitized_filename, mime_type, size_bytes, content_sha256, ingest_status, pipeline_version, chunk_count, gcs_uri, page_count, delete_state "
+    "FROM documents "
+)
+_FIND_DOCUMENT_BY_HASH = (
+    _SELECT_DOCUMENT
+    + "WHERE user_id = :user_id AND content_sha256 = :sha "
+    + "AND pipeline_version = :version AND deleted_at IS NULL"
+)
+_GET_DOCUMENT = (
+    _SELECT_DOCUMENT
+    + "WHERE id = :id AND user_id = :user_id AND deleted_at IS NULL"
+)
+_CLAIM_DOCUMENT_RETURNING = (
+    "UPDATE documents SET ingest_status = 'processing', claimed_at = now(), "
+    "claimed_by = :executor, attempts = attempts + 1, updated_at = now() "
+    "WHERE id = :id AND (ingest_status IN ('pending', 'failed') "
+    "OR (ingest_status = 'processing' "
+    "AND claimed_at < now() - interval '15 minutes')) "
+    "RETURNING id, user_id, original_filename, sanitized_filename, mime_type, size_bytes, "
+    "content_sha256, ingest_status, pipeline_version, chunk_count, gcs_uri, page_count, "
+    "delete_state"
+)
+_LIST_READY_DOCUMENTS = (
+    _SELECT_DOCUMENT
+    + "WHERE user_id = :user_id AND ingest_status = 'ready' "
+    + "AND deleted_at IS NULL ORDER BY created_at"
+)
+def _as_document(row: Any) -> DocumentRows:
+    return DocumentRows(
+        id=row[0],
+        user_id=row[1],
+        original_filename=row[2],
+        sanitized_filename=row[3],
+        mime_type=row[4],
+        size_bytes=row[5],
+        content_sha256=row[6],
+        ingest_status=row[7],
+        pipeline_version=row[8],
+        chunk_count=row[9],
+        gcs_uri=row[10],
+        page_count=row[11],
+        delete_state=row[12],
+    )
+
+
+async def find_document_by_hash(
+    session: AsyncSession, *, user_id: int, content_sha256: str, pipeline_version: int
+) -> DocumentRows | None:
+    """The ingestion idempotency lookup (spec §9 "idempotente por hash ... y versión")."""
+
+    row = (
+        await session.execute(
+            sa.text(_FIND_DOCUMENT_BY_HASH).bindparams(
+                user_id=user_id, sha=content_sha256, version=pipeline_version
+            )
+        )
+    ).first()
+    return None if row is None else _as_document(row)
+
+
+async def get_document(
+    session: AsyncSession, *, user_id: int, document_id: UUID
+) -> DocumentRows | None:
+    """Owner-scoped: another user's id is a not-found, never a permission error (§6.5)."""
+
+    row = (
+        await session.execute(
+            sa.text(_GET_DOCUMENT).bindparams(id=document_id, user_id=user_id)
+        )
+    ).first()
+    return None if row is None else _as_document(row)
+
+
+async def create_document(
+    session: AsyncSession,
+    *,
+    user_id: int,
+    original_filename: str,
+    sanitized_filename: str,
+    mime_type: str,
+    size_bytes: int,
+    content_sha256: str,
+    gcs_uri: str,
+    pipeline_version: int,
+) -> UUID | None:
+    """Insert as `pending`. `None` means the same bytes are already being ingested."""
+
+    row = (
+        await session.execute(
+            sa.text(
+                """
+                INSERT INTO documents (user_id, original_filename, sanitized_filename, mime_type,
+                                       size_bytes, content_sha256, gcs_uri, pipeline_version,
+                                       ingest_status)
+                VALUES (:user_id, :original_filename, :sanitized_filename, :mime_type, :size_bytes,
+                        :sha, :gcs_uri, :pipeline_version, 'pending')
+                ON CONFLICT (user_id, content_sha256, pipeline_version)
+                    WHERE deleted_at IS NULL
+                DO NOTHING
+                RETURNING id
+                """
+            ).bindparams(
+                user_id=user_id,
+                original_filename=original_filename,
+                sanitized_filename=sanitized_filename,
+                mime_type=mime_type,
+                size_bytes=size_bytes,
+                sha=content_sha256,
+                gcs_uri=gcs_uri,
+                pipeline_version=pipeline_version,
+            )
+        )
+    ).scalar_one_or_none()
+    return row
+
+
+async def claim_document(
+    session: AsyncSession, *, document_id: UUID, executor: str
+) -> DocumentRows | None:
+    """Claim a pending (or lease-expired) document for ingestion.
+
+    The lease is what lets a crashed ingest be reclaimed without two workers owning it.
+    """
+
+    row = (
+        await session.execute(
+            sa.text(_CLAIM_DOCUMENT_RETURNING).bindparams(
+                id=document_id, executor=executor
+            )
+        )
+    ).first()
+    return None if row is None else _as_document(row)
+
+
+async def mark_document_failed(
+    session: AsyncSession, *, document_id: UUID, error: str
+) -> None:
+    await session.execute(
+        sa.text(
+            "UPDATE documents SET ingest_status = 'failed', ingest_error = :error, "
+            "updated_at = now() WHERE id = :id"
+        ).bindparams(id=document_id, error=error[:500])
+    )
+
+
+async def mark_document_ready(
+    session: AsyncSession,
+    *,
+    document_id: UUID,
+    chunk_count: int,
+    page_count: int | None,
+    pipeline_version: int | None = None,
+) -> int:
+    """`finalize` (stage 10): `ready` only after every chunk is committed (spec §9.9).
+
+    **The version is stamped here, in the same statement that flips the row to `ready`.** The
+    retrieval join compares `documents.pipeline_version` with `chunks.pipeline_version`, so a row
+    that reached `ready` without its version being stamped while its chunks were written at a
+    higher one would be `ready` with **zero retrievable chunks** — the invariant this schema
+    exists to protect. Stamping at finalize is also what keeps the previous index answering for
+    the whole duration of a re-index.
+    """
+
+    result = await session.execute(
+        sa.text(
+            "UPDATE documents SET ingest_status = 'ready', chunk_count = :chunks, "
+            "page_count = :pages, ingest_error = NULL, updated_at = now(), "
+            "pipeline_version = COALESCE(:version, pipeline_version) "
+            "WHERE id = :id AND ingest_status = 'processing'"
+        ).bindparams(
+            id=document_id, chunks=chunk_count, pages=page_count, version=pipeline_version
+        )
+    )
+    return int(result.rowcount or 0)
+
+
+async def release_document_claim(session: AsyncSession, *, document_id: UUID) -> None:
+    """Put a claimed document back in the queue without marking it failed (spec §6.1)."""
+
+    await session.execute(
+        sa.text(
+            "UPDATE documents SET ingest_status = 'pending', claimed_at = NULL, "
+            "claimed_by = NULL, updated_at = now() WHERE id = :id "
+            "AND ingest_status = 'processing'"
+        ).bindparams(id=document_id)
+    )
+
+
+async def insert_chunks(
+    session: AsyncSession, *, document_id: UUID, owner_user_id: int, pipeline_version: int,
+    embed_model: str, chunks: Sequence[dict[str, Any]],
+) -> int:
+    """Stage 9: one statement per batch, converging on retry.
+
+    The conflict target is the **three-part** chunk key, so a retry inside one version updates
+    rather than duplicates, while a different version legitimately produces its own rows
+    (RB3-follow-on).
+    """
+
+    if not chunks:
+        return 0
+    payload = [
+        {
+            "chunk_index": chunk["chunk_index"],
+            "page_number": chunk.get("page_number"),
+            "text": chunk["text"],
+            "char_count": chunk.get("char_count", len(chunk["text"])),
+            "embedding": str(chunk["embedding"]),
+        }
+        for chunk in chunks
+    ]
+    result = await session.execute(
+        sa.text(
+            """
+            INSERT INTO document_chunks (document_id, owner_user_id, chunk_index, page_number,
+                                         text, char_count, embedding, embed_model,
+                                         pipeline_version)
+            SELECT :document_id, :owner_user_id, (item->>'chunk_index')::int,
+                   NULLIF(item->>'page_number', '')::int, item->>'text',
+                   (item->>'char_count')::int, CAST(item->>'embedding' AS vector), :embed_model,
+                   :pipeline_version
+              FROM jsonb_array_elements(CAST(:payload AS jsonb)) AS item
+            ON CONFLICT (document_id, pipeline_version, chunk_index) DO UPDATE
+               SET text = EXCLUDED.text, char_count = EXCLUDED.char_count,
+                   page_number = EXCLUDED.page_number, embedding = EXCLUDED.embedding,
+                   embed_model = EXCLUDED.embed_model
+            """
+        ).bindparams(
+            document_id=document_id,
+            owner_user_id=owner_user_id,
+            embed_model=embed_model,
+            pipeline_version=pipeline_version,
+            payload=json.dumps(payload),
+        )
+    )
+    return int(result.rowcount or 0)
+
+
+async def count_chunks(
+    session: AsyncSession, *, document_id: UUID, pipeline_version: int | None = None
+) -> int:
+    query = "SELECT count(*) FROM document_chunks WHERE document_id = :id"
+    params: dict[str, Any] = {"id": document_id}
+    if pipeline_version is not None:
+        query += " AND pipeline_version = :version"
+        params["version"] = pipeline_version
+    return int((await session.execute(sa.text(query).bindparams(**params))).scalar_one())
+
+
+async def delete_superseded_chunks(
+    session: AsyncSession, *, document_id: UUID, keep_pipeline_version: int
+) -> int:
+    """§6.4: delete the previous version's rows **after** the new version is complete.
+
+    Until this runs, the join keeps answering from the previous index, which is the invariant
+    "a `ready` document is always retrievable".
+    """
+
+    result = await session.execute(
+        sa.text(
+            "DELETE FROM document_chunks WHERE document_id = :id AND pipeline_version < :keep"
+        ).bindparams(id=document_id, keep=keep_pipeline_version)
+    )
+    return int(result.rowcount or 0)
+
+
+# `set_document_pipeline_version` was removed here. It had no caller, and the re-index flow
+# does not want one: flipping the document's version *before* the new chunks are committed makes
+# the retrieval join match nothing, which is the failure mode this schema exists to prevent. The
+# version is stamped by `mark_document_ready` in the same statement that flips the row to `ready`.
+
+
+async def set_delete_state(
+    session: AsyncSession, *, document_id: UUID, state: str, error: str | None = None
+) -> None:
+    await session.execute(
+        sa.text(
+            "UPDATE documents SET delete_state = :state, delete_error = :error, updated_at = now() "
+            "WHERE id = :id"
+        ).bindparams(id=document_id, state=state, error=error)
+    )
+
+
+async def mark_document_deleted(session: AsyncSession, *, document_id: UUID) -> None:
+    await session.execute(
+        sa.text(
+            "UPDATE documents SET deleted_at = now(), delete_state = 'complete', "
+            "updated_at = now() WHERE id = :id"
+        ).bindparams(id=document_id)
+    )
+
+
+async def list_ready_documents(session: AsyncSession, *, user_id: int) -> list[DocumentRows]:
+    rows = (
+        await session.execute(
+            sa.text(_LIST_READY_DOCUMENTS).bindparams(user_id=user_id)
+        )
+    ).all()
+    return [_as_document(row) for row in rows]
+
+
 async def search_chunks(
     session: AsyncSession,
     *,
@@ -793,6 +1121,7 @@ async def search_chunks(
     query_embedding: Sequence[float],
     embed_model: str,
     top_k: int,
+    min_score: float,
     document_ids: Sequence[uuid.UUID] | None = None,
 ) -> list[ChunkMatch]:
     """THE single vector search. **Frozen signature.**
@@ -812,6 +1141,11 @@ async def search_chunks(
     (RB3-follow-on), so a caller passing "the active pipeline version" would have been silently
     ignored. A parameter that cannot do anything is a trap in a frozen contract; it was removed
     and the change is recorded in the phase report.
+
+    ``min_score`` is **required, not optional**. It used to default to ``None``, which silently
+    disabled the floor for any caller that forgot it — a default that turns a safety filter off
+    is worse than no filter, because the code still reads as if it were on. It is a *degenerate
+    match* filter (see `Settings.rag_min_score`), not a relevance threshold.
 
     ``SET LOCAL hnsw.iterative_scan = strict_order`` makes a *filtered* approximate search
     return exactly ``top_k`` rows instead of however many the index happened to visit
@@ -847,6 +1181,10 @@ async def search_chunks(
     )
     if document_ids is not None:
         statement = statement.where(DocumentChunk.document_id.in_(list(document_ids)))
+    # `min_score` is a **cosine similarity floor**, applied here because this is the single
+    # retrieval chokepoint: a caller-side filter would let a weak chunk reach the model from any
+    # future caller. pgvector orders by cosine *distance*, so the floor becomes a ceiling.
+    statement = statement.where(distance <= (1.0 - float(min_score)))
 
     rows = (await session.execute(statement)).all()
     return [
@@ -1409,6 +1747,19 @@ async def active_turn_items(
     return [dict(row) for row in (await session.execute(statement)).mappings().all()]
 
 __all__ = [
+    "DocumentRows",
+    "claim_document",
+    "count_chunks",
+    "create_document",
+    "delete_superseded_chunks",
+    "find_document_by_hash",
+    "get_document",
+    "insert_chunks",
+    "list_ready_documents",
+    "mark_document_deleted",
+    "mark_document_failed",
+    "mark_document_ready",
+    "set_delete_state",
     "count_actions_for_key_prefix",
     "work_item_state",
     "start_invocation",

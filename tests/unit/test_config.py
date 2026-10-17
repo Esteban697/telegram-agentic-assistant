@@ -44,6 +44,8 @@ def test_production_settings_with_everything_required_are_valid() -> None:
         app_env="production",
         store_backend="postgres",
         telegram_allowed_user_ids=frozenset({1, 2}),
+        gcs_bucket="a-private-bucket",
+        google_cloud_project="a-project",
     )
     assert settings.is_production
     assert settings.problems() == []
@@ -55,7 +57,10 @@ def test_production_settings_with_everything_required_are_valid() -> None:
 @pytest.mark.parametrize(
     ("overrides", "needle"),
     [
-        ({"app_env": "production"}, "STORE_BACKEND=memory"),
+        (
+            {"app_env": "production", "gcs_bucket": "b", "google_cloud_project": "p"},
+            "STORE_BACKEND=memory",
+        ),
         (
             {
                 "app_env": "production",
@@ -220,6 +225,21 @@ def test_log_level_is_normalised_and_validated() -> None:
     assert Settings(log_level="debug").log_level == "DEBUG"
     with pytest.raises(Exception):
         Settings(log_level="verbose")
+
+
+def test_the_largest_chunk_must_fit_inside_the_context_window() -> None:
+    """`RAG_CHUNK_MAX_CHARS > RAG_MAX_CONTEXT_CHARS` was accepted and was silently wrong.
+
+    The largest chunk the splitter can emit could never fit in the context handed to the model, so
+    every answer would be assembled from a truncated passage — and the block renderer keeps the
+    citation either way, so nothing downstream noticed.
+    """
+
+    with pytest.raises(ConfigError, match="RAG_CHUNK_MAX_CHARS"):
+        make_settings(rag_chunk_max_chars=7000, rag_max_context_chars=6000)
+
+    # The boundary is inclusive: a chunk that exactly fills the window is fine.
+    assert make_settings(rag_chunk_max_chars=6000, rag_max_context_chars=6000).problems() == []
 
 
 def test_llm_timeout_must_fit_inside_the_request_budget() -> None:

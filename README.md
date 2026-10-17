@@ -22,6 +22,9 @@ aprobaciones, RAG documental y despliegue en Google Cloud) se añaden por fases.
 - Limitar la frecuencia por usuario y avisar una sola vez por ventana.
 - Guardar y consultar **preferencias explícitas** (`/memory`) y borrarlas (`/forget`).
 - Crear, listar, completar y cancelar **recordatorios** con zona horaria IANA (`/tasks`).
+- Enviar un **documento** (PDF, texto o Markdown) y preguntar por su contenido: se indexa en
+  fragmentos con su número de página y las respuestas citan el archivo y la página. Si no hay
+  evidencia suficiente, lo dice en lugar de inventar.
 - Registrar cada `update_id` en una tabla: la idempotencia sobrevive a los reinicios.
 - Despachar recordatorios con la lógica de reclamo, reconciliación y avance de estado de
   `PLAN.md` §5.2 (`python -m app.jobs.dispatch_reminders`).
@@ -147,10 +150,27 @@ TEST_DATABASE_URL=postgresql+psycopg://postgres:postgres@127.0.0.1:55432/taa   u
 
 # Cobertura de la suite sin credenciales
 uv run pytest -m "not integration and not live and not eval" --cov=app --cov-report=term-missing
+
+# Evaluaciones de RAG (deterministas: base de datos y proveedor léxico de prueba, sin red).
+# Ojo: `-m "eval and not live"` es lo que no necesita nada; `-m eval` incluye las
+# evaluaciones del agente, que llevan también el marcador `live` porque llaman al modelo.
+TEST_DATABASE_URL=postgresql+psycopg://postgres:postgres@127.0.0.1:55432/taa   uv run pytest -m "eval and not live"
+
+# Evaluaciones del agente: hacen llamadas reales al modelo (necesitan OLLAMA_API_KEY).
+TEST_DATABASE_URL=postgresql+psycopg://postgres:postgres@127.0.0.1:55432/taa   uv run pytest -m eval tests/evals/test_agent_evals.py -s
+
+# Criterios de aceptación (a) y (b) de la Fase 4, con embeddings reales de Vertex.
+GOOGLE_CLOUD_PROJECT=telegram-assistant-esteban GOOGLE_CLOUD_REGION=europe-west1 RUN_LIVE_TESTS=1   uv run pytest -m live
 ```
 
 Los marcadores `integration`, `eval` y `live` están declarados en `pyproject.toml`; las
 pruebas que exigen credenciales reales llevan `live` y quedan excluidas por defecto.
+
+Las evaluaciones viven en `tests/evals/`, con documentos ficticios y diminutos en
+`tests/fixtures/` (sin datos personales reales). Las de RAG son deterministas; las del agente
+hacen llamadas reales al modelo y por eso llevan el marcador `eval` y no forman parte de la
+suite por defecto. Una evaluación del agente que falle se reporta como fallo: no se ajusta el
+fixture para que pase.
 
 ## Configuración
 
@@ -250,8 +270,11 @@ incluye `.env`, claves ni ficheros de servicio.
   pueden acceder a los datos, en lugar de fingir que los han guardado.
 - **Sin herramientas en el grafo.** El modelo no puede crear recordatorios todavía: los
   comandos funcionan, pero la selección de herramientas por el modelo llega en la Fase 3.
-- **Sin RAG.** Los documentos llegan en la Fase 4; las tablas de documentos, el índice HNSW y
-  `embedding_models` ya existen en el esquema.
+- **RAG con un solo proveedor de embeddings.** Los documentos (PDF, texto, Markdown) se indexan y
+  se buscan por similitud con Vertex AI (`gemini-embedding-001`, 768 dimensiones); sin credenciales
+  de Google no hay recuperación, y el bot avisa cuando falta el proveedor. `RAG_MIN_SCORE` es un
+  filtro de coincidencias degeneradas, **no** un umbral de relevancia: la decisión de "no hay
+  evidencia" la toma el modelo con los fragmentos y sus puntuaciones delante (ver `.env.example`).
 - **El despachador no está programado.** `python -m app.jobs.dispatch_reminders` se ejecuta a
   mano; Cloud Scheduler y el Cloud Run Job son Fase 5.
 - **`RATE_LIMIT_PER_MINUTE` es por instancia** (el cubo de fichas es local al proceso).
@@ -264,7 +287,12 @@ incluye `.env`, claves ni ficheros de servicio.
   comportamiento que se descubra en producción.
 - **Límite de frecuencia por instancia.** El cubo de fichas es local al proceso, así que el
   límite efectivo es `RATE_LIMIT_PER_MINUTE` multiplicado por el número de instancias.
-- **Las imágenes que no sean texto** reciben un aviso; los documentos llegan en la Fase 4.
+- **Las imágenes que no sean texto** reciben un aviso que explica qué formatos sí se procesan; las
+  fotos no se indexan.
+
+- **La ingesta dentro de la petición tiene un tope de tiempo.** El trabajo en línea se limita al
+  menor valor entre `INGEST_INLINE_BUDGET_SECONDS` y una fracción de `REQUEST_BUDGET_SECONDS`; si se
+  agota, el documento queda en cola y lo procesa el trabajo en segundo plano (Fase 5).
 - **A10 pendiente de validación externa** hasta que se ejecute `scripts/verify_ollama.py` con
   una clave real.
 

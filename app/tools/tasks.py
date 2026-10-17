@@ -107,7 +107,7 @@ class TaskTools:
         return ToolResult.success(payload, created=created)
 
     async def list_tasks(
-        self, *, user_id: int, args: ListTasksArgs | None = None
+        self, *, user_id: int, args: ListTasksArgs | None = None, **_: Any
     ) -> ToolResult[list[dict[str, Any]]]:
         status = (args or ListTasksArgs()).status
         async with self.sessions() as session:
@@ -128,14 +128,14 @@ class TaskTools:
         return ToolResult.success(payload, count=len(payload))
 
     async def complete_task(
-        self, *, user_id: int, args: TaskIdArgs
+        self, *, user_id: int, args: TaskIdArgs, **_: Any
     ) -> ToolResult[dict[str, Any]]:
         return await self._set_state(
             user_id=user_id, task_id=args.task_id, state=repositories.TASK_COMPLETED
         )
 
     async def cancel_reminder(
-        self, *, user_id: int, args: TaskIdArgs
+        self, *, user_id: int, args: TaskIdArgs, **_: Any
     ) -> ToolResult[dict[str, Any]]:
         return await self._set_state(
             user_id=user_id, task_id=args.task_id, state=repositories.TASK_CANCELLED

@@ -32,6 +32,10 @@ dependencies = [
     "psycopg[binary,pool]==3.3.6",
     "pgvector==0.5.1",
     "langgraph-checkpoint-postgres==3.2.0",
+    # Phase 4: the document store and the embedding provider chosen in §13.1 (Vertex).
+    "google-cloud-storage==3.17.1",
+    "google-auth==2.62.0",
+    "pypdf==6.21.0",
 ]
 
 [project.optional-dependencies]

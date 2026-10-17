@@ -24,8 +24,8 @@ CATALOGUE: Final[dict[str, str]] = {
     "start": (
         "Hola. Soy tu asistente personal.\n\n"
         "Puedes escribirme con normalidad. También puedo guardar tus preferencias "
-        "(/memory) y gestionar recordatorios (/tasks). Los documentos llegarán en una "
-        "fase posterior."
+        "(/memory), gestionar recordatorios (/tasks) y leer los documentos que me envíes "
+        "(PDF o texto) para responderte con la página de la que saco cada dato."
     ),
     "help": (
         "Comandos disponibles:\n"
@@ -52,8 +52,8 @@ CATALOGUE: Final[dict[str, str]] = {
     ),
     "callback.not_available": "Esa opción todavía no está disponible.",
     "unsupported.content": (
-        "Por ahora solo entiendo mensajes de texto. Los documentos llegarán en una fase "
-        "posterior."
+        "No he podido leer eso. Envíame un mensaje de texto o un documento en PDF o texto "
+        "plano y te respondo sobre su contenido."
     ),
     # --- Tasks / reminders -------------------------------------------------- #
     "tasks.empty": "No tienes recordatorios pendientes.",
@@ -133,6 +133,35 @@ CATALOGUE: Final[dict[str, str]] = {
     "error.task_not_found": "No encuentro ese recordatorio.",
     "error.storage_unavailable": (
         "Ahora mismo no puedo acceder a tus datos. Inténtalo de nuevo en unos minutos."
+    ),
+    "documents.indexed": (
+        "He indexado «{name}»: {chunks} fragmentos de {pages} páginas. Ya puedes preguntarme "
+        "sobre él."
+    ),
+    "documents.already_indexed": "Ese documento ya estaba indexado.",
+    "documents.queued": (
+        "El documento queda en cola: todavía no está indexado, así que aún no puedo buscarlo. "
+        "Lo procesaré en segundo plano; vuelve a preguntarme dentro de un momento."
+    ),
+    "documents.unavailable": (
+        "No puedo procesar documentos en esta configuración: falta el proveedor de embeddings."
+    ),
+    "error.unsupported_document": (
+        "No puedo leer ese archivo. Envíame un PDF o un texto plano."
+    ),
+    "error.empty_text_layer": (
+        "Ese documento no contiene texto extraíble (parece un escaneo sin capa de texto)."
+    ),
+    "error.document_too_large": (
+        "Ese documento supera el límite de tamaño o de páginas que puedo procesar."
+    ),
+    "error.document_not_found": "No encuentro ese documento entre los tuyos.",
+    "error.deletion_incomplete": (
+        "No he podido borrarlo del todo; lo dejo marcado para reintentarlo y te aviso."
+    ),
+    "error.reindex_required": (
+        "Los documentos están indexados con otro modelo de embeddings; hay que reindexarlos "
+        "antes de poder buscarlos."
     ),
     "error.tool_args_changed": (
         "La llamada a esa herramienta no coincide con la que ya quedó registrada; no la repito."

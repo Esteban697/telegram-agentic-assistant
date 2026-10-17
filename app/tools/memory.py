@@ -47,7 +47,7 @@ class MemoryTools:
     sessions: async_sessionmaker[AsyncSession]
 
     async def search_personal_memory(
-        self, *, user_id: int, args: SearchMemoryArgs
+        self, *, user_id: int, args: SearchMemoryArgs, **_: Any
     ) -> ToolResult[list[dict[str, Any]]]:
         async with self.sessions() as session:
             rows = await repositories.search_memories(
@@ -67,7 +67,7 @@ class MemoryTools:
         )
 
     async def save_preference(
-        self, *, user_id: int, args: SavePreferenceArgs
+        self, *, user_id: int, args: SavePreferenceArgs, **_: Any
     ) -> ToolResult[dict[str, Any]]:
         async with self.sessions() as session, session.begin():
             row = await repositories.upsert_memory(
@@ -95,7 +95,7 @@ class MemoryTools:
         return ToolResult.success({"deleted": deleted > 0, "key": key}, deleted=deleted)
 
     async def delete_memory(
-        self, *, user_id: int, args: DeleteMemoryArgs
+        self, *, user_id: int, args: DeleteMemoryArgs, **_: Any
     ) -> ToolResult[dict[str, Any]]:
         async with self.sessions() as session, session.begin():
             deleted = await repositories.delete_memory(
@@ -117,7 +117,7 @@ class MemoryTools:
         return ToolResult.success({"deleted": deleted})
 
     async def list_memories(
-        self, *, user_id: int, args: ListMemoriesArgs | None = None
+        self, *, user_id: int, args: ListMemoriesArgs | None = None, **_: Any
     ) -> ToolResult[list[dict[str, Any]]]:
         limit = (args or ListMemoriesArgs()).limit
         async with self.sessions() as session:

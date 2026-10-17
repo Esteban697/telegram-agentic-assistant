@@ -202,7 +202,17 @@ def _signature_of(name: str) -> dict[str, str | None]:
 
 
 def test_search_chunks_signature_is_frozen() -> None:
-    """Phase 3 and Phase 4 build on this shape; changing it is a contract change."""
+    """Phase 3 and Phase 4 build on this shape; changing it is a contract change.
+
+    `min_score` was **added deliberately** in the Phase 4 second pass, and it became a required
+    argument in the third: a floor that defaults to `None` is disabled by *forgetting* it, which
+    is the worst kind of default on a safety filter. The floor belongs here rather than in the
+    caller because this is the single place a chunk can enter the model's context.
+
+    It is a **degenerate-match filter, not a relevance threshold** — see
+    `Settings.rag_min_score`, which carries the measurements showing that no global cosine
+    threshold separates an unrelated question from an answerable one on the deployed provider.
+    """
 
     assert _signature_of("search_chunks") == {
         "session": None,
@@ -210,6 +220,9 @@ def test_search_chunks_signature_is_frozen() -> None:
         "query_embedding": None,
         "embed_model": None,
         "top_k": None,
+        # `None` here means "the parameter has **no** default", which is the point of the change:
+        # `document_ids` (whose default is the literal `None`) is spelled "None".
+        "min_score": None,
         "document_ids": "None",
     }
 

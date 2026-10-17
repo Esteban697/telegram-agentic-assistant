@@ -33,18 +33,27 @@ pytestmark = [
 ]
 
 
-class SlowModel:
-    """Answers slowly, so the second message provably arrives mid-turn."""
+class GatedModel:
+    """Answers only when the test opens the gate.
 
-    model = "slow-model"
+    The first version slept for 1.5 s and assumed the second request would arrive inside that
+    window. Under load it sometimes did not: the first turn finished, the second message was
+    served normally, and the test failed on `model.calls == 1` — a test artifact, not a product
+    race. The gate makes "the second message arrived mid-turn" a fact the test *establishes*
+    (it posts the second message only after `entered` is set) instead of a stopwatch guess.
+    """
 
-    def __init__(self, delay: float = 1.5) -> None:
-        self.delay = delay
+    model = "gated-model"
+
+    def __init__(self) -> None:
         self.calls = 0
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
 
     async def chat(self, messages_, **_: Any) -> ChatResult:  # noqa: ANN001
         self.calls += 1
-        await asyncio.sleep(self.delay)
+        self.entered.set()
+        await self.release.wait()
         return ChatResult(content="primera respuesta", model=self.model, latency_ms=1.0)
 
     async def list_models(self) -> list[str]:
@@ -67,7 +76,7 @@ def _update(update_id: int, text: str) -> dict[str, Any]:
 async def test_h_the_webhook_declines_the_second_message_and_records_both_once() -> None:
     settings = make_db_settings()
     truncate_all(settings)
-    model = SlowModel()
+    model = GatedModel()
     telegram = RecordingTelegram()
     app = create_app(settings=settings, chat_model=model, telegram_client=telegram)
 
@@ -75,10 +84,17 @@ async def test_h_the_webhook_declines_the_second_message_and_records_both_once()
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         async with app.router.lifespan_context(app):
             headers = {"X-Telegram-Bot-Api-Secret-Token": WEBHOOK_SECRET}
-            first, second = await asyncio.gather(
-                client.post("/telegram/webhook", json=_update(1, "primer mensaje"), headers=headers),
-                client.post("/telegram/webhook", json=_update(2, "segundo mensaje"), headers=headers),
+            # The first turn is held open inside the model, so the second message is provably
+            # concurrent rather than probably concurrent.
+            first_task = asyncio.create_task(
+                client.post("/telegram/webhook", json=_update(1, "primer mensaje"), headers=headers)
             )
+            await asyncio.wait_for(model.entered.wait(), timeout=30.0)
+            second = await client.post(
+                "/telegram/webhook", json=_update(2, "segundo mensaje"), headers=headers
+            )
+            model.release.set()
+            first = await asyncio.wait_for(first_task, timeout=30.0)
 
             engine = sa.create_engine(settings.database_sync_url.get_secret_value())
             try:

@@ -1,0 +1,8 @@
+FACTURA DE ELECTRICIDAD
+
+Periodo de facturacion: del 1 al 31 de octubre.
+
+El consumo del periodo fue de 210 kWh.
+El importe total asciende a 63,40 euros, impuestos incluidos.
+
+La fecha limite de pago es el dia 20 del mes siguiente a la emision.

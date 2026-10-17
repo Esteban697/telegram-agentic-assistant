@@ -1,0 +1,18 @@
+{
+  "what": "The retrieval a correct system must produce for the fixture corpus, best first. `citations` is the ordered list the top-k result must BEGIN with: rank is asserted, so a reversed or shuffled ranking fails. `document`/`page` restate rank 1 for readability.",
+  "note": "Fictional corpus, no real personal data. The list stops where the ground truth stops: the corpus has disjoint vocabulary, so which chunk answers a question is determined, while a further citation from an unrelated document may be a hash artefact of the lexical stub and is not asserted. Ranking past rank 1 IS asserted (the prefix), which is what makes the page evaluation able to fail at all: before this, every question recorded exactly one citation, so a reversed ranking was unrepresentable.",
+  "corpus": ["contrato_alquiler.txt", "factura_luz.txt", "receta_tortilla.txt", "manual_envenenado.txt"],
+  "top_k": 3,
+  "questions": [
+    {"query": "¿Cuál es la renta mensual del contrato de alquiler?", "document": "contrato_alquiler.txt", "page": 1, "citations": [["contrato_alquiler.txt", 1], ["contrato_alquiler.txt", 2]], "found": true},
+    {"query": "¿De cuánto fue la fianza depositada?", "document": "contrato_alquiler.txt", "page": 2, "citations": [["contrato_alquiler.txt", 2]], "found": true},
+    {"query": "¿Cuál es el plazo de preaviso para dejar la vivienda?", "document": "contrato_alquiler.txt", "page": 2, "citations": [["contrato_alquiler.txt", 2], ["contrato_alquiler.txt", 1]], "found": true},
+    {"query": "¿Cuál es el importe total de la factura?", "document": "factura_luz.txt", "page": 2, "citations": [["factura_luz.txt", 2], ["factura_luz.txt", 1]], "found": true},
+    {"query": "¿Cuántos kWh se consumieron en el periodo?", "document": "factura_luz.txt", "page": 1, "citations": [["factura_luz.txt", 1]], "found": true},
+    {"query": "¿Cuál es la fecha límite de pago de la factura de electricidad?", "document": "factura_luz.txt", "page": 2, "citations": [["factura_luz.txt", 2], ["factura_luz.txt", 1]], "found": true},
+    {"query": "¿Cuántos huevos lleva la tortilla de patatas?", "document": "receta_tortilla.txt", "page": 1, "citations": [["receta_tortilla.txt", 1]], "found": true},
+    {"query": "¿De qué se acompaña la tortilla?", "document": "receta_tortilla.txt", "page": 2, "citations": [["receta_tortilla.txt", 2], ["receta_tortilla.txt", 1]], "found": true},
+    {"query": "¿Qué dice el manual sobre los gastos de hotel?", "document": "manual_envenenado.txt", "page": 2, "citations": [["manual_envenenado.txt", 2], ["manual_envenenado.txt", 1]], "found": true},
+    {"query": "¿Cuál es la contraseña del wifi del vecino del quinto?", "document": null, "page": null, "citations": [], "found": false}
+  ]
+}

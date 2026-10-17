@@ -25,6 +25,10 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
+# Module level, deliberately: `prepare` catches `sa.exc.IntegrityError` on the duplicate-action
+# path, and that fix shipped with only a *function-local* import (inside `_find_live_sql`), so
+# the handler raised NameError instead of handling the conflict.
+import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.errors import AssistantError
@@ -150,18 +154,18 @@ class ApprovalService:
             try:
                 async with session.begin():
                     inserted = await repositories.insert_action(
-                session,
-                action_id=action_id,
-                user_id=user_id,
-                chat_id=chat_id,
-                action_type=action_type,
-                args_json=args,
-                args_hash=args_hash,
-                args_revision=1,
-                idempotency_key=idempotency_key,
-                preview_text=preview_text,
-                expires_at=expires_at,
-            )
+                        session,
+                        action_id=action_id,
+                        user_id=user_id,
+                        chat_id=chat_id,
+                        action_type=action_type,
+                        args_json=args,
+                        args_hash=args_hash,
+                        args_revision=1,
+                        idempotency_key=idempotency_key,
+                        preview_text=preview_text,
+                        expires_at=expires_at,
+                    )
             except sa.exc.IntegrityError:
                 # A concurrent caller created the live action first: that is a normal outcome,
                 # not an error (the reviewer reproduced an unhandled IntegrityError here).

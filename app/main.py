@@ -31,17 +31,26 @@ from app.api.health import router as health_router
 from app.api.telegram_webhook import RateLimiter
 from app.api.telegram_webhook import router as webhook_router
 from app.bot.handlers import TelegramHandlers
+from app.errors import AssistantError
 from app.bot.telegram_client import TelegramClient
 from app.config import Settings, load_settings
+from app.llm.embeddings import build_embedding_provider
 from app.llm.ollama_client import OllamaChatClient
 from app.llm.protocols import ChatModel
 from app.logging_config import configure_logging
 from app.services.approvals import ApprovalService
 from app.services.conversation import ConversationService
+from app.services.document_ingestion import DocumentIngestion
+
+# Inline ingestion must leave room in the request for the reply itself.
+INGEST_BUDGET_FRACTION = 0.6
 from app.services.work_queue import WorkQueue
 from app.storage.checkpointing import build_checkpointer, setup_checkpointer
+from app.storage.gcs import build_object_store
 from app.storage.postgres import Database, build_database, use_compatible_event_loop
 from app.storage.stores import build_stores
+from app.tools.documents import DocumentTools
+from app.tools.documents import specs as document_specs
 from app.tools.memory import MemoryTools
 from app.tools.memory import specs as memory_specs
 from app.tools.registry import ToolRegistry
@@ -119,16 +128,76 @@ def create_app(
             )
         )
 
+        # Phase 4: the embedding provider (§13.1: Vertex everywhere), the object store and the
+        # ingestion pipeline. The provider is built even when a database is absent so the app
+        # reports the capability problem plainly (no ADC) rather than at first use.
+        # A missing embedding capability must not stop the service from booting: chat, memory
+        # and reminders do not need it, and the failure should surface where it matters — when a
+        # document arrives — with the exact remediation rather than as a startup crash.
+        embedding_error: str | None = None
+        try:
+            embeddings = build_embedding_provider(resolved)
+        except AssistantError as exc:
+            embeddings = None
+            embedding_error = exc.detail or exc.code
+            _logger.warning(
+                "the embedding provider is unavailable; documents are disabled",
+                extra=exc.as_log_fields(),
+            )
+        objects = build_object_store(resolved)
+        ingestion = (
+            None
+            if active_database is None or embeddings is None
+            else DocumentIngestion(
+                sessions=active_database.sessions,
+                objects=objects,
+                embeddings=embeddings,
+                active_model_name=resolved.embed_model,
+                max_upload_mb=resolved.max_upload_mb,
+                max_pages=resolved.max_pdf_pages,
+                max_ingest_seconds=resolved.max_ingest_seconds,
+                # Spec §6.1: inline only if the budget allows. The deadline is the smaller of
+                # the configured ceiling and a fraction of the request budget, so the webhook
+                # always answers inside Telegram's deadline; the remainder is the Phase 5 job's.
+                deadline_seconds=min(
+                    resolved.ingest_inline_budget_seconds,
+                    resolved.request_budget_seconds * INGEST_BUDGET_FRACTION,
+                ),
+                chunk_chars=resolved.rag_chunk_chars,
+                chunk_overlap=resolved.rag_chunk_overlap_chars,
+                chunk_max=resolved.rag_chunk_max_chars,
+                chunk_min=resolved.rag_chunk_min_chars,
+            )
+        )
+        document_tools = (
+            None
+            if active_database is None or embeddings is None
+            else DocumentTools(
+                sessions=active_database.sessions,
+                embeddings=embeddings,
+                max_context_chars=resolved.rag_max_context_chars,
+                top_k=resolved.rag_top_k,
+                min_score=resolved.rag_min_score,
+                ingestion=ingestion,
+            )
+        )
+
         registry: ToolRegistry | None = None
         approvals: ApprovalService | None = None
         work_queue: WorkQueue | None = None
-        if active_database is not None and memory_tools is not None and task_tools is not None:
+        if (
+            active_database is not None
+            and memory_tools is not None
+            and task_tools is not None
+            and document_tools is not None
+        ):
             registry = ToolRegistry(
                 [
                     *memory_specs(memory_tools),
                     *task_specs(task_tools),
                     *web_specs(WebSearchTool()),
                     *restaurant_specs(RestaurantTools()),
+                    *document_specs(document_tools),
                 ],
                 sessions=active_database.sessions,
                 stale_seconds=resolved.stale_invocation_seconds,
@@ -188,6 +257,15 @@ def create_app(
         app.state.agent = agent
         app.state.memory_tools = memory_tools
         app.state.task_tools = task_tools
+        # /readyz reads these (§8.2/RN12): the database, the vector extension and the single
+        # active embedding model row are dependencies it must report on.
+        app.state.settings = resolved
+        app.state.database = active_database
+        app.state.embeddings = embeddings
+        app.state.embedding_error = embedding_error
+        app.state.objects = objects
+        app.state.ingestion = ingestion
+        app.state.document_tools = document_tools
         app.state.registry = registry
         app.state.approvals = approvals
         app.state.work_queue = work_queue
@@ -202,6 +280,8 @@ def create_app(
             approvals=approvals,
             work_queue=work_queue,
             registry=registry,
+            ingestion=ingestion,
+            document_tools=document_tools,
         )
 
         _logger.info(
