@@ -18,8 +18,10 @@ from fastapi.testclient import TestClient
 from app.api.telegram_webhook import _secret_matches
 from app.config import Settings
 from app.logging_config import JsonFormatter, redact
+from app.errors import AssistantError
 from app.main import create_app
 from app.policy.limits import backoff_seconds, total_retry_backoff, worst_case_provider_seconds
+from app.storage.stores import GraphConversationStore
 from tests.conftest import OllamaStub, RecordingTelegram, chat_response, make_settings
 
 SECRET = "s3cret_token-ABC"
@@ -343,3 +345,110 @@ def test_plain_http_ollama_url_is_rejected_in_test_env() -> None:
 def test_plain_http_is_allowed_in_development_only() -> None:
     settings = make_settings(app_env="development", ollama_base_url="http://127.0.0.1:11434")
     assert settings.problems() == []
+
+
+# --------------------------------------------------------------------------- #
+# Phase 2 review, items 11-13
+# --------------------------------------------------------------------------- #
+def test_exception_messages_survive_into_the_log() -> None:
+    """Item 11: the message must be visible, or a bare `KeyError` cannot be diagnosed.
+
+    `exc_message` used `redact(..., key="content")`, which replaced *every* exception message
+    with "[redacted]" — exactly why the `/forget` KeyError surfaced with nothing to read.
+    """
+
+    import sys
+
+    formatter = JsonFormatter(app_env="test")
+    try:
+        raise KeyError("id")
+    except KeyError:
+        record = logging.LogRecord(
+            name="t", level=logging.ERROR, pathname=__file__, lineno=1, msg="m", args=(),
+            exc_info=sys.exc_info(),
+        )
+    payload = json.loads(formatter.format(record))
+    assert payload["exc_type"] == "KeyError"
+    assert "id" in payload["exc_message"], "the diagnostic must survive"
+    assert payload["exc_message"] != "[redacted]"
+
+
+def test_a_credential_inside_an_exception_message_is_still_scrubbed() -> None:
+    from app.logging_config import scrub_text
+
+    scrubbed = scrub_text("failed for Bearer abcdefghijklmnopqrst with 123456:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw")
+    assert "abcdefghijklmnopqrst" not in scrubbed
+    assert "AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw" not in scrubbed
+    assert "failed for" in scrubbed, "the surrounding diagnostic stays readable"
+
+    long_hex = scrub_text("digest deadbeefdeadbeefdeadbeefdeadbeef leaked")
+    assert "deadbeef" not in long_hex and "digest" in long_hex
+
+
+def test_scrub_truncates_a_flood() -> None:
+    from app.logging_config import scrub_text
+
+    assert scrub_text("x" * 5000).endswith("chars]")
+
+
+async def test_history_before_thread_id_raises_instead_of_inventing_a_conversation() -> None:
+    """Item 12: resolving a thread from `history()` needed a user id, and guessing one (0)
+    would have written the chat's conversation row attributed to Telegram user 0."""
+
+    class _ExplodingRegistry:
+        async def resolve(self, *, user_id: int, chat_id: int) -> str:  # pragma: no cover
+            raise AssertionError(f"the registry must not be called: user_id={user_id}")
+
+        async def rotate(self, *, chat_id: int) -> str:  # pragma: no cover
+            raise AssertionError("not used")
+
+    class _History:
+        async def history(self, thread_id: str) -> list:  # pragma: no cover
+            return []
+
+    store = GraphConversationStore(_ExplodingRegistry(), _History(), session_factory=None)
+
+    with pytest.raises(AssistantError, match="before thread_id"):
+        await store.history(chat_id=4242)
+
+
+def test_create_app_accepts_an_injected_saver_with_autorun() -> None:
+    """Item 13: `create_app(checkpointer=X)` + MIGRATIONS_AUTORUN crashed with
+    `AttributeError: 'State' object has no attribute 'checkpointer'`."""
+
+    from app.main import create_app
+    from tests.conftest import make_db_settings
+
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    class _Saver(InMemorySaver):
+        """A real saver (LangGraph validates the type) that counts `setup()` calls."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.setup_calls = 0
+
+        async def setup(self) -> None:  # type: ignore[override]
+            self.setup_calls += 1
+
+    saver = _Saver()
+    settings = make_db_settings(
+        database_url="postgresql+psycopg://u:p@127.0.0.1:1/x",
+        database_sync_url="postgresql+psycopg://u:p@127.0.0.1:1/x",
+        migrations_autorun=True,
+    )
+    app = create_app(
+        settings=settings,
+        chat_model=OllamaStub(handler=_ok).client(),
+        telegram_client=RecordingTelegram(),
+        checkpointer=saver,
+    )
+
+    # Entering the context runs the lifespan, which is where the crash happened: with an
+    # injected saver the old code called `setup_checkpointer(app.state.checkpointer)` and
+    # `app.state.checkpointer` does not exist.
+    with TestClient(app, raise_server_exceptions=True):
+        pass
+
+    assert saver.setup_calls == 1, "autorun must call setup() on the injected saver"
+    assert not hasattr(app.state, "checkpointer"), "an injected saver is not ours to store"

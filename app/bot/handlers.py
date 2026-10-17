@@ -1,12 +1,20 @@
-"""Update handling: commands, conversation turns, callbacks (PLAN.md §10 Phase 1 deliverable 7).
+"""Update handling: commands, conversation turns, callbacks (PLAN.md §10 Phase 1 deliverable 7,
+Phase 2: `/tasks`, `/memory` and `/forget` become real).
 
 This is where the plan's prompt-assembly rule lives (§2.2, §10 Phase 1 deliverable 9): **the
-handler reads the conversation store and passes a shaped message list to the agent**, which
-is why ``agent/`` never imports ``app.storage.stores``. Phase 2 swaps the store for an adapter
-over ``aget_state`` and this module does not change.
+handler reads the conversation service and passes a shaped message list to the agent**, which
+is why ``agent/`` never imports ``app.storage``.
 
-Everything the user reads is rendered from :mod:`app.bot.messages`; this module contains no
-user-facing string literals.
+Phase 2 changes:
+
+* history comes from the checkpointed thread state, so the handler no longer appends to a list —
+  it calls :meth:`ConversationService.prepare` and :meth:`ConversationService.record`;
+* `/reset` rotates the thread id instead of clearing a list (decision 3);
+* `/tasks`, `/memory` and `/forget` operate on real storage. When no database is configured
+  (`STORE_BACKEND=memory`, development), they answer with the explicit
+  ``error.storage_unavailable`` message rather than pretending to have stored something.
+
+Everything the user reads is rendered from :mod:`app.bot.messages`.
 """
 
 from __future__ import annotations
@@ -23,21 +31,24 @@ from app.config import Settings
 from app.errors import AssistantError
 from app.llm.protocols import ChatMessage
 from app.policy.authz import TelegramIdentity
+from app.services.conversation import ConversationService
 from app.storage.stores import (
     STATUS_FAILED,
     STATUS_IGNORED,
     STATUS_NOTICED,
     STATUS_PROCESSED,
-    ConversationStore,
+    DedupeStore,
 )
+from app.tools.memory import MemoryTools
+from app.tools.tasks import ListTasksArgs, TaskTools
 
 _logger = logging.getLogger(__name__)
 
-# Commands whose implementation belongs to a later phase. They answer on the Phase 1 command
-# surface with the "not available yet" message so that the surface does not change later
-# (PLAN.md §10 Phase 1 deliverable 7).
-_PENDING_COMMANDS = {"tasks", "memory", "forget"}
-_KNOWN_COMMANDS = {"start", "help", "reset"} | _PENDING_COMMANDS
+_KNOWN_COMMANDS = {"start", "help", "reset", "tasks", "memory", "forget"}
+
+# Mirrors the `memories.key` CHECK constraint (1..128); the handler checks it so the user gets
+# a catalogue message instead of a validation error.
+MAX_MEMORY_KEY_CHARS = 128
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,12 +69,16 @@ class TelegramHandlers:
         settings: Settings,
         telegram: TelegramClient,
         agent: ChatAgent,
-        conversations: ConversationStore,
+        conversations: ConversationService,
+        memory_tools: MemoryTools | None = None,
+        task_tools: TaskTools | None = None,
     ) -> None:
         self._settings = settings
         self._telegram = telegram
         self._agent = agent
         self._conversations = conversations
+        self._memory = memory_tools
+        self._tasks = task_tools
 
     # ------------------------------------------------------------------ #
     # Entry point
@@ -98,37 +113,30 @@ class TelegramHandlers:
             await self._reply(identity.chat_id, messages.render("error.message_too_long"))
             return HandlerOutcome(status=STATUS_IGNORED, replied=True, detail="message_too_long")
 
-        command = _parse_command(text)
+        command, argument = _parse_command(text)
         if command is not None:
-            return await self._run_command(command, identity)
+            return await self._run_command(
+                command, argument, identity, update_id=update.get("update_id")
+            )
 
-        return await self._run_turn(text, identity)
+        return await self._run_turn(text, identity, update_id=update.get("update_id"))
 
     async def _handle_edited_message(
         self, update: dict[str, Any], identity: TelegramIdentity
     ) -> HandlerOutcome:
-        """An edit to an already-processed message is noticed, never replayed (PLAN.md §7.7).
-
-        Re-running the turn would risk a second level-1 side effect and would make the
-        transcript disagree with the graph's history; the user is told to resend instead.
-        """
+        """An edit to an already-processed message is noticed, never replayed (PLAN.md §7.7)."""
 
         await self._reply(identity.chat_id, messages.render("edited.notice"))
         return HandlerOutcome(status=STATUS_NOTICED, replied=True, detail="edited_message")
 
-    async def _run_turn(self, text: str, identity: TelegramIdentity) -> HandlerOutcome:
-        history = await self._conversations.get(identity.chat_id)
-        user_message = ChatMessage(role="user", content=text)
-        # The shaped prompt input: history (already retained) plus this turn's message.
-        prompt_input = [*history, user_message]
-
-        _logger.info(
-            "conversation turn start",
-            extra={"history_messages": len(history), "model": self._agent.model_name},
-        )
-
+    async def _run_turn(
+        self, text: str, identity: TelegramIdentity, *, update_id: int | None
+    ) -> HandlerOutcome:
         try:
-            result = await self._agent.run(prompt_input)
+            prepared = await self._conversations.prepare(
+                user_id=identity.user_id, chat_id=identity.chat_id, text=text
+            )
+            result = await self._agent.run(prepared.prompt_input, thread_id=prepared.thread_id)
         except AssistantError as exc:
             _logger.warning("conversation turn failed", extra=exc.as_log_fields())
             await self._reply(identity.chat_id, messages.render(exc.message_key))
@@ -136,23 +144,31 @@ class TelegramHandlers:
 
         reply_text = result.content.strip() or messages.render("error.generic")
         await self._reply(identity.chat_id, reply_text)
-        await self._conversations.append(
-            identity.chat_id,
-            [user_message, ChatMessage(role="assistant", content=reply_text)],
-        )
+
+        try:
+            # The transcript is an audit log, never read back as history (decision 3).
+            await self._conversations.record(
+                chat_id=identity.chat_id,
+                user_text=text,
+                assistant_text=reply_text,
+                telegram_update_id=update_id,
+            )
+        except AssistantError as exc:  # pragma: no cover - the reply is already delivered
+            _logger.warning("could not record the turn", extra=exc.as_log_fields())
+
         return HandlerOutcome(status=STATUS_PROCESSED, replied=True, detail="answered")
 
     # ------------------------------------------------------------------ #
     # Commands
     # ------------------------------------------------------------------ #
-    async def _run_command(self, command: str, identity: TelegramIdentity) -> HandlerOutcome:
-        if command in _PENDING_COMMANDS:
-            await self._reply(
-                identity.chat_id,
-                messages.render("error.not_available", command=f"/{command}"),
-            )
-            return HandlerOutcome(status=STATUS_PROCESSED, replied=True, detail=f"pending:{command}")
-
+    async def _run_command(
+        self,
+        command: str,
+        argument: str,
+        identity: TelegramIdentity,
+        *,
+        update_id: int | None = None,
+    ) -> HandlerOutcome:
         if command == "start":
             await self._reply(
                 identity.chat_id, messages.render("start"), keyboard=main_menu_keyboard()
@@ -166,16 +182,119 @@ class TelegramHandlers:
             return HandlerOutcome(status=STATUS_PROCESSED, replied=True, detail="help")
 
         if command == "reset":
-            # Phase 1: drop this chat's retained context. Nothing else exists to protect yet
-            # (no documents, no memories), and Phase 2 replaces the body with thread rotation
-            # behind the same handler and the same reply key (PLAN.md §10 Phase 1 deliverable 7).
-            await self._conversations.reset(identity.chat_id)
+            try:
+                await self._conversations.reset(chat_id=identity.chat_id)
+            except AssistantError as exc:
+                _logger.warning("reset failed", extra=exc.as_log_fields())
+                await self._reply(identity.chat_id, messages.render(exc.message_key))
+                return HandlerOutcome(status=STATUS_FAILED, replied=True, detail=exc.code)
             await self._reply(identity.chat_id, messages.render("reset.done"))
             return HandlerOutcome(status=STATUS_PROCESSED, replied=True, detail="reset")
 
-        # Unknown command: answer on the command surface rather than staying silent.
+        if command == "tasks":
+            return await self._show_tasks(identity)
+
+        if command == "memory":
+            return await self._show_memories(identity)
+
+        if command == "forget":
+            return await self._forget(argument, identity)
+
         await self._reply(identity.chat_id, messages.render("help"))
         return HandlerOutcome(status=STATUS_PROCESSED, replied=True, detail="unknown_command")
+
+    async def _show_tasks(self, identity: TelegramIdentity) -> HandlerOutcome:
+        if self._tasks is None:
+            await self._reply(identity.chat_id, messages.render("error.storage_unavailable"))
+            return HandlerOutcome(status=STATUS_IGNORED, replied=True, detail="no_storage")
+
+        result = await self._tasks.list_tasks(user_id=identity.user_id, args=ListTasksArgs())
+        items = result.data or []
+        if not items:
+            await self._reply(identity.chat_id, messages.render("tasks.empty"))
+        else:
+            lines = [messages.render("tasks.header")]
+            lines.extend(
+                messages.render(
+                    "tasks.line",
+                    title=item["title"],
+                    local=item["local"],
+                    timezone=item["timezone"],
+                    state=messages.state_label(str(item["state"])),
+                )
+                for item in items
+            )
+            await self._reply(identity.chat_id, "\n".join(lines))
+        return HandlerOutcome(status=STATUS_PROCESSED, replied=True, detail="tasks_listed")
+
+    async def _show_memories(self, identity: TelegramIdentity) -> HandlerOutcome:
+        if self._memory is None:
+            await self._reply(identity.chat_id, messages.render("error.storage_unavailable"))
+            return HandlerOutcome(status=STATUS_IGNORED, replied=True, detail="no_storage")
+
+        result = await self._memory.list_memories(user_id=identity.user_id)
+        items = result.data or []
+        if not items:
+            await self._reply(identity.chat_id, messages.render("memory.empty"))
+        else:
+            lines = [messages.render("memory.header")]
+            lines.extend(
+                messages.render("memory.line", key=item["key"], value=item["value"])
+                for item in items
+            )
+            await self._reply(identity.chat_id, "\n".join(lines))
+        return HandlerOutcome(status=STATUS_PROCESSED, replied=True, detail="memory_listed")
+
+    async def _forget(self, argument: str, identity: TelegramIdentity) -> HandlerOutcome:
+        """`/forget <clave>` deletes one memory; `/forget all [confirm]` needs confirmation.
+
+        Spec §6: "/forget debe permitir eliminar una memoria explícita ... con confirmación
+        cuando el alcance sea amplio". A two-step command is used rather than a callback, so
+        the confirmation does not depend on the approval machinery that arrives in Phase 3.
+        """
+
+        if self._memory is None:
+            await self._reply(identity.chat_id, messages.render("error.storage_unavailable"))
+            return HandlerOutcome(status=STATUS_IGNORED, replied=True, detail="no_storage")
+
+        target = argument.strip()
+        if not target:
+            await self._reply(identity.chat_id, messages.render("forget.needs_key"))
+            return HandlerOutcome(status=STATUS_PROCESSED, replied=True, detail="forget_needs_key")
+
+        if target.split()[0].lower() == "all":
+            return await self._forget_all(target, identity)
+
+        # A key longer than the column allows cannot exist, so answer instead of letting a
+        # pydantic ValidationError escape to the webhook's catch-all (which turned it into
+        # "Ha ocurrido un error inesperado").
+        if len(target) > MAX_MEMORY_KEY_CHARS:
+            await self._reply(identity.chat_id, messages.render("forget.not_found", key=target[:64]))
+            return HandlerOutcome(status=STATUS_PROCESSED, replied=True, detail="forget_key_too_long")
+
+        result = await self._memory.delete_memory_by_key(user_id=identity.user_id, key=target)
+        if (result.data or {}).get("deleted"):
+            await self._reply(identity.chat_id, messages.render("forget.done", key=target))
+            return HandlerOutcome(status=STATUS_PROCESSED, replied=True, detail="memory_deleted")
+
+        await self._reply(identity.chat_id, messages.render("forget.not_found", key=target))
+        return HandlerOutcome(status=STATUS_PROCESSED, replied=True, detail="forget_not_found")
+
+    async def _forget_all(self, target: str, identity: TelegramIdentity) -> HandlerOutcome:
+        parts = target.split()
+
+        if len(parts) > 1 and parts[1].lower() == "confirm":
+            result = await self._memory.delete_all_memories(user_id=identity.user_id)
+            deleted = int((result.data or {}).get("deleted", 0))
+            await self._reply(identity.chat_id, messages.render("forget.all_done", count=deleted))
+            return HandlerOutcome(
+                status=STATUS_PROCESSED, replied=True, detail="memory_deleted_all"
+            )
+
+        counted = await self._memory.count_memories(user_id=identity.user_id)
+        count = int((counted.data or {}).get("count", 0))
+        await self._reply(identity.chat_id, messages.render("forget.confirm_all", count=count))
+        return HandlerOutcome(status=STATUS_PROCESSED, replied=True, detail="forget_needs_confirm")
 
     # ------------------------------------------------------------------ #
     # Callbacks
@@ -187,9 +306,8 @@ class TelegramHandlers:
         callback_id = str(callback.get("id", ""))
         command = parse_callback_data(str(callback.get("data", "")))
 
-        # The acknowledgement is answered first and neutrally, because Telegram expects a
-        # prompt answer and an answer sent before the action cannot report the action's result
-        # (PLAN.md §4.2, N2). The outcome is then sent as its own message.
+        # The acknowledgement is answered first and neutrally (PLAN.md §4.2, N2): an answer sent
+        # before the action cannot report the action's result, so the outcome is its own message.
         if callback_id:
             await self._telegram.answer_callback_query(callback_query_id=callback_id)
 
@@ -197,17 +315,13 @@ class TelegramHandlers:
             await self._reply(identity.chat_id, messages.render("callback.not_available"))
             return HandlerOutcome(status=STATUS_IGNORED, replied=True, detail="unknown_callback")
 
-        return await self._run_command(command, identity)
+        return await self._run_command(command, "", identity)
 
     # ------------------------------------------------------------------ #
     # Helpers
     # ------------------------------------------------------------------ #
     async def notify(self, chat_id: int, text: str) -> None:
-        """Send a catalogue-rendered notice outside the command/turn flow.
-
-        Used by the webhook for its rate-limit and error notices, so that no other module
-        needs to reach into this object's private helpers.
-        """
+        """Send a catalogue-rendered notice outside the command/turn flow."""
 
         await self._telegram.send_message(chat_id=chat_id, text=text)
 
@@ -225,15 +339,15 @@ def _text_of(message: dict[str, Any]) -> str | None:
     return None
 
 
-def _parse_command(text: str) -> str | None:
-    """Return the bare command name for ``/name`` or ``/name@bot``, else None."""
+def _parse_command(text: str) -> tuple[str | None, str]:
+    """Return ``(command, argument)`` for ``/name`` or ``/name@bot arg``."""
 
     stripped = text.strip()
     if not stripped.startswith("/"):
-        return None
-    head = stripped.split()[0][1:]
-    head = head.split("@", 1)[0].lower()
-    return head if head else None
+        return None, ""
+    head, _, rest = stripped.partition(" ")
+    name = head[1:].split("@", 1)[0].lower()
+    return (name or None), rest.strip()
 
 
 __all__ = ["HandlerOutcome", "TelegramHandlers"]

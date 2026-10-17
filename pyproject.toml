@@ -12,13 +12,9 @@ license = { text = "Proprietary" }
 
 # Pinned exactly as PLAN.md §2.4 requires.
 #
-# Phase 1 scope (§10 Phase 1, deliverable 2): only the packages Phase 1 actually
-# imports are declared. §2.4's set also pins sqlalchemy / alembic / psycopg /
-# pgvector / langgraph-checkpoint-postgres / google-cloud-storage / pypdf, which
-# belong to Phases 2 and 4; declaring them here would be dead configuration,
-# which PLAN.md §9.1 forbids ("every variable ... has at least one non-test
-# reader" is the same rule applied to dependencies). They are added in the phase
-# that imports them.
+# Phase 1 declared only what it imported. Phase 2 imports the persistence stack, so
+# §2.4's deferred pins (SQLAlchemy, Alembic, psycopg, pgvector,
+# langgraph-checkpoint-postgres) are declared here, in the phase that consumes them.
 dependencies = [
     "fastapi==0.143.3",
     "uvicorn[standard]==0.54.0",
@@ -28,6 +24,14 @@ dependencies = [
     # LangGraph is used from Phase 1 on purpose (§10 Phase 1 deliverable 9) so
     # that Phase 2 only has to attach the checkpointer instead of restructuring.
     "langgraph==1.2.15",
+    # Phase 2: persistence. `psycopg[binary,pool]` is the driver the checkpointer requires
+    # and the one the async SQLAlchemy engine uses (decision 1).
+    # [asyncio] brings greenlet, which the async engine requires (decision 1).
+    "sqlalchemy[asyncio]==2.1.4",
+    "alembic==1.20.0",
+    "psycopg[binary,pool]==3.3.6",
+    "pgvector==0.5.1",
+    "langgraph-checkpoint-postgres==3.2.0",
 ]
 
 [project.optional-dependencies]

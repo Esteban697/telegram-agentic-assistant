@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sys
 from contextvars import ContextVar
 from datetime import UTC, datetime
@@ -154,6 +155,37 @@ def _truncate(value: str, limit: int = 200) -> str:
     return value if len(value) <= limit else value[:limit] + f"...[{len(value)} chars]"
 
 
+# Shapes that must never survive into a log line, wherever they appear: bearer tokens, common
+# API-key prefixes, long hex digests and long base64-ish runs. A pattern list is a weaker
+# guarantee than key-based redaction, so it is applied *in addition to* it: `redact()` still
+# blocks whole keys, and this scrubs values that carry a credential inside a free-text message.
+_SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?i)\b(bearer)\s+[A-Za-z0-9._\-]{8,}"),
+    re.compile(r"\b(sk|pk|rk|ghp|gho|xox[baprs])[-_][A-Za-z0-9_\-]{12,}"),
+    re.compile(r"\b[A-Fa-f0-9]{32,}\b"),
+    # A long *mixed* run (upper, lower and digits) is base64-shaped; a long run of a single
+    # character class is usually unbroken prose, so it is left to the truncation below instead
+    # of being nuked. `re` has no easy entropy test, so the lookaheads do it.
+    re.compile(
+        r"\b(?=[A-Za-z0-9+/]*[A-Z])(?=[A-Za-z0-9+/]*[a-z])(?=[A-Za-z0-9+/]*[0-9])"
+        r"[A-Za-z0-9+/]{40,}={0,2}\b"
+    ),
+    re.compile(r"\b\d{6,}:[A-Za-z0-9_\-]{30,}\b"),
+)
+
+
+def scrub_text(value: str, *, limit: int = 300) -> str:
+    """Keep a free-text diagnostic, minus anything shaped like a credential.
+
+    Truncated as well, so a provider's echoed payload cannot become a log flood.
+    """
+
+    scrubbed = value.replace("\n", " ")
+    for pattern in _SECRET_PATTERNS:
+        scrubbed = pattern.sub(_REDACTED, scrubbed)
+    return _truncate(scrubbed, limit)
+
+
 def _clean_extras(record: logging.LogRecord, *, content_debug: bool) -> dict[str, Any]:
     extras: dict[str, Any] = {}
     for key, value in record.__dict__.items():
@@ -196,9 +228,10 @@ class JsonFormatter(logging.Formatter):
             # The traceback is useful but must never contain a secret: it is a stack
             # frame dump, not a payload, so it is kept while payload keys are stripped.
             payload["exc_type"] = getattr(record.exc_info[0], "__name__", "Exception")
-            payload["exc_message"] = redact(
-                str(record.exc_info[1]), key="content", content_debug=self._content_debug
-            )
+            # NOT `redact(..., key="content")`: that replaced every exception message with
+            # "[redacted]", which is why a bare `KeyError` had no message to diagnose with.
+            # Secrets are still scrubbed, by shape rather than by key.
+            payload["exc_message"] = scrub_text(str(record.exc_info[1]))
         return json.dumps(payload, ensure_ascii=False, default=str)
 
 
@@ -247,5 +280,6 @@ __all__ = [
     "clear_request_context",
     "configure_logging",
     "redact",
+    "scrub_text",
     "set_request_context",
 ]

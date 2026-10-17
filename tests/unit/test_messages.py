@@ -62,6 +62,10 @@ _SPANISH_WORDS = (
     "necesito",
     "ayuda",
     "vale",
+    "pendiente",
+    "completado",
+    "cancelado",
+    "fallido",
 )
 _SPANISH_HINT = re.compile(
     r"[áéíóúñ¿¡ü]|\b(" + "|".join(_SPANISH_WORDS) + r")\b",
@@ -70,7 +74,9 @@ _SPANISH_HINT = re.compile(
 
 # The only placeholders the catalogue is allowed to use, so a typo cannot ship a literal
 # "{comamnd}" to a user.
-_ALLOWED_PLACEHOLDERS = frozenset({"command"})
+_ALLOWED_PLACEHOLDERS = frozenset(
+    {"command", "title", "when", "local", "timezone", "state", "key", "value", "count"}
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -220,14 +226,32 @@ def test_catalogue_keys_are_dotted_and_unique() -> None:
 
 
 def test_catalogue_values_are_non_empty_and_spanish() -> None:
+    """Every entry is non-empty, and the catalogue as a whole is Spanish.
+
+    A per-entry *heuristic* ("contains an accent") cannot work: "Preferencias guardadas:" is
+    perfectly Spanish and has none. So the per-entry assertion is structural (non-empty, has
+    letters, is not a raw identifier) and the language claim is made about the catalogue as a
+    whole, where there is enough text for the markers to be decisive. A short English-word
+    blocklist catches the realistic failure, which is a leak from an English template.
+    """
+
     for key, value in messages.CATALOGUE.items():
         assert isinstance(value, str) and value.strip(), f"{key} is empty"
-        assert find_spanish_literals(f'x = "{value}"'.replace("\n", " ")) or "{" in value or len(
-            value
-        ) > 30, f"{key} does not look Spanish"
+        assert any(character.isalpha() for character in value), f"{key} has no words"
+        assert not value.strip().startswith("{"), f"{key} looks like a raw identifier"
 
     joined = " ".join(messages.CATALOGUE.values())
-    assert "todavía" in joined or "disponible" in joined
+    flattened = " ".join(joined.splitlines())
+    assert find_spanish_literals('x = "' + flattened + '"'), (
+        "the catalogue does not look Spanish"
+    )
+
+    english_leaks = [
+        key
+        for key, value in messages.CATALOGUE.items()
+        if re.search(r"(the|please|sorry|unavailable|not available|saved|deleted)", value, re.I)
+    ]
+    assert english_leaks == [], f"English text leaked into the catalogue: {english_leaks}"
 
 
 def test_catalogue_uses_only_known_placeholders() -> None:

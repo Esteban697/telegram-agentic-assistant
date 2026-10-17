@@ -14,9 +14,9 @@ from typing import Any
 
 CALLBACK_PREFIX = "cmd:"
 
-# The commands the Phase 1 surface exposes. /tasks, /memory and /forget are deliberately
-# absent from the menu while they are unimplemented; they still answer on the command
-# surface with the "not available yet" message (A11).
+# The commands the menu exposes. `/tasks`, `/memory` and `/forget` work from Phase 2 but
+# stay off the menu: the menu is for the two stateless commands, while the other three are
+# useful mainly with an argument (`/forget <clave>`), which a button cannot supply.
 _MENU: tuple[tuple[str, str], ...] = (
     ("/help", "help"),
     ("/reset", "reset"),

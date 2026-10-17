@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from typing import Any
 
 import httpx
@@ -21,13 +22,20 @@ from app.bot import messages
 from app.main import create_app
 from tests.conftest import (
     CHAT_ID,
+    TEST_DATABASE_URL,
     USER_ID,
     WEBHOOK_SECRET,
     OllamaStub,
     RecordingTelegram,
     chat_response,
+    make_db_settings,
     make_settings,
+    truncate_all,
 )
+
+# (f) The same suite, the other backend: `TEST_STORE_BACKEND=postgres` reruns every test here
+# against PostgreSQL instead of the in-memory stores, with no test bodies changed.
+STORE_BACKEND = os.environ.get("TEST_STORE_BACKEND", "memory")
 
 pytestmark = pytest.mark.integration
 
@@ -58,10 +66,20 @@ class Harness:
         self._handler = handler
         self.telegram = RecordingTelegram()
         self.stub: OllamaStub | None = None
-        self.settings = make_settings(**setting_overrides)
+        if STORE_BACKEND == "postgres":
+            if not TEST_DATABASE_URL:
+                pytest.skip("TEST_DATABASE_URL is not set: the postgres run needs a database")
+            # MIGRATIONS_AUTORUN only exists so the checkpointer's idempotent setup() runs at
+            # startup here; production validation refuses it.
+            setting_overrides.setdefault("migrations_autorun", True)
+            self.settings = make_db_settings(**setting_overrides)
+        else:
+            self.settings = make_settings(**setting_overrides)
         self._client: TestClient | None = None
 
     def __enter__(self) -> "Harness":
+        if STORE_BACKEND == "postgres":
+            truncate_all(self.settings)
         handler = self._handler
         if handler is None:
             handler = lambda request: httpx.Response(200, json=chat_response())  # noqa: E731
@@ -347,12 +365,24 @@ def test_commands_reply_from_the_catalogue(command: str, key: str) -> None:
     assert harness.chat_call_count == 0, "a command is not a model turn"
 
 
-@pytest.mark.parametrize("command", ["/tasks", "/memory", "/forget"])
-def test_pending_commands_answer_with_the_not_available_message(command: str) -> None:
+@pytest.mark.parametrize("command", ["/tasks", "/memory"])
+def test_storage_commands_answer_either_from_storage_or_with_an_explicit_refusal(
+    command: str,
+) -> None:
+    """Phase 2 makes these real.
+
+    With a database they answer from it; without one (`STORE_BACKEND=memory`, development) they
+    say so explicitly instead of pretending. The same test body covers both backends — which is
+    the point of criterion (f).
+    """
+
     with Harness() as harness:
         harness.post(_message_update(update_id=1, text=command))
 
-    assert harness.telegram.sent_texts == [messages.render("error.not_available", command=command)]
+    if STORE_BACKEND == "postgres":
+        assert harness.telegram.sent_texts == [messages.render("tasks.empty" if command == "/tasks" else "memory.empty")]
+    else:
+        assert harness.telegram.sent_texts == [messages.render("error.storage_unavailable")]
 
 
 def test_commands_accept_the_botname_suffix() -> None:
@@ -360,6 +390,18 @@ def test_commands_accept_the_botname_suffix() -> None:
         harness.post(_message_update(update_id=1, text="/help@mi_bot"))
 
     assert harness.telegram.sent_texts == [messages.render("help")]
+
+
+def test_forget_without_an_argument_explains_the_syntax() -> None:
+    with Harness() as harness:
+        harness.post(_message_update(update_id=1, text="/forget"))
+
+    expected = (
+        messages.render("forget.needs_key")
+        if STORE_BACKEND == "postgres"
+        else messages.render("error.storage_unavailable")
+    )
+    assert harness.telegram.sent_texts == [expected]
 
 
 def test_an_unknown_command_answers_with_help() -> None:

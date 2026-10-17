@@ -20,9 +20,12 @@ aprobaciones, RAG documental y despliegue en Google Cloud) se añaden por fases.
 - Validar el secreto del webhook en cada petición y limitar el tamaño del cuerpo.
 - Procesar cada `update_id` **una sola vez**, aunque Telegram lo reintente.
 - Limitar la frecuencia por usuario y avisar una sola vez por ventana.
-- Comandos: `/start`, `/help`, `/reset`. Los comandos `/tasks`, `/memory` y `/forget` ya
-  existen en la superficie y responden que todavía no están disponibles, para que no cambien
-  cuando llegue la fase que los implementa.
+- Guardar y consultar **preferencias explícitas** (`/memory`) y borrarlas (`/forget`).
+- Crear, listar, completar y cancelar **recordatorios** con zona horaria IANA (`/tasks`).
+- Registrar cada `update_id` en una tabla: la idempotencia sobrevive a los reinicios.
+- Despachar recordatorios con la lógica de reclamo, reconciliación y avance de estado de
+  `PLAN.md` §5.2 (`python -m app.jobs.dispatch_reminders`).
+- Comandos: `/start`, `/help`, `/reset`, `/tasks`, `/memory`, `/forget`.
 - Registrar logs estructurados en JSON, sin secretos, sin contenido de mensajes y sin
   embeddings.
 
@@ -87,6 +90,44 @@ El servicio arranca **sin secretos**: sin `TELEGRAM_BOT_TOKEN`, sin `OLLAMA_API_
 lista de usuarios vacía. En ese estado `/healthz` responde y ninguna petición de Telegram se
 atiende, porque la lista está vacía (denegación por defecto).
 
+## Base de datos (Fase 2)
+
+```bash
+# 1. PostgreSQL 17 con pgvector
+bash scripts/run_local_db.sh          # o el `docker run` equivalente del README de más abajo
+
+# 2. DSN en .env
+#   DATABASE_URL=postgresql+psycopg://postgres:postgres@127.0.0.1:55432/taa
+#   DATABASE_SYNC_URL=postgresql+psycopg://postgres:postgres@127.0.0.1:55432/taa
+
+# 3. Esquema desde una base vacía + tablas del checkpointer + verificación
+uv run python scripts/bootstrap_db.py
+
+#    OK: 12 application tables + 4 checkpoint tables, pgvector 0.8.7, HNSW index present,
+#        trigger present, 1 active embedding model.
+
+# 4. Servicio con almacenamiento duradero
+STORE_BACKEND=postgres uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+`scripts/migrate.py` envuelve Alembic con una comprobación previa y un guardián de producción:
+
+```bash
+uv run python scripts/migrate.py current
+uv run python scripts/migrate.py upgrade head
+uv run python scripts/migrate.py downgrade -1 --i-have-a-backup   # solo en producción si hace falta
+```
+
+Las tablas del checkpointer de LangGraph las crea la propia librería (`PostgresSaver.setup()`),
+no Alembic: la especificación §8 pide no reinventar su formato.
+
+### Despacho de recordatorios
+
+```bash
+uv run python -m app.jobs.dispatch_reminders
+# JOB_REPORT {"claimed": 1, "sent": [...], "skipped": [], "failed": [], ...}
+```
+
 ### Comandos de prueba
 
 ```bash
@@ -97,6 +138,12 @@ uv run pytest -m "not integration and not live and not eval"
 # Pruebas de integración: levantan la aplicación completa con transportes simulados.
 # Tampoco necesitan credenciales.
 uv run pytest -m integration
+
+# Las mismas pruebas de integración, contra PostgreSQL en lugar de la memoria.
+TEST_STORE_BACKEND=postgres TEST_DATABASE_URL=postgresql+psycopg://postgres:postgres@127.0.0.1:55432/taa   uv run pytest -m integration
+
+# Solo las pruebas que necesitan base de datos (se saltan si no hay TEST_DATABASE_URL).
+TEST_DATABASE_URL=postgresql+psycopg://postgres:postgres@127.0.0.1:55432/taa   uv run pytest tests/integration/test_phase2_db.py
 
 # Cobertura de la suite sin credenciales
 uv run pytest -m "not integration and not live and not eval" --cov=app --cov-report=term-missing
@@ -198,12 +245,16 @@ incluye `.env`, claves ni ficheros de servicio.
 
 ## Limitaciones conocidas de la Fase 1
 
-- **Sin persistencia.** El contexto de la conversación y la idempotencia viven en memoria: al
-  reiniciar se pierden, y no hay soporte multiinstancia (`STORE_BACKEND=memory` es un error de
-  arranque en `production`).
-- **Sin herramientas reales.** El grafo tiene un solo nodo: no hay recordatorios, memoria,
-  documentos, búsqueda web ni aprobaciones. Esas capacidades llegan en las fases 2 a 4.
-- **`/tasks`, `/memory` y `/forget` no están implementados**; responden indicándolo.
+- **`STORE_BACKEND=memory` no persiste nada** y no soporta varias instancias (es un error de
+  arranque en `production`). Con ese backend, `/tasks`, `/memory` y `/forget` responden que no
+  pueden acceder a los datos, en lugar de fingir que los han guardado.
+- **Sin herramientas en el grafo.** El modelo no puede crear recordatorios todavía: los
+  comandos funcionan, pero la selección de herramientas por el modelo llega en la Fase 3.
+- **Sin RAG.** Los documentos llegan en la Fase 4; las tablas de documentos, el índice HNSW y
+  `embedding_models` ya existen en el esquema.
+- **El despachador no está programado.** `python -m app.jobs.dispatch_reminders` se ejecuta a
+  mano; Cloud Scheduler y el Cloud Run Job son Fase 5.
+- **`RATE_LIMIT_PER_MINUTE` es por instancia** (el cubo de fichas es local al proceso).
 - **`429` de Telegram: la respuesta se pierde.** Si la Bot API responde `429`, el cliente
   lanza `TelegramRateLimited` con el `retry_after` que indique Telegram, pero **no se espera ni
   se reintenta**: la respuesta de ese turno no se entrega y el `update` queda marcado como
@@ -240,7 +291,11 @@ app/
   bot/                  cliente de la Bot API, handlers, catálogo de textos en español
   agent/                grafo LangGraph, estado, prompts
   llm/                  puertos (protocolos) y cliente de Ollama
-  storage/              protocolos de almacén e implementaciones en memoria
+  storage/              modelos, migraciones de datos, repositorios, checkpointer y almacenes
+  services/             conversación, recordatorios y entrega de mensajes
+  tools/                memoria y recordatorios: esquemas de argumentos y resultados tipados
+  jobs/                 despacho de recordatorios (una sola ejecución, sin bucles)
+migrations/             revisiones de Alembic (0001..0006)
 scripts/verify_ollama.py
 tests/unit/  tests/integration/
 ```

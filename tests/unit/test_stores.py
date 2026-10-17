@@ -6,6 +6,7 @@ import pytest
 
 from app.llm.protocols import ChatMessage
 from app.storage.stores import (
+    GraphConversationStore,
     STATUS_IGNORED,
     STATUS_NOTICED,
     STATUS_PROCESSED,
@@ -128,6 +129,11 @@ async def test_context_expires_after_the_ttl() -> None:
 # --------------------------------------------------------------------------- #
 # Selection and the production refusal (B6, A13)
 # --------------------------------------------------------------------------- #
+class _FakeHistory:
+    async def history(self, thread_id: str) -> list[ChatMessage]:
+        return []
+
+
 def test_build_stores_returns_the_in_memory_implementations_outside_production() -> None:
     dedupe, conversations = build_stores(
         store_backend="memory",
@@ -136,9 +142,12 @@ def test_build_stores_returns_the_in_memory_implementations_outside_production()
         update_dedupe_max_entries=10,
         context_max_messages=5,
         context_ttl_seconds=60,
+        history_provider=_FakeHistory(),
     )
     assert isinstance(dedupe, InMemoryDedupeStore)
-    assert isinstance(conversations, InMemoryConversationStore)
+    # Phase 2: both backends expose the same ConversationStore semantics, because history
+    # comes from the checkpointer; only the saver and the registry differ.
+    assert isinstance(conversations, GraphConversationStore)
 
 
 def test_build_stores_refuses_memory_in_production() -> None:
@@ -150,13 +159,14 @@ def test_build_stores_refuses_memory_in_production() -> None:
             update_dedupe_max_entries=10,
             context_max_messages=5,
             context_ttl_seconds=60,
+            history_provider=_FakeHistory(),
         )
 
 
-def test_postgres_backend_is_not_implemented_in_phase_1() -> None:
-    """Phase 2 lands it; until then the failure must be explicit, not silent."""
+def test_postgres_backend_requires_a_session_factory() -> None:
+    """Phase 2 implements it; a missing dependency must fail loudly, not silently."""
 
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(ValueError, match="session factory"):
         build_stores(
             store_backend="postgres",
             app_env="development",
@@ -164,6 +174,7 @@ def test_postgres_backend_is_not_implemented_in_phase_1() -> None:
             update_dedupe_max_entries=10,
             context_max_messages=5,
             context_ttl_seconds=60,
+            history_provider=_FakeHistory(),
         )
 
 
@@ -177,8 +188,33 @@ async def test_stores_satisfy_the_protocols() -> None:
         update_dedupe_max_entries=10,
         context_max_messages=5,
         context_ttl_seconds=60,
+        history_provider=_FakeHistory(),
     )
     assert isinstance(dedupe, DedupeStore)
     assert isinstance(conversations, ConversationStore)
     await dedupe.mark(1, status=STATUS_PROCESSED)
     assert await dedupe.status_of(1) == STATUS_PROCESSED
+
+
+def test_a_history_provider_is_required() -> None:
+    """History comes from the checkpointed thread state, never from a table (NN1)."""
+
+    with pytest.raises(ValueError, match="history provider"):
+        build_stores(
+            store_backend="memory",
+            app_env="development",
+            update_dedupe_ttl_seconds=60,
+            update_dedupe_max_entries=10,
+            context_max_messages=5,
+            context_ttl_seconds=60,
+        )
+
+
+async def test_the_memory_conversation_store_is_a_test_double_for_the_old_protocol() -> None:
+    """Kept deliberately: the unit tests need a trivial get/append/reset implementation."""
+
+    store = InMemoryConversationStore(max_messages=2, ttl_seconds=60)
+    await store.append(1, [ChatMessage(role="user", content="a")])
+    assert len(await store.get(1)) == 1
+    await store.reset(1)
+    assert await store.get(1) == []

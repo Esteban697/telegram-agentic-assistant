@@ -1812,7 +1812,11 @@ truncation would produce an embedding of an unknown prefix — the worst kind of
    tool argument, or model output.
 3. **Reading:** exactly one function may issue a vector `ORDER BY` —
    `storage/repositories.py::search_chunks(owner_user_id: int, query_embedding: list[float],
-   embed_model: str, pipeline_version: int, top_k: int, document_ids: Sequence[uuid.UUID] | None)`
+   embed_model: str, top_k: int, document_ids: Sequence[uuid.UUID] | None)`
+   (the earlier draft carried a `pipeline_version: int` parameter, **removed when Phase 2 froze the
+   signature**: the eligible version is the *document's* current one, which the join below already
+   derives, so a caller-supplied value is redundant at best and wrong at worst — honouring it as a
+   filter would hide a document awaiting re-index, which is the exact failure RB3-follow-on corrected)
    — with the owner predicate **inside the SQL literal**, not as an optional caller-supplied filter,
    and with the **document's own current version inside the literal too** (RB3-follow-on, corrected in
    round 3): the query joins

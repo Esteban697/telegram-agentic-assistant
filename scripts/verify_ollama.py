@@ -14,9 +14,11 @@ Exit codes:
 * ``1`` — the probe ran and the model failed a capability. Tool calling being unsupported is
   the case PLAN.md §10 Phase 1 A10 calls out; the phase then closes with this recorded output
   and the fallback decision, never with a claim that tool calling works.
-* ``2`` — no ``OLLAMA_API_KEY`` is configured (neither in ``.env`` nor in the environment),
-  or the application configuration is invalid, so the probe could not run at all (pending
-  external validation).
+* ``2`` — no ``OLLAMA_API_KEY`` is configured (neither in ``.env`` nor in the environment), or a
+  configured value is malformed enough that the settings cannot be read at all, so the probe
+  could not run (pending external validation). An application *rule* the configuration violates
+  — a database DSN pair, a production-only guard — is warned about and the probe still runs,
+  because it answers a question about model capability, not about deployment.
 
 The authoritative model name is printed from ``/api/tags`` rather than trusted from
 configuration, because the cloud catalogue and the CLI disagree about the ``:cloud`` suffix
@@ -32,6 +34,8 @@ import sys
 import time
 from pathlib import Path
 
+from pydantic import ValidationError
+
 # Allow `python scripts/verify_ollama.py` without an editable install.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -40,7 +44,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-from app.config import load_settings  # noqa: E402
+from app.config import Settings, load_settings  # noqa: E402
 from app.errors import ConfigError, OllamaError  # noqa: E402
 from app.llm.ollama_client import OllamaChatClient  # noqa: E402
 from app.llm.protocols import ChatMessage, ToolSpec  # noqa: E402
@@ -231,7 +235,18 @@ def resolve_config(argv: list[str] | None = None) -> tuple[str, str, str, float]
     parser.add_argument("--timeout", type=float, default=60.0)
     args = parser.parse_args(argv)
 
-    settings = load_settings()
+    try:
+        settings = load_settings()
+    except ConfigError as exc:
+        # A probe is a diagnostic. A configuration fault with nothing to do with model
+        # capability — a database DSN pair, a missing production-only value — must not make
+        # A10 unrunnable, and must not be reported as "no key configured". Warn, then read the
+        # values the probe actually needs. (A *malformed* value still fails below, because then
+        # ``Settings`` cannot be constructed at all and there is genuinely nothing to read.)
+        print(f"WARNING: the application configuration is not valid: {exc}")
+        print("         Probing anyway — A10 asks whether the model can call tools.")
+        settings = Settings()
+
     return (
         args.base_url or settings.ollama_base_url,
         args.model or settings.llm_model,
@@ -243,10 +258,10 @@ def resolve_config(argv: list[str] | None = None) -> tuple[str, str, str, float]
 def main(argv: list[str] | None = None) -> int:
     try:
         base_url, model, api_key, timeout = resolve_config(argv)
-    except ConfigError as exc:
-        # A probe cannot say anything useful about a model if the configuration it would run
-        # with is itself invalid, so this is reported rather than raised as a traceback.
-        print(f"RESULT: cannot resolve configuration — {exc}")
+    except (ConfigError, ValidationError) as exc:
+        # Only reachable when a configured value is malformed enough that ``Settings`` cannot be
+        # constructed — there is then nothing to probe with, so say so rather than traceback.
+        print(f"RESULT: cannot read configuration — {exc}")
         print("A10 is PENDING EXTERNAL VALIDATION, not passed.")
         return EXIT_PENDING
 

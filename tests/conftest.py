@@ -14,15 +14,25 @@ Two principles, both from PLAN.md §9:
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
 import pytest
+import sqlalchemy as sa
 
 from app.bot.telegram_client import DownloadedFile, SentMessage
 from app.config import Settings
 from app.llm.ollama_client import OllamaChatClient
+from app.storage.postgres import use_compatible_event_loop
+
+# Windows: psycopg's async mode cannot run on the default ProactorEventLoop, so the policy must
+# be installed before pytest-asyncio creates any loop. No-op on Linux.
+use_compatible_event_loop()
+
+# The DSN the DB-backed tests use. Unset => those tests skip with an explicit reason.
+TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL", "")
 
 CHAT_ID = 4242
 USER_ID = 42
@@ -170,6 +180,62 @@ class OllamaStub:
     @property
     def chat_bodies_for_model(self) -> list[str]:
         return [str(body.get("model")) for body in self.chat_bodies]
+
+
+def make_db_settings(**overrides: Any) -> Settings:
+    """Settings pointing at the test database."""
+
+    base: dict[str, Any] = {
+        "store_backend": "postgres",
+        "database_url": TEST_DATABASE_URL,
+        "database_sync_url": TEST_DATABASE_URL,
+    }
+    base.update(overrides)
+    return make_settings(**base)
+
+
+def truncate_all(settings: Settings) -> None:
+    """Empty every application table (the checkpointer's included) for test isolation."""
+
+    engine = sa.create_engine(settings.database_sync_url.get_secret_value(), poolclass=sa.pool.NullPool)
+    try:
+        with engine.begin() as connection:
+            tables = [
+                "work_items",
+                "tool_invocations",
+                "reminder_dispatches",
+                "tasks",
+                "pending_actions",
+                "embedding_models",
+                "document_chunks",
+                "documents",
+                "memories",
+                "inbox_updates",
+                "messages",
+                "conversations",
+                "checkpoint_writes",
+                "checkpoint_blobs",
+                "checkpoints",
+            ]
+            existing = {
+                row[0]
+                for row in connection.execute(
+                    sa.text("SELECT table_name FROM information_schema.tables WHERE table_schema='public'")
+                )
+            }
+            for table in tables:
+                if table in existing:
+                    connection.execute(sa.text(f"TRUNCATE {table} CASCADE"))
+        with engine.begin() as connection:
+            # TRUNCATE removes the seeded row too, so restore the single active model.
+            connection.execute(
+                sa.text(
+                    "INSERT INTO embedding_models (model_name, dim, pipeline_version, is_active) "
+                    "VALUES ('embeddinggemma', 768, 1, true) ON CONFLICT (model_name) DO NOTHING"
+                )
+            )
+    finally:
+        engine.dispose()
 
 
 @pytest.fixture

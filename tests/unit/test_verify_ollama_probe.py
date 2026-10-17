@@ -30,9 +30,19 @@ def _write_env(directory: Path, **values: str) -> None:
 
 @pytest.fixture
 def isolated_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Run in a directory whose only configuration is the ``.env`` a test writes."""
+    """Run in a directory whose only configuration is the ``.env`` a test writes.
+
+    The database variables are cleared too: this file tests *model* resolution, so it must not
+    be sensitive to whatever DSN the surrounding environment happens to carry.
+    """
     monkeypatch.chdir(tmp_path)
-    for name in ("OLLAMA_API_KEY", "OLLAMA_BASE_URL", "LLM_MODEL"):
+    for name in (
+        "OLLAMA_API_KEY",
+        "OLLAMA_BASE_URL",
+        "LLM_MODEL",
+        "DATABASE_URL",
+        "DATABASE_SYNC_URL",
+    ):
         monkeypatch.delenv(name, raising=False)
     return tmp_path
 
@@ -106,3 +116,21 @@ def test_main_does_not_report_pending_when_the_key_comes_from_the_env_file(
     monkeypatch.setattr("verify_ollama.run_probe", _stub_probe)
 
     assert main([]) != EXIT_PENDING
+
+
+def test_an_invalid_application_rule_does_not_block_the_probe(
+    isolated_env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A deployment-config fault must not make A10 unrunnable, nor report it as "no key".
+
+    Phase 2 added a rule that a set ``DATABASE_URL`` requires ``DATABASE_SYNC_URL``. A probe
+    answering a *model capability* question must not be blocked by that, and must not conflate
+    it with a missing key. Before this fix ``resolve_config`` raised ``ConfigError`` here.
+    """
+    _write_env(isolated_env, OLLAMA_API_KEY="key-from-dotenv")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://postgres:postgres@127.0.0.1:9/none")
+
+    _, _, api_key, _ = resolve_config([])
+
+    assert api_key == "key-from-dotenv"
+    assert "not valid" in capsys.readouterr().out

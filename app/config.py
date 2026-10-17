@@ -15,6 +15,7 @@ Two rules from the plan drive the design here:
 from __future__ import annotations
 
 import re
+import zoneinfo
 from typing import Annotated, Any, Literal
 
 from pydantic import Field, SecretStr, field_validator
@@ -88,6 +89,27 @@ class Settings(BaseSettings):
     context_ttl_seconds: int = Field(default=3600, gt=0)
     update_dedupe_ttl_seconds: int = Field(default=3600, gt=0)
     update_dedupe_max_entries: int = Field(default=10_000, gt=0)
+
+    # --- Database (Phase 2) ------------------------------------------------ #
+    # Async DSN for the application (SQLAlchemy + psycopg 3 async); the sync DSN is what
+    # Alembic and the scripts use. Decision 1: migrations stay on the well-trodden sync path.
+    database_url: SecretStr = SecretStr("")
+    database_sync_url: SecretStr = SecretStr("")
+    db_pool_size: int = Field(default=4, gt=0)
+    checkpointer_pool_size: int = Field(default=3, gt=0)
+    migrations_autorun: bool = False
+    default_timezone: str = "Europe/Madrid"
+
+    # --- Reminders (Phase 2: claiming logic; scheduling is Phase 5) --------- #
+    reminder_batch_size: int = Field(default=50, gt=0)
+    reminder_max_attempts: int = Field(default=5, gt=0)
+    # Must exceed the dispatcher's own maximum run time, or Phase 0 reconciliation can mark
+    # an in-flight send as `unknown` while the message is still being delivered (RN4).
+    dispatcher_lease_seconds: int = Field(default=900, gt=0)
+    # `telegram` is the only value allowed in production; `record` appends each send to a file
+    # so the concurrency acceptance criterion can be observed from outside the process.
+    notifications_transport: Literal["telegram", "record"] = "telegram"
+    notify_record_path: str = ""
 
     # ------------------------------------------------------------------ #
     # Validators
@@ -192,12 +214,44 @@ class Settings(BaseSettings):
         if not self.telegram_api_base_url.startswith(("https://", "http://")):
             found.append("TELEGRAM_API_BASE_URL must be an absolute http(s) URL")
 
+        if self.default_timezone:
+            try:
+                zoneinfo.ZoneInfo(self.default_timezone)
+            except (zoneinfo.ZoneInfoNotFoundError, ValueError):
+                found.append(
+                    f"DEFAULT_TIMEZONE {self.default_timezone!r} is not a valid IANA zone "
+                    "(the task due dates are stored with it)"
+                )
+
+        if self.store_backend == "postgres" and not self.database_url.get_secret_value():
+            found.append(
+                "STORE_BACKEND=postgres requires DATABASE_URL; without it there is nowhere "
+                "to persist conversations, memories or reminders"
+            )
+        if self.database_url.get_secret_value() and not self.database_sync_url.get_secret_value():
+            found.append(
+                "DATABASE_URL is set but DATABASE_SYNC_URL is not: Alembic and the scripts "
+                "need the synchronous DSN (they do not run inside the event loop)"
+            )
+        if self.notifications_transport == "record" and not self.notify_record_path:
+            found.append("NOTIFICATIONS_TRANSPORT=record requires NOTIFY_RECORD_PATH")
+
         # --- The fail-fast list of PLAN.md §7.2 (production only) ---------- #
         if self.app_env == "production":
             if self.store_backend == "memory":
                 found.append(
                     "STORE_BACKEND=memory is not allowed in production: the in-memory "
                     "stores lose update-id idempotency across instances (PLAN.md §7.2)"
+                )
+            if self.notifications_transport == "record":
+                found.append(
+                    "NOTIFICATIONS_TRANSPORT=record is not allowed in production: it writes "
+                    "messages to a file instead of delivering them"
+                )
+            if self.migrations_autorun:
+                found.append(
+                    "MIGRATIONS_AUTORUN=true is not allowed in production: a schema change "
+                    "must never be a side effect of starting a service (PLAN.md §11.6)"
                 )
             if self.dev_allow_any_user:
                 found.append(
