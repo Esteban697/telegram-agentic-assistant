@@ -1,0 +1,38 @@
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+
+# Test and tooling artefacts are not part of the runtime image.
+# `scripts/` is deliberately NOT excluded: the Ollama compatibility probe ships in the image
+# so an operator can run it against a real key without rebuilding.
+tests/
+docs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Never ship secrets or keys.
+*.pem
+*.key
+*.p12
+*.pfx
+service-account*.json
+
+PLAN.md
+PLAN-REVIEW-LOG.md
+PROJECT_SPEC.md
+.claude/

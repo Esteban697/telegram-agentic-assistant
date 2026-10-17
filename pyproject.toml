@@ -1,0 +1,58 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "telegram-agentic-assistant"
+version = "0.1.0"
+description = "Asistente personal en Telegram impulsado por Ollama Cloud (Fase 1)"
+readme = "README.md"
+requires-python = ">=3.13"
+license = { text = "Proprietary" }
+
+# Pinned exactly as PLAN.md §2.4 requires.
+#
+# Phase 1 scope (§10 Phase 1, deliverable 2): only the packages Phase 1 actually
+# imports are declared. §2.4's set also pins sqlalchemy / alembic / psycopg /
+# pgvector / langgraph-checkpoint-postgres / google-cloud-storage / pypdf, which
+# belong to Phases 2 and 4; declaring them here would be dead configuration,
+# which PLAN.md §9.1 forbids ("every variable ... has at least one non-test
+# reader" is the same rule applied to dependencies). They are added in the phase
+# that imports them.
+dependencies = [
+    "fastapi==0.143.3",
+    "uvicorn[standard]==0.54.0",
+    "pydantic==2.14.1",
+    "pydantic-settings==2.16.0",
+    "httpx==0.28.1",
+    # LangGraph is used from Phase 1 on purpose (§10 Phase 1 deliverable 9) so
+    # that Phase 2 only has to attach the checkpointer instead of restructuring.
+    "langgraph==1.2.15",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.1.1",
+    "pytest-asyncio==1.4.0",
+    "pytest-cov==7.1.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.pytest.ini_options]
+# `-m 'not live'` keeps credential-requiring tests out of every default run
+# (PLAN.md §9.4); `--strict-markers` turns a typo in a marker into an error
+# instead of a silently-unfiltered test.
+addopts = "-m 'not live' --strict-markers -q"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "integration: needs no external credentials but exercises the full app wiring",
+    "eval: RAG / agent evaluations (Phase 4)",
+    "live: requires real credentials (OLLAMA_API_KEY, TELEGRAM_BOT_TOKEN, GCP)",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["app"]

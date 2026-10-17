@@ -1,0 +1,5 @@
+# Repository and working tree both use LF, so the Dockerfile and any future
+# shell script behave identically on Windows and Linux.
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
