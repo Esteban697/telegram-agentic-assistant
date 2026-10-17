@@ -109,6 +109,18 @@ class ConversationStore(Protocol):
         """Rotate the context revision; returns the new thread id."""
         ...
 
+    async def conversation_id(self, *, user_id: int, chat_id: int) -> Any:
+        """Resolve (creating if needed) and return the conversation's id.
+
+        `GraphConversationStore` is the only implementation that can answer this, and it does so
+        through the registry it already holds.
+        """
+
+        resolver = getattr(self._registry, "conversation_id", None)
+        if resolver is None:
+            return None
+        return await resolver(user_id=user_id, chat_id=chat_id)
+
     async def record_turn(
         self,
         *,
@@ -273,6 +285,13 @@ class SqlConversationRegistry:
             await repositories.touch_conversation(session, conversation_id=conversation.id)
             return conversation.thread_id
 
+    async def conversation_id(self, *, user_id: int, chat_id: int) -> Any:
+        async with self._sessions() as session, session.begin():
+            conversation = await repositories.get_or_create_active_conversation(
+                session, telegram_user_id=user_id, telegram_chat_id=chat_id
+            )
+            return conversation.id
+
     async def rotate(self, *, chat_id: int) -> str:
         async with self._sessions() as session, session.begin():
             conversation = await repositories.get_active_conversation(
@@ -330,6 +349,14 @@ class GraphConversationStore:
         thread_id = await self._registry.rotate(chat_id=chat_id)
         self._threads[chat_id] = thread_id
         return thread_id
+
+    async def conversation_id(self, *, user_id: int, chat_id: int) -> Any:
+        """The conversation row's id, for rows that reference it (the watchdog)."""
+
+        resolver = getattr(self._registry, "conversation_id", None)
+        if resolver is None:
+            return None
+        return await resolver(user_id=user_id, chat_id=chat_id)
 
     async def record_turn(
         self,

@@ -1,12 +1,7 @@
-"""Shared tool plumbing: argument validation, timeouts, structured results.
+"""Shared tool plumbing: argument validation and structured results.
 
-Layer 4. Spec §10: "Todas las herramientas deben tener esquemas de argumentos, validación,
-timeout, límites, manejo de errores y resultados estructurados."
-
-A tool is a plain typed function over a pydantic argument model, returning a
-:class:`ToolResult`. Nothing here knows about the graph: Phase 3 binds these into the registry
-and the graph; Phase 2 calls them from the command handlers. Keeping the shape stable now is
-what lets Phase 3 add the registry without rewriting the tools.
+The `ToolSpec` that lived here in Phase 2 moved to :mod:`app.tools.registry`, which PLAN.md §2.1
+declares the single source of tool truth; this module keeps the two helpers both layers need.
 """
 
 from __future__ import annotations
@@ -17,7 +12,7 @@ from typing import Any, Generic, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
-from app.errors import AssistantError, CapabilityUnavailable
+from app.errors import AssistantError
 
 _logger = logging.getLogger(__name__)
 
@@ -46,21 +41,11 @@ class ToolResult(Generic[T]):
         return cls(ok=False, error_code=error_code, message_key=message_key, detail=detail, meta=meta)
 
 
-@dataclass(frozen=True, slots=True)
-class ToolSpec:
-    """Everything the registry (Phase 3) needs to expose a tool to the model."""
-
-    name: str
-    description: str
-    args_model: type[BaseModel]
-    risk_level: int  # 0 read, 1 reversible internal, 2 external commitment, 3 high impact
-
-
 def validate_args(model: type[BaseModel], raw: dict[str, Any]) -> BaseModel:
     """Validate arguments, turning pydantic's error into our taxonomy.
 
-    A model-supplied argument that fails validation raises a typed error the caller reports;
-    it must never be silently coerced into something executable.
+    A model-supplied argument that fails validation raises a typed error the caller reports; it
+    must never be silently coerced into something executable.
     """
 
     try:
@@ -72,4 +57,4 @@ def validate_args(model: type[BaseModel], raw: dict[str, Any]) -> BaseModel:
         ) from exc
 
 
-__all__ = ["ToolResult", "ToolSpec", "validate_args"]
+__all__ = ["ToolResult", "validate_args"]

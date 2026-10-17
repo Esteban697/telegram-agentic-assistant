@@ -430,6 +430,10 @@ class PendingAction(Base):
     chat_id: Mapped[int] = mapped_column(sa.BigInteger, nullable=False)
     action_type: Mapped[str] = mapped_column(sa.Text, nullable=False)
     args_json: Mapped[dict[str, Any]] = mapped_column(postgresql.JSONB, nullable=False)
+    # The canonical serialisation of the approved arguments, hashed by `args_hash`. It is stored
+    # as *text* because jsonb does not round-trip floats faithfully (`1e20` comes back as an int),
+    # which made the stale-hash guard refuse legitimate float arguments (migration 0007).
+    args_canonical: Mapped[str] = mapped_column(sa.Text, nullable=False, server_default=sa.text("''"))
     args_hash: Mapped[str] = mapped_column(sa.CHAR(64), nullable=False)
     args_revision: Mapped[int] = mapped_column(sa.Integer, nullable=False, server_default=sa.text("1"))
     state: Mapped[str] = mapped_column(sa.Text, nullable=False, server_default=sa.text("'pending'"))
@@ -493,6 +497,9 @@ class ToolInvocation(Base):
     attempt_no: Mapped[int] = mapped_column(sa.Integer, nullable=False, server_default=sa.text("1"))
     tool_call_id: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
     tool_name: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    # The canonical serialisation of the approved arguments, hashed by `args_hash`. It is stored
+    # as *text* because jsonb does not round-trip floats faithfully (`1e20` comes back as an int),
+    # which made the stale-hash guard refuse legitimate float arguments (migration 0007).
     args_hash: Mapped[str] = mapped_column(sa.CHAR(64), nullable=False)
     state: Mapped[str] = mapped_column(sa.Text, nullable=False, server_default=sa.text("'started'"))
     result_json: Mapped[dict[str, Any] | None] = mapped_column(postgresql.JSONB, nullable=True)

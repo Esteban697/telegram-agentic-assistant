@@ -31,4 +31,21 @@ def build_system_prompt(*, extra: str | None = None) -> str:
     return SYSTEM_PROMPT
 
 
-__all__ = ["SYSTEM_PROMPT", "build_system_prompt"]
+TOOL_HINT = (
+    "Herramientas disponibles: {available}.\n"
+    "Úsalas solo cuando aporten algo. Las que requieren aprobación se preparan y el usuario "
+    "decide: nunca afirmes que ya se han ejecutado. Si te falta un dato, pídelo antes de actuar."
+)
+
+
+def build_tool_hint(available: str) -> str:
+    """The tool-availability addendum, kept here because it is a prompt, not a reply.
+
+    Spanish lives in exactly two places: `app/bot/messages.py` for anything the user reads, and
+    this module for anything the model reads.
+    """
+
+    return TOOL_HINT.format(available=available)
+
+
+__all__ = ["SYSTEM_PROMPT", "TOOL_HINT", "build_system_prompt", "build_tool_hint"]

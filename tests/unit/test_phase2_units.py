@@ -14,10 +14,14 @@ from app.errors import AssistantError
 from app.llm.protocols import ChatMessage
 from app.services.conversation import ConversationService
 from app.services.reminders import retry_delay_seconds
-from app.tools.base import ToolResult, ToolSpec, validate_args
-from app.tools.memory import SPECS as MEMORY_SPECS
+from app.policy.risk import RiskLevel
+from app.tools.base import ToolResult, validate_args
+from app.tools.registry import ToolSpec
+from app.tools.memory import MemoryTools
+from app.tools.memory import specs as memory_specs
 from app.tools.memory import SavePreferenceArgs, SearchMemoryArgs
-from app.tools.tasks import SPECS as TASK_SPECS
+from app.tools.tasks import TaskTools
+from app.tools.tasks import specs as task_specs
 from app.tools.tasks import CreateReminderArgs, creation_key
 
 REPO = Path(__file__).resolve().parents[2]
@@ -28,17 +32,20 @@ REPOSITORIES = REPO / "app" / "storage" / "repositories.py"
 # Tool schemas (spec §10)
 # --------------------------------------------------------------------------- #
 def test_every_tool_has_a_schema_a_risk_level_and_a_description() -> None:
-    specs = (*MEMORY_SPECS, *TASK_SPECS)
+    specs = (*memory_specs(MemoryTools(sessions=None)), *task_specs(TaskTools(sessions=None)))
     assert specs, "no tool specs found"
     for spec in specs:
         assert isinstance(spec, ToolSpec)
         assert spec.name and spec.description
         assert issubclass(spec.args_model, __import__("pydantic").BaseModel)
-        assert spec.risk_level in {0, 1, 2, 3}
+        assert isinstance(spec.risk_level, RiskLevel)
 
 
 def test_the_read_and_write_levels_are_what_the_spec_says() -> None:
-    by_name = {spec.name: spec.risk_level for spec in (*MEMORY_SPECS, *TASK_SPECS)}
+    by_name = {
+        spec.name: spec.risk_level
+        for spec in (*memory_specs(MemoryTools(sessions=None)), *task_specs(TaskTools(sessions=None)))
+    }
     assert by_name["search_personal_memory"] == 0
     assert by_name["list_tasks"] == 0
     assert by_name["save_preference"] == 1

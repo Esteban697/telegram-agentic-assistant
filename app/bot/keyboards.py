@@ -13,6 +13,7 @@ from __future__ import annotations
 from typing import Any
 
 CALLBACK_PREFIX = "cmd:"
+APPROVAL_PREFIX = "ap"
 
 # The commands the menu exposes. `/tasks`, `/memory` and `/forget` work from Phase 2 but
 # stay off the menu: the menu is for the two stateless commands, while the other three are
@@ -34,6 +35,48 @@ def main_menu_keyboard() -> dict[str, Any]:
     }
 
 
+def approval_keyboard(
+    *, action_id: str, approve: bool, args_revision: int, args_hash: str
+) -> dict[str, Any]:
+    """The two buttons of an approval prompt.
+
+    `callback_data` is `ap:<action_id>:<a|r>:<args_revision>:<args_hash[:16]>` — 48 bytes, inside
+    Telegram's 64-byte cap (PLAN.md §4.1). The full 32-byte hash does not fit, which is why the
+    claim compares the row's *prefix*.
+    """
+
+    from app.policy.approval import build_callback_data
+
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": "Aprobar",
+                    "callback_data": build_callback_data(
+                        action_id=action_id,
+                        approve=True,
+                        args_revision=args_revision,
+                        args_hash=args_hash,
+                    ),
+                },
+                {
+                    "text": "Rechazar",
+                    "callback_data": build_callback_data(
+                        action_id=action_id,
+                        approve=False,
+                        args_revision=args_revision,
+                        args_hash=args_hash,
+                    ),
+                },
+            ]
+        ]
+    }
+
+
+def is_approval_callback(data: str) -> bool:
+    return data.startswith(f"{APPROVAL_PREFIX}:")
+
+
 def parse_callback_data(data: str) -> str | None:
     """Return the command name carried by a menu callback, or None if it is not one.
 
@@ -50,4 +93,11 @@ def parse_callback_data(data: str) -> str | None:
     return name if name in known else None
 
 
-__all__ = ["CALLBACK_PREFIX", "main_menu_keyboard", "parse_callback_data"]
+__all__ = [
+    "APPROVAL_PREFIX",
+    "CALLBACK_PREFIX",
+    "approval_keyboard",
+    "is_approval_callback",
+    "main_menu_keyboard",
+    "parse_callback_data",
+]

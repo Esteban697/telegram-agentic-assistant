@@ -32,6 +32,7 @@ import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.policy.approval import RowView, canonical_args
 from app.storage.models import (
     Conversation,
     Document,
@@ -862,7 +863,575 @@ async def search_chunks(
     ]
 
 
+
+# --------------------------------------------------------------------------- #
+# Phase 3: approvals, the tool ledger and the resume queue
+#
+# All SQL stays in this one module (PLAN.md §2.1, §15): the statements below are the §4.2
+# CAS, the §4.5 diagnostic read, the §5.3 ledger and the §5.5 watchdog queue.
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True, slots=True)
+class ClaimedAction:
+    """What a successful claim returns to the executor."""
+
+    id: UUID
+    action_id: str
+    action_type: str
+    args_json: dict[str, Any]
+    args_canonical: str
+    args_hash: str
+    args_revision: int
+    idempotency_key: str
+    user_id: int
+    chat_id: int
+    attempts: int
+
+
+async def insert_action(
+    session: AsyncSession,
+    *,
+    action_id: str,
+    user_id: int,
+    chat_id: int,
+    action_type: str,
+    args_json: dict[str, Any],
+    args_hash: str,
+    args_revision: int,
+    idempotency_key: str,
+    preview_text: str,
+    expires_at: datetime,
+) -> UUID | None:
+    """Create a pending action, or return `None` if an identical live one already exists.
+
+    The partial unique index on `(user_id, action_type, args_hash) WHERE state IN
+    ('pending','approved','executing')` is the arbiter: the model cannot stack three identical
+    approval prompts.
+    """
+
+    statement = (
+        sa.text(
+            """
+            INSERT INTO pending_actions
+                (action_id, user_id, chat_id, action_type, args_json, args_canonical, args_hash,
+                 args_revision, state, idempotency_key, preview_text, expires_at)
+            VALUES
+                (:action_id, :user_id, :chat_id, :action_type, CAST(:args_json AS jsonb),
+                 :args_canonical, :args_hash, :args_revision, 'pending', :idempotency_key,
+                 :preview_text, :expires_at)
+            ON CONFLICT (user_id, action_type, args_hash)
+                WHERE state IN ('pending', 'approved', 'executing')
+            DO NOTHING
+            RETURNING id
+            """
+        ).bindparams(
+            action_id=action_id,
+            user_id=user_id,
+            chat_id=chat_id,
+            action_type=action_type,
+            args_json=canonical_args(args_json),
+            args_canonical=canonical_args(args_json),
+            args_hash=args_hash,
+            args_revision=args_revision,
+            idempotency_key=idempotency_key,
+            preview_text=preview_text,
+            expires_at=expires_at,
+        )
+    )
+    # `args_json` reaches the column as the canonical serialisation, so the value inserted is
+    # exactly the value the hash was computed from (sorted keys, no insignificant whitespace);
+    # `CAST(... AS jsonb)` in the statement pins the type without a nested bind parameter.
+    return (await session.execute(statement)).scalar_one_or_none()
+
+
+async def decide_action(
+    session: AsyncSession,
+    *,
+    action_id: str,
+    user_id: int,
+    chat_id: int,
+    args_revision: int,
+    approve: bool,
+) -> UUID | None:
+    """Step 1: the guarded decision CAS. Zero rows means "diagnose, do not guess"."""
+
+    target = "approved" if approve else "rejected"
+    statement = (
+        sa.text(
+            """
+            UPDATE pending_actions
+               SET state = :target, decided_at = now(), decided_by = :user_id
+             WHERE action_id     = :action_id
+               AND state         = 'pending'
+               AND user_id       = :user_id
+               AND chat_id       = :chat_id
+               AND args_revision = :args_revision
+               AND expires_at    > now()
+            RETURNING id
+            """
+        ).bindparams(
+            target=target,
+            action_id=action_id,
+            user_id=user_id,
+            chat_id=chat_id,
+            args_revision=args_revision,
+        )
+    )
+    return (await session.execute(statement)).scalar_one_or_none()
+
+
+async def claim_action(
+    session: AsyncSession,
+    *,
+    action_id: str,
+    user_id: int,
+    chat_id: int,
+    args_revision: int,
+    args_hash_prefix: str,
+    executor: str,
+) -> ClaimedAction | None:
+    """Step 2: the consumption CAS.
+
+    All five of spec §7's re-checks are in this one statement — `estado`, `usuario`, `chat`,
+    `argumentos` (revision *and* hash) and `caducidad` — so the mutual exclusion is the row lock
+    and there is no read-then-write window. The hash is compared against the row's **prefix**,
+    because that is all `callback_data` can carry (N1/RN9).
+    """
+
+    statement = (
+        sa.text(
+            """
+            UPDATE pending_actions
+               SET state = 'executing', claimed_at = now(), claimed_by = :executor,
+                   attempts = attempts + 1, executed_at = now()
+             WHERE action_id     = :action_id
+               AND state         = 'approved'
+               AND user_id       = :user_id
+               AND chat_id       = :chat_id
+               AND args_revision = :args_revision
+               AND left(args_hash, :prefix_len) = :args_hash_prefix
+               AND expires_at    > now()
+            RETURNING id, action_id, action_type, args_json, args_canonical, args_hash,
+                      args_revision, idempotency_key, user_id, chat_id, attempts
+            """
+        ).bindparams(
+            action_id=action_id,
+            user_id=user_id,
+            chat_id=chat_id,
+            args_revision=args_revision,
+            prefix_len=len(args_hash_prefix),
+            args_hash_prefix=args_hash_prefix,
+            executor=executor,
+        )
+    )
+    row = (await session.execute(statement)).first()
+    if row is None:
+        return None
+    return ClaimedAction(
+        id=row[0],
+        action_id=row[1],
+        action_type=row[2],
+        args_json=row[3],
+        args_canonical=row[4],
+        args_hash=row[5],
+        args_revision=row[6],
+        idempotency_key=row[7],
+        user_id=row[8],
+        chat_id=row[9],
+        attempts=row[10],
+    )
+
+
+async def diagnose_action(session: AsyncSession, *, action_id: str) -> RowView | None:
+    """The §4.5 diagnostic read: `SELECT` only, so it cannot change the outcome."""
+
+    row = (
+        await session.execute(
+            sa.text(
+                """
+                SELECT state, args_revision, args_hash, expires_at, user_id, chat_id, decided_by
+                  FROM pending_actions WHERE action_id = :action_id
+                """
+            ).bindparams(action_id=action_id)
+        )
+    ).first()
+    if row is None:
+        return None
+    return RowView(
+        state=row[0],
+        args_revision=row[1],
+        args_hash=row[2],
+        expires_at=row[3],
+        user_id=row[4],
+        chat_id=row[5],
+        decided_by=row[6],
+    )
+
+
+async def finish_action(
+    session: AsyncSession,
+    *,
+    action_id: str,
+    state: str,
+    result_json: dict[str, Any] | None = None,
+    error: str | None = None,
+) -> int:
+    """CAS `executing -> succeeded|failed|unknown`, keyed on the state being `executing`.
+
+    A stale executor therefore cannot overwrite a reconciled outcome.
+    """
+
+    statement = sa.text(
+        """
+        UPDATE pending_actions
+           SET state = :state,
+               result_json = CAST(:result_json AS jsonb),
+               error = :error
+         WHERE action_id = :action_id AND state = 'executing'
+        """
+    ).bindparams(
+        state=state,
+        action_id=action_id,
+        result_json=canonical_args(result_json) if result_json is not None else None,
+        error=error,
+    )
+    return int((await session.execute(statement)).rowcount or 0)
+
+
+async def expire_lapsed_actions(session: AsyncSession) -> int:
+    """Bulk expiry. Bookkeeping only: the claim's own `expires_at` guard is the correctness."""
+
+    result = await session.execute(
+        sa.text(
+            """
+            UPDATE pending_actions SET state = 'expired'
+             WHERE state IN ('pending', 'approved') AND expires_at <= now()
+            """
+        )
+    )
+    return int(result.rowcount or 0)
+
+
+async def get_action(session: AsyncSession, *, action_id: str) -> dict[str, Any] | None:
+    row = (
+        await session.execute(
+            sa.text(
+                """
+                SELECT id, action_id, action_type, args_json, args_hash, args_revision, state,
+                       idempotency_key, preview_text, user_id, chat_id, expires_at,
+                       telegram_message_id
+                  FROM pending_actions WHERE action_id = :action_id
+                """
+            ).bindparams(action_id=action_id)
+        )
+    ).mappings().first()
+    return None if row is None else dict(row)
+
+
+async def set_action_message_id(
+    session: AsyncSession, *, action_id: str, message_id: int
+) -> None:
+    await session.execute(
+        sa.text(
+            "UPDATE pending_actions SET telegram_message_id = :message_id WHERE action_id = :action_id"
+        ).bindparams(message_id=message_id, action_id=action_id)
+    )
+
+
+async def count_actions_for_key_prefix(
+    session: AsyncSession, *, idempotency_prefix: str
+) -> int:
+    """How many rows already exist for a logical action, in any state.
+
+    Used to fold the attempt number into the idempotency key: the column is UNIQUE (spec §3.2),
+    and a *terminal* row keeps its key occupied, so a re-request of the same action must be a
+    distinct row rather than a violation of the full constraint (§4.1: "a retry is a new row").
+    """
+
+    result = await session.execute(
+        sa.text(
+            "SELECT count(*) FROM pending_actions WHERE idempotency_key LIKE :prefix"
+        ).bindparams(prefix=f"{idempotency_prefix}#%")
+    )
+    return int(result.scalar_one())
+
+
+async def count_actions(session: AsyncSession, *, user_id: int) -> int:
+    result = await session.execute(
+        sa.text("SELECT count(*) FROM pending_actions WHERE user_id = :user_id").bindparams(
+            user_id=user_id
+        )
+    )
+    return int(result.scalar_one())
+
+
+# --------------------------------------------------------------------------- #
+# Tool invocation ledger (§5.3)
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True, slots=True)
+class InvocationRow:
+    id: int
+    state: str
+    args_hash: str
+    result_json: dict[str, Any] | None
+    started_at: datetime
+
+
+async def find_invocation(
+    session: AsyncSession, *, thread_id: str, run_key: str, attempt_no: int
+) -> InvocationRow | None:
+    row = (
+        await session.execute(
+            sa.text(
+                """
+                SELECT id, state, args_hash, result_json, started_at
+                  FROM tool_invocations
+                 WHERE thread_id = :thread_id AND run_key = :run_key AND attempt_no = :attempt_no
+                """
+            ).bindparams(thread_id=thread_id, run_key=run_key, attempt_no=attempt_no)
+        )
+    ).first()
+    if row is None:
+        return None
+    return InvocationRow(
+        id=row[0], state=row[1], args_hash=row[2], result_json=row[3], started_at=row[4]
+    )
+
+
+async def start_invocation(
+    session: AsyncSession,
+    *,
+    thread_id: str,
+    run_key: str,
+    attempt_no: int,
+    tool_name: str,
+    tool_call_id: str | None,
+    args_hash: str,
+) -> int:
+    """Insert the `started` row. Committed before the side effect (spec §5.3)."""
+
+    statement = (
+        sa.text(
+            """
+            INSERT INTO tool_invocations
+                (thread_id, run_key, attempt_no, tool_call_id, tool_name, args_hash, state)
+            VALUES (:thread_id, :run_key, :attempt_no, :tool_call_id, :tool_name, :args_hash,
+                    'started')
+            ON CONFLICT (thread_id, run_key, attempt_no) DO NOTHING
+            RETURNING id
+            """
+        ).bindparams(
+            thread_id=thread_id,
+            run_key=run_key,
+            attempt_no=attempt_no,
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            args_hash=args_hash,
+        )
+    )
+    return int((await session.execute(statement)).scalar_one_or_none() or 0)
+
+
+async def finish_invocation(
+    session: AsyncSession,
+    *,
+    thread_id: str,
+    run_key: str,
+    attempt_no: int,
+    state: str,
+    result_json: dict[str, Any] | None = None,
+    error: str | None = None,
+) -> None:
+    await session.execute(
+        sa.text(
+            """
+            UPDATE tool_invocations
+               SET state = :state, result_json = CAST(:result_json AS jsonb), error = :error,
+                   finished_at = now()
+             WHERE thread_id = :thread_id AND run_key = :run_key AND attempt_no = :attempt_no
+            """
+        ).bindparams(
+            state=state,
+            thread_id=thread_id,
+            run_key=run_key,
+            attempt_no=attempt_no,
+            result_json=canonical_args(result_json) if result_json is not None else None,
+            error=error,
+        )
+    )
+
+
+async def list_invocations(session: AsyncSession, *, thread_id: str) -> list[InvocationRow]:
+    rows = (
+        await session.execute(
+            sa.text(
+                """
+                SELECT id, state, args_hash, result_json, started_at
+                  FROM tool_invocations WHERE thread_id = :thread_id ORDER BY id
+                """
+            ).bindparams(thread_id=thread_id)
+        )
+    ).all()
+    return [
+        InvocationRow(
+            id=row[0], state=row[1], args_hash=row[2], result_json=row[3], started_at=row[4]
+        )
+        for row in rows
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# The resume queue (§5.5)
+# --------------------------------------------------------------------------- #
+async def enqueue_work_item(
+    session: AsyncSession,
+    *,
+    conversation_id: UUID,
+    thread_id: str,
+    kind: str,
+    run_at: datetime,
+    payload: dict[str, Any] | None = None,
+) -> int | None:
+    """The watchdog enqueue: inserted **before** the graph runs, marked `done` after the reply.
+
+    `ON CONFLICT DO NOTHING` on the partial unique index is the second-turn rule: with a turn in
+    flight the row is already `pending`, so a second message creates nothing and the handler
+    declines it (RB1-follow-on).
+    """
+
+    statement = sa.text(
+        """
+        INSERT INTO work_items (kind, conversation_id, thread_id, payload, run_at, state)
+        VALUES (:kind, :conversation_id, :thread_id, CAST(:payload AS jsonb), :run_at, 'pending')
+        ON CONFLICT (thread_id, kind) WHERE state IN ('pending', 'claimed')
+        DO NOTHING
+        RETURNING id
+        """
+    ).bindparams(
+        kind=kind,
+        conversation_id=conversation_id,
+        thread_id=thread_id,
+        payload=canonical_args(payload or {}),
+        run_at=run_at,
+    )
+    return (await session.execute(statement)).scalar_one_or_none()
+
+
+async def mark_work_item_done(
+    session: AsyncSession, *, thread_id: str, kind: str, state: str = "done"
+) -> int:
+    result = await session.execute(
+        sa.text(
+            """
+            UPDATE work_items SET state = :state, finished_at = now()
+             WHERE thread_id = :thread_id AND kind = :kind AND state IN ('pending', 'claimed')
+            """
+        ).bindparams(state=state, thread_id=thread_id, kind=kind)
+    )
+    return int(result.rowcount or 0)
+
+
+async def claim_due_work_items(
+    session: AsyncSession, *, batch: int, executor: str, lease_seconds: int
+) -> list[dict[str, Any]]:
+    """Claim resume work with a lease, so one run owns a thread at a time."""
+
+    statement = sa.text(
+        """
+        WITH due AS (
+            SELECT id FROM work_items
+             WHERE state = 'pending' AND run_at <= now() AND attempts < max_attempts
+             ORDER BY run_at LIMIT :batch
+             FOR UPDATE SKIP LOCKED
+        )
+        UPDATE work_items w
+           SET state = 'claimed', claimed_at = now(), claimed_by = :executor,
+               attempts = w.attempts + 1,
+               lease_expires_at = now() + make_interval(0, 0, 0, 0, 0, 0, :lease_seconds)
+          FROM due
+         WHERE w.id = due.id
+        RETURNING w.id, w.thread_id, w.conversation_id, w.kind, w.payload, w.attempts,
+                  w.max_attempts
+        """
+    ).bindparams(batch=batch, executor=executor, lease_seconds=lease_seconds)
+    return [dict(row) for row in (await session.execute(statement)).mappings().all()]
+
+
+async def finish_work_item(
+    session: AsyncSession, *, item_id: int, state: str, error: str | None = None
+) -> int:
+    result = await session.execute(
+        sa.text(
+            """
+            UPDATE work_items SET state = :state, finished_at = now(), last_error = :error
+             WHERE id = :item_id AND state = 'claimed'
+            """
+        ).bindparams(state=state, item_id=item_id, error=error)
+    )
+    return int(result.rowcount or 0)
+
+
+async def work_item_state(session: AsyncSession, *, thread_id: str, kind: str) -> str | None:
+    result = await session.execute(
+        sa.text(
+            "SELECT state FROM work_items WHERE thread_id = :thread_id AND kind = :kind "
+            "ORDER BY id DESC LIMIT 1"
+        ).bindparams(thread_id=thread_id, kind=kind)
+    )
+    return result.scalar_one_or_none()
+
+
+async def count_work_items(session: AsyncSession, *, thread_id: str | None = None) -> int:
+    if thread_id is None:
+        result = await session.execute(sa.text("SELECT count(*) FROM work_items"))
+    else:
+        result = await session.execute(
+            sa.text("SELECT count(*) FROM work_items WHERE thread_id = :thread_id").bindparams(
+                thread_id=thread_id
+            )
+        )
+    return int(result.scalar_one())
+
+
+async def active_turn_items(
+    session: AsyncSession, *, thread_id: str | None = None
+) -> Sequence[dict[str, Any]]:
+    """Rows that still look like an in-flight turn (for the orphan check of (h))."""
+
+    query = (
+        "SELECT id, thread_id, kind, state, created_at, finished_at FROM work_items "
+        "WHERE state IN ('pending', 'claimed', 'failed', 'dead')"
+    )
+    if thread_id is not None:
+        query += " AND thread_id = :thread_id"
+    statement = sa.text(query)
+    if thread_id is not None:
+        statement = statement.bindparams(thread_id=thread_id)
+    return [dict(row) for row in (await session.execute(statement)).mappings().all()]
+
 __all__ = [
+    "count_actions_for_key_prefix",
+    "work_item_state",
+    "start_invocation",
+    "set_action_message_id",
+    "mark_work_item_done",
+    "list_invocations",
+    "insert_action",
+    "get_action",
+    "finish_work_item",
+    "finish_invocation",
+    "finish_action",
+    "find_invocation",
+    "expire_lapsed_actions",
+    "enqueue_work_item",
+    "diagnose_action",
+    "decide_action",
+    "count_work_items",
+    "count_actions",
+    "claim_due_work_items",
+    "claim_action",
+    "active_turn_items",
+    "InvocationRow",
+    "ClaimedAction",
     "ActiveEmbeddingModel",
     "ChunkMatch",
     "ClaimedTask",

@@ -75,7 +75,20 @@ _SPANISH_HINT = re.compile(
 # The only placeholders the catalogue is allowed to use, so a typo cannot ship a literal
 # "{comamnd}" to a user.
 _ALLOWED_PLACEHOLDERS = frozenset(
-    {"command", "title", "when", "local", "timezone", "state", "key", "value", "count"}
+    {
+        "command",
+        "title",
+        "when",
+        "local",
+        "timezone",
+        "state",
+        "key",
+        "value",
+        "count",
+        "preview",
+        "minutes",
+        "detail",
+    }
 )
 
 

@@ -1,15 +1,19 @@
-"""Application factory and dependency wiring (PLAN.md §10 Phase 1 deliverable 11).
+"""Application factory and dependency wiring (PLAN.md §10 Phase 1 deliverable 11, Phase 2/3).
 
-This is the **only** place concrete implementations are chosen: settings are read, the database
-and checkpointer are opened, the stores, tools and services are built, and the agent is compiled
-against whatever checkpointer the deployment provides.
+This is the **only** place concrete implementations are chosen. The construction order is not
+arbitrary:
 
-Startup is fail-fast (PLAN.md §8.1): an invalid configuration, or one §7.2 forbids in
-production, raises before the process can serve a request (A13).
+1. settings (validated, fail-fast);
+2. database and checkpointer (the durability layer);
+3. the tools and the **registry** — which refuses to load a tool without a risk level — plus the
+   approval service and the resume queue;
+4. the model, the Telegram client and the **agent**, which needs the registry and the approvals;
+5. the stores — the conversation store reads history from the agent's checkpointed state (NN1),
+   which is why the agent exists first;
+6. the handlers, which need everything above.
 
-Phase 2 wiring note: conversational history now comes from the **checkpointed thread state**
-(NN1), so `ChatAgent` is the `HistoryProvider` the conversation store reads. `agent/` still never
-imports `app.storage` — the protocol is declared in the storage layer and satisfied structurally.
+Startup is fail-fast (§8.1): an invalid configuration, or one §7.2 forbids in production, raises
+before the process can serve a request.
 """
 
 from __future__ import annotations
@@ -32,17 +36,26 @@ from app.config import Settings, load_settings
 from app.llm.ollama_client import OllamaChatClient
 from app.llm.protocols import ChatModel
 from app.logging_config import configure_logging
+from app.services.approvals import ApprovalService
 from app.services.conversation import ConversationService
+from app.services.work_queue import WorkQueue
 from app.storage.checkpointing import build_checkpointer, setup_checkpointer
 from app.storage.postgres import Database, build_database, use_compatible_event_loop
 from app.storage.stores import build_stores
 from app.tools.memory import MemoryTools
+from app.tools.memory import specs as memory_specs
+from app.tools.registry import ToolRegistry
+from app.tools.restaurants import RestaurantTools
+from app.tools.restaurants import specs as restaurant_specs
 from app.tools.tasks import TaskTools
+from app.tools.tasks import specs as task_specs
+from app.tools.web_search import WebSearchTool
+from app.tools.web_search import specs as web_specs
 
 _logger = logging.getLogger(__name__)
 
-# Windows only: psycopg's async mode cannot run on the default ProactorEventLoop, so the
-# policy is installed before uvicorn (or any caller) creates the loop. No-op elsewhere.
+# Windows only: psycopg's async mode cannot run on the default ProactorEventLoop, so the policy is
+# installed before uvicorn (or any caller) creates the loop. No-op elsewhere.
 use_compatible_event_loop()
 
 
@@ -54,12 +67,7 @@ def create_app(
     database: Database | None = None,
     checkpointer: Any | None = None,
 ) -> FastAPI:
-    """Build the FastAPI application.
-
-    The optional arguments exist so the credential-free test suites can inject a fake model, a
-    mock transport and a test database; production passes none of them and the real adapters
-    are built from configuration.
-    """
+    """Build the FastAPI application."""
 
     resolved = (settings or load_settings()).validate_or_raise()
     configure_logging(
@@ -82,9 +90,7 @@ def create_app(
             if active_database is None:
                 active_database = build_database(resolved)
             if checkpointer is not None:
-                # Either a built Checkpointer (with its pool) or a raw saver. `setup()` belongs
-                # to whichever we were given: calling `setup_checkpointer` with a bare saver
-                # raised `AttributeError: 'State' object has no attribute 'checkpointer'`.
+                # Either a built Checkpointer (with its pool) or a raw saver.
                 built_checkpointer = getattr(checkpointer, "saver", None) is not None
                 saver = checkpointer.saver if built_checkpointer else checkpointer
                 if built_checkpointer and resolved.migrations_autorun:
@@ -97,10 +103,45 @@ def create_app(
                 owns_checkpointer = True
                 app.state.checkpointer = built
                 if resolved.migrations_autorun:
-                    # Off by default and refused in production (PLAN.md §11.6): a schema change
-                    # must never be a side effect of starting a service.
                     await setup_checkpointer(built)
 
+        # --- tools, registry, approvals, queue ------------------------------------------- #
+        memory_tools = (
+            None if active_database is None else MemoryTools(sessions=active_database.sessions)
+        )
+        task_tools = (
+            None
+            if active_database is None
+            else TaskTools(
+                sessions=active_database.sessions,
+                max_attempts=resolved.reminder_max_attempts,
+                default_timezone=resolved.default_timezone,
+            )
+        )
+
+        registry: ToolRegistry | None = None
+        approvals: ApprovalService | None = None
+        work_queue: WorkQueue | None = None
+        if active_database is not None and memory_tools is not None and task_tools is not None:
+            registry = ToolRegistry(
+                [
+                    *memory_specs(memory_tools),
+                    *task_specs(task_tools),
+                    *web_specs(WebSearchTool()),
+                    *restaurant_specs(RestaurantTools()),
+                ],
+                sessions=active_database.sessions,
+                stale_seconds=resolved.stale_invocation_seconds,
+            )
+            approvals = ApprovalService(
+                sessions=active_database.sessions, ttl_minutes=resolved.approval_ttl_minutes
+            )
+            work_queue = WorkQueue(
+                sessions=active_database.sessions,
+                lease_seconds=resolved.dispatcher_lease_seconds,
+            )
+
+        # --- model, transport, agent ----------------------------------------------------- #
         model: ChatModel = chat_model or OllamaChatClient(
             base_url=resolved.ollama_base_url,
             model=resolved.llm_model,
@@ -118,8 +159,11 @@ def create_app(
             system_prompt=build_system_prompt(),
             budget_seconds=resolved.request_budget_seconds,
             checkpointer=saver,
+            registry=registry,
+            approvals=approvals,
         )
 
+        # --- stores (history comes from the agent's checkpoints, NN1) -------------------- #
         dedupe, conversations = build_stores(
             store_backend=resolved.store_backend,
             app_env=resolved.app_env,
@@ -134,19 +178,6 @@ def create_app(
             conversations, max_messages=resolved.context_max_messages
         )
 
-        memory_tools = (
-            None if active_database is None else MemoryTools(sessions=active_database.sessions)
-        )
-        task_tools = (
-            None
-            if active_database is None
-            else TaskTools(
-                sessions=active_database.sessions,
-                max_attempts=resolved.reminder_max_attempts,
-                default_timezone=resolved.default_timezone,
-            )
-        )
-
         app.state.settings = resolved
         app.state.database = active_database
         app.state.dedupe = dedupe
@@ -157,6 +188,9 @@ def create_app(
         app.state.agent = agent
         app.state.memory_tools = memory_tools
         app.state.task_tools = task_tools
+        app.state.registry = registry
+        app.state.approvals = approvals
+        app.state.work_queue = work_queue
         app.state.rate_limiter = RateLimiter(per_minute=resolved.rate_limit_per_minute)
         app.state.handlers = TelegramHandlers(
             settings=resolved,
@@ -165,6 +199,9 @@ def create_app(
             conversations=conversation_service,
             memory_tools=memory_tools,
             task_tools=task_tools,
+            approvals=approvals,
+            work_queue=work_queue,
+            registry=registry,
         )
 
         _logger.info(
@@ -172,7 +209,7 @@ def create_app(
             extra={
                 "model": resolved.llm_model,
                 "store_backend": resolved.store_backend,
-                "durable_conversations": conversations is not None,
+                "tools": len(registry.names()) if registry else 0,
                 "status": "ready",
             },
         )
@@ -191,10 +228,9 @@ def create_app(
 
     app = FastAPI(
         title="Telegram personal assistant",
-        version="0.2.0",
+        version="0.3.0",
         lifespan=lifespan,
-        # The schema is off: this service exposes an unauthenticated webhook and health
-        # endpoints, and there is nothing for a public API document to help with.
+        # The schema is off: this service exposes an unauthenticated webhook and health endpoints.
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
@@ -206,15 +242,12 @@ def create_app(
 
 
 def main() -> Any:  # pragma: no cover - entry point for `python -m app.main`
-    """Run the service with uvicorn. Used by the README's local flow."""
-
     import uvicorn
 
     uvicorn.run("app.main:app", host="127.0.0.1", port=8000, log_config=None)
 
 
-# Module-level app for `uvicorn app.main:app`. Settings are read (and validated) at import,
-# so a misconfigured deployment fails immediately rather than on first request (A13).
+# Module-level app for `uvicorn app.main:app`.
 app = create_app()
 
 

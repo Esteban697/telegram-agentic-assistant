@@ -67,6 +67,19 @@ class ConversationService:
             thread_id=thread_id, prompt_input=prompt_input, history_length=len(history)
         )
 
+    async def thread_id(self, *, user_id: int, chat_id: int) -> str:
+        """The chat's current LangGraph thread id."""
+
+        return await self._store.thread_id(user_id=user_id, chat_id=chat_id)
+
+    async def conversation_id(self, *, user_id: int, chat_id: int) -> Any:
+        """The conversation row's id, for rows that reference it (the watchdog)."""
+
+        resolver = getattr(self._store, "conversation_id", None)
+        if resolver is None:
+            return None
+        return await resolver(user_id=user_id, chat_id=chat_id)
+
     async def record(
         self,
         *,

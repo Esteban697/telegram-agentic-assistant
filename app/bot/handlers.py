@@ -25,7 +25,14 @@ from typing import Any
 
 from app.agent.graph import ChatAgent
 from app.bot import messages
-from app.bot.keyboards import main_menu_keyboard, parse_callback_data
+from app.bot.keyboards import (
+    approval_keyboard,
+    is_approval_callback,
+    main_menu_keyboard,
+    parse_callback_data,
+)
+from app.policy import approval as approval_machine
+from app.policy.approval import ActionState
 from app.bot.telegram_client import TelegramClient
 from app.config import Settings
 from app.errors import AssistantError
@@ -39,7 +46,10 @@ from app.storage.stores import (
     STATUS_PROCESSED,
     DedupeStore,
 )
+from app.services.approvals import ApprovalService
+from app.services.work_queue import WorkQueue
 from app.tools.memory import MemoryTools
+from app.tools.registry import ToolRegistry
 from app.tools.tasks import ListTasksArgs, TaskTools
 
 _logger = logging.getLogger(__name__)
@@ -72,6 +82,9 @@ class TelegramHandlers:
         conversations: ConversationService,
         memory_tools: MemoryTools | None = None,
         task_tools: TaskTools | None = None,
+        approvals: ApprovalService | None = None,
+        work_queue: WorkQueue | None = None,
+        registry: ToolRegistry | None = None,
     ) -> None:
         self._settings = settings
         self._telegram = telegram
@@ -79,6 +92,9 @@ class TelegramHandlers:
         self._conversations = conversations
         self._memory = memory_tools
         self._tasks = task_tools
+        self._approvals = approvals
+        self._queue = work_queue
+        self._registry = registry
 
     # ------------------------------------------------------------------ #
     # Entry point
@@ -132,31 +148,111 @@ class TelegramHandlers:
     async def _run_turn(
         self, text: str, identity: TelegramIdentity, *, update_id: int | None
     ) -> HandlerOutcome:
+        prepared = None
+        answered = False
+        # Only the caller that actually opened the watchdog row may close it: closing the *other*
+        # turn's row on the busy path would mark an in-flight turn as finished.
+        owns_turn = False
         try:
             prepared = await self._conversations.prepare(
                 user_id=identity.user_id, chat_id=identity.chat_id, text=text
             )
-            result = await self._agent.run(prepared.prompt_input, thread_id=prepared.thread_id)
+
+            # The watchdog goes in BEFORE the graph runs (RB1). A death anywhere inside the turn
+            # therefore leaves a queued resume rather than a lost message — and a second message
+            # arriving now finds the row `pending`, which is how (h) declines it.
+            if self._queue is not None:
+                claim = await self._queue.open_turn(
+                    conversation_id=await self._conversations.conversation_id(
+                        user_id=identity.user_id, chat_id=identity.chat_id
+                    ),
+                    thread_id=prepared.thread_id,
+                    chat_id=identity.chat_id,
+                )
+                if claim.is_busy:
+                    await self._reply(
+                        identity.chat_id, messages.render("busy.previous_turn_in_progress")
+                    )
+                    return HandlerOutcome(
+                        status=STATUS_IGNORED, replied=True, detail="busy_previous_turn"
+                    )
+                owns_turn = True
+
+            result = await self._agent.run(
+                prepared.prompt_input,
+                thread_id=prepared.thread_id,
+                user_id=identity.user_id,
+                chat_id=identity.chat_id,
+            )
+
+            pending = await self._agent.pending_approval(prepared.thread_id)
+            if pending is not None:
+                # A level-2 call was prepared, not performed: the prompt is the reply.
+                await self._send_approval_prompt(identity, pending)
+                answered = True
+                return HandlerOutcome(
+                    status=STATUS_PROCESSED, replied=True, detail="approval_requested"
+                )
+
+            reply_text = result.content.strip() or messages.render("error.generic")
+            await self._reply(identity.chat_id, reply_text)
+            answered = True
+
+            try:
+                # The transcript is an audit log, never read back as history (decision 3).
+                await self._conversations.record(
+                    chat_id=identity.chat_id,
+                    user_text=text,
+                    assistant_text=reply_text,
+                    telegram_update_id=update_id,
+                )
+            except AssistantError as exc:  # pragma: no cover - the reply is already delivered
+                _logger.warning("could not record the turn", extra=exc.as_log_fields())
+
+            return HandlerOutcome(status=STATUS_PROCESSED, replied=True, detail="answered")
         except AssistantError as exc:
             _logger.warning("conversation turn failed", extra=exc.as_log_fields())
             await self._reply(identity.chat_id, messages.render(exc.message_key))
+            answered = True
             return HandlerOutcome(status=STATUS_FAILED, replied=True, detail=exc.code)
+        finally:
+            # Closed unconditionally (Phase 3 review): a path that skipped this left the row
+            # `pending` for ever, and every later message in that chat was then declined as busy.
+            # `answered` distinguishes a real reply from an escape.
+            if owns_turn:
+                await self._close_turn(prepared, failed=not answered)
 
-        reply_text = result.content.strip() or messages.render("error.generic")
-        await self._reply(identity.chat_id, reply_text)
-
+    async def _close_turn(self, prepared: Any, *, failed: bool = False) -> None:
+        if self._queue is None or prepared is None:
+            return
         try:
-            # The transcript is an audit log, never read back as history (decision 3).
-            await self._conversations.record(
-                chat_id=identity.chat_id,
-                user_text=text,
-                assistant_text=reply_text,
-                telegram_update_id=update_id,
-            )
-        except AssistantError as exc:  # pragma: no cover - the reply is already delivered
-            _logger.warning("could not record the turn", extra=exc.as_log_fields())
+            await self._queue.close_turn(thread_id=prepared.thread_id, failed=failed)
+        except AssistantError as exc:  # pragma: no cover - bookkeeping only
+            _logger.warning("could not close the watchdog row", extra=exc.as_log_fields())
 
-        return HandlerOutcome(status=STATUS_PROCESSED, replied=True, detail="answered")
+    async def _send_approval_prompt(
+        self, identity: TelegramIdentity, pending: dict[str, Any]
+    ) -> None:
+        """Render the frozen preview and the two buttons. Nothing has run."""
+
+        sent = await self._telegram.send_message(
+            chat_id=identity.chat_id,
+            text=messages.render(
+                "approval.prompt",
+                preview=pending.get("preview_text", ""),
+                minutes=self._settings.approval_ttl_minutes,
+            ),
+            reply_markup=approval_keyboard(
+                action_id=str(pending["action_id"]),
+                approve=True,
+                args_revision=int(pending["args_revision"]),
+                args_hash=str(pending["args_hash"]),
+            ),
+        )
+        if self._approvals is not None:
+            await self._approvals.attach_message(
+                action_id=str(pending["action_id"]), message_id=sent.message_id
+            )
 
     # ------------------------------------------------------------------ #
     # Commands
@@ -304,7 +400,16 @@ class TelegramHandlers:
     ) -> HandlerOutcome:
         callback = update.get("callback_query") or {}
         callback_id = str(callback.get("id", ""))
-        command = parse_callback_data(str(callback.get("data", "")))
+        data = str(callback.get("data", ""))
+
+        # Approval buttons are handled before the command menu: they carry an action id, not a
+        # command name, and the acknowledgement must fire first (N2).
+        if is_approval_callback(data):
+            if callback_id:
+                await self._telegram.answer_callback_query(callback_query_id=callback_id)
+            return await self._handle_approval(data, identity, callback)
+
+        command = parse_callback_data(data)
 
         # The acknowledgement is answered first and neutrally (PLAN.md §4.2, N2): an answer sent
         # before the action cannot report the action's result, so the outcome is its own message.
@@ -316,6 +421,142 @@ class TelegramHandlers:
             return HandlerOutcome(status=STATUS_IGNORED, replied=True, detail="unknown_callback")
 
         return await self._run_command(command, "", identity)
+
+    # ------------------------------------------------------------------ #
+    # Approvals
+    # ------------------------------------------------------------------ #
+    async def _handle_approval(
+        self, data: str, identity: TelegramIdentity, callback: dict[str, Any]
+    ) -> HandlerOutcome:
+        """Handle an Aprobar/Rechazar press.
+
+        The acknowledgement has already been sent by the caller, so a slow claim cannot make
+        Telegram retry; the outcome is communicated by editing the decision message.
+        """
+
+        parsed = approval_machine.parse_callback_data(data)
+        if parsed is None or self._approvals is None:
+            await self._reply(identity.chat_id, messages.render("approval.unknown_action"))
+            return HandlerOutcome(status=STATUS_IGNORED, replied=True, detail="bad_approval_data")
+
+        if not parsed.approve:
+            decision = await self._approvals.decide(
+                callback=parsed, user_id=identity.user_id, chat_id=identity.chat_id
+            )
+            key = "approval.rejected" if decision.applied else decision.message_key
+            await self._reply(identity.chat_id, messages.render(key))
+            return HandlerOutcome(
+                status=STATUS_PROCESSED, replied=True, detail=f"rejected:{decision.applied}"
+            )
+
+        decision = await self._approvals.decide(
+            callback=parsed, user_id=identity.user_id, chat_id=identity.chat_id
+        )
+        if not decision.applied:
+            await self._reply(identity.chat_id, messages.render(decision.message_key))
+            return HandlerOutcome(
+                status=STATUS_PROCESSED, replied=True, detail=f"not_decided:{decision.message_key}"
+            )
+
+        # The decision landed; now try to consume it. Two repeated callbacks race here and
+        # exactly one wins (the CAS), which is what the spec's headline sentence is about.
+        try:
+            execution = await self._approvals.claim_and_execute(
+                callback=parsed,
+                user_id=identity.user_id,
+                chat_id=identity.chat_id,
+                executor=f"handler:{identity.user_id}",
+            )
+        except AssistantError as exc:
+            _logger.error("approved arguments refused", extra=exc.as_log_fields())
+            await self._reply(identity.chat_id, messages.render(exc.message_key))
+            return HandlerOutcome(status=STATUS_FAILED, replied=True, detail=exc.code)
+
+        if not execution.claimed:
+            await self._reply(identity.chat_id, messages.render(execution.message_key))
+            return HandlerOutcome(
+                status=STATUS_PROCESSED, replied=True, detail=f"not_claimed:{execution.cause}"
+            )
+
+        await self._reply(identity.chat_id, messages.render("approval.executing"))
+        return await self._execute_approved(identity, execution)
+
+    async def _execute_approved(self, identity: TelegramIdentity, execution: Any) -> HandlerOutcome:
+        assert self._approvals is not None
+        action_id = str(execution.action_id)
+        if self._registry is None:  # pragma: no cover - always wired
+            await self._approvals.finish(
+                action_id=action_id, state=ActionState.FAILED, error="no registry"
+            )
+            await self._reply(identity.chat_id, messages.render("error.generic"))
+            return HandlerOutcome(status=STATUS_FAILED, replied=True, detail="no_registry")
+
+        try:
+            result = await self._registry.execute_approved(
+                execution=execution, user_id=identity.user_id
+            )
+        except AssistantError as exc:
+            # §4.2 step 3: an ambiguous outcome is `unknown`, never `failed`. A provider timeout
+            # does not tell us whether the far side completed the operation, and the plan forbids
+            # assuming it did not ("No asumir que un timeout significa que la acción falló").
+            # Inverted default (Phase 3 review, §7): a code we do not recognise is treated as
+            # **ambiguous**, because the plan forbids reporting an unknown outcome as a failure.
+            unambiguous = {
+                "capability_unavailable",
+                "invalid_arguments",
+                "tool_not_allowed",
+                "unsupported_document",
+            }
+            ambiguous = exc.code not in unambiguous
+            state = ActionState.UNKNOWN if ambiguous else ActionState.FAILED
+            await self._approvals.finish(
+                action_id=action_id,
+                state=state,
+                result={"reason": "timeout"} if ambiguous else {"error_code": exc.code},
+                error=exc.code,
+            )
+            _logger.warning(
+                "approved action outcome is ambiguous" if ambiguous else "approved action failed",
+                extra=exc.as_log_fields(),
+            )
+            await self._reply(
+                identity.chat_id,
+                messages.render("approval.unknown" if ambiguous else exc.message_key),
+            )
+            return HandlerOutcome(
+                status=STATUS_FAILED,
+                replied=True,
+                detail=f"{'unknown' if ambiguous else 'failed'}:{exc.code}",
+            )
+
+        if result.ok:
+            await self._approvals.finish(
+                action_id=action_id, state=ActionState.SUCCEEDED, result={"data": result.data}
+            )
+            await self._reply(
+                identity.chat_id,
+                messages.render("approval.succeeded", detail=_short(result.data)),
+            )
+            return HandlerOutcome(status=STATUS_PROCESSED, replied=True, detail="executed")
+
+        # A capability gap is a definite failure, not an ambiguity: nothing left this system.
+        await self._approvals.finish(
+            action_id=action_id,
+            state=ActionState.FAILED,
+            result={"error_code": result.error_code},
+            error=result.error_code,
+        )
+        if result.error_code == "CapabilityUnavailable":
+            # A capability gap is a definite failure, not an ambiguity: nothing left this system.
+            await self._reply(identity.chat_id, messages.render("approval.capability_unavailable"))
+        else:
+            await self._reply(
+                identity.chat_id,
+                messages.render("approval.failed", detail=result.detail or "error"),
+            )
+        return HandlerOutcome(
+            status=STATUS_PROCESSED, replied=True, detail=f"executed_failed:{result.error_code}"
+        )
 
     # ------------------------------------------------------------------ #
     # Helpers
@@ -348,6 +589,15 @@ def _parse_command(text: str) -> tuple[str | None, str]:
     head, _, rest = stripped.partition(" ")
     name = head[1:].split("@", 1)[0].lower()
     return (name or None), rest.strip()
+
+
+def _short(data: Any, limit: int = 200) -> str:
+    import json
+
+    if data is None:
+        return ""
+    rendered = data if isinstance(data, str) else json.dumps(data, ensure_ascii=False, default=str)
+    return rendered if len(rendered) <= limit else rendered[:limit] + "…"
 
 
 __all__ = ["HandlerOutcome", "TelegramHandlers"]

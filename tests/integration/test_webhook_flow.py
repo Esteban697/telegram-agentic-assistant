@@ -433,20 +433,41 @@ def test_a_callback_query_is_acknowledged_then_dispatched() -> None:
 
 
 def test_an_unknown_callback_data_is_refused_not_ignored() -> None:
-    update = {
+    """A forged `cmd:` callback is refused, and a malformed `ap:` one is reported as unknown.
+
+    Phase 3 gave `ap:` callbacks their own path (PLAN.md §4.5), so a malformed one now reports
+    "that action no longer exists" rather than the generic menu message — a more accurate answer,
+    and one that still confirms nothing about whether the id ever existed.
+    """
+
+    command_update = {
         "update_id": 6,
         "callback_query": {
             "id": "cb-2",
             "from": {"id": USER_ID},
             "message": {"message_id": 51, "chat": {"id": CHAT_ID}},
+            "data": "cmd:forged",
+        },
+    }
+    approval_update = {
+        "update_id": 7,
+        "callback_query": {
+            "id": "cb-3",
+            "from": {"id": USER_ID},
+            "message": {"message_id": 52, "chat": {"id": CHAT_ID}},
             "data": "ap:forged",
         },
     }
 
     with Harness() as harness:
-        harness.post(update)
+        harness.post(command_update)
+        assert harness.telegram.sent_texts == [messages.render("callback.not_available")]
 
-    assert harness.telegram.sent_texts == [messages.render("callback.not_available")]
+        harness.post(approval_update)
+        assert harness.telegram.sent_texts[-1] == messages.render("approval.unknown_action")
+        assert harness.telegram.count_of("answerCallbackQuery") == 2, (
+            "an approval callback is acknowledged before anything else (N2)"
+        )
 
 
 def test_an_edited_message_is_noticed_not_replayed() -> None:

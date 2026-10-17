@@ -133,6 +133,9 @@ class _FakeHistory:
     async def history(self, thread_id: str) -> list[ChatMessage]:
         return []
 
+    async def conversation_id(self, *, user_id: int, chat_id: int) -> None:
+        return None
+
 
 def test_build_stores_returns_the_in_memory_implementations_outside_production() -> None:
     dedupe, conversations = build_stores(

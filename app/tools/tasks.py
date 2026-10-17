@@ -25,7 +25,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.policy.timezones import InvalidLocalTime, parse_local
 from app.storage import repositories
-from app.tools.base import ToolResult, ToolSpec
+from app.policy.risk import RiskLevel
+from app.tools.base import ToolResult
+from app.tools.registry import ToolSpec
 
 REMINDER_PIPELINE_VERSION = "v1"
 
@@ -70,7 +72,7 @@ class TaskTools:
     default_timezone: str = "Europe/Madrid"
 
     async def create_reminder(
-        self, *, user_id: int, args: CreateReminderArgs
+        self, *, user_id: int, args: CreateReminderArgs, **_: Any
     ) -> ToolResult[dict[str, Any]]:
         try:
             resolved = parse_local(args.due_local, args.timezone or self.default_timezone)
@@ -156,35 +158,47 @@ class TaskTools:
         return ToolResult.success(payload)
 
 
-SPECS: tuple[ToolSpec, ...] = (
-    ToolSpec(
-        name="create_reminder",
-        description="Create a reminder at a local date and time in a named timezone.",
-        args_model=CreateReminderArgs,
-        risk_level=1,
-    ),
-    ToolSpec(
-        name="list_tasks",
-        description="List the user's tasks, optionally filtered by state.",
-        args_model=ListTasksArgs,
-        risk_level=0,
-    ),
-    ToolSpec(
-        name="complete_task",
-        description="Mark a task as completed.",
-        args_model=TaskIdArgs,
-        risk_level=1,
-    ),
-    ToolSpec(
-        name="cancel_reminder",
-        description="Cancel a pending reminder.",
-        args_model=TaskIdArgs,
-        risk_level=1,
-    ),
-)
+def specs(tools: TaskTools) -> list[ToolSpec]:
+    """Bind the reminder tools into registry entries."""
+
+    return [
+        ToolSpec(
+            name="create_reminder",
+            description="Create a reminder at a local date and time in a named timezone.",
+            args_model=CreateReminderArgs,
+            risk_level=RiskLevel.REVERSIBLE,
+            timeout_seconds=10.0,
+            handler=tools.create_reminder,
+        ),
+        ToolSpec(
+            name="list_tasks",
+            description="List the user's tasks, optionally filtered by state.",
+            args_model=ListTasksArgs,
+            risk_level=RiskLevel.READ,
+            timeout_seconds=10.0,
+            handler=tools.list_tasks,
+        ),
+        ToolSpec(
+            name="complete_task",
+            description="Mark a task as completed.",
+            args_model=TaskIdArgs,
+            risk_level=RiskLevel.REVERSIBLE,
+            timeout_seconds=10.0,
+            handler=tools.complete_task,
+        ),
+        ToolSpec(
+            name="cancel_reminder",
+            description="Cancel a pending reminder.",
+            args_model=TaskIdArgs,
+            risk_level=RiskLevel.REVERSIBLE,
+            timeout_seconds=10.0,
+            handler=tools.cancel_reminder,
+        ),
+    ]
+
 
 __all__ = [
-    "SPECS",
+    "specs",
     "CreateReminderArgs",
     "ListTasksArgs",
     "REMINDER_PIPELINE_VERSION",

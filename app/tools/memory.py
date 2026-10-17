@@ -18,7 +18,9 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.storage import repositories
-from app.tools.base import ToolResult, ToolSpec
+from app.policy.risk import RiskLevel
+from app.tools.base import ToolResult
+from app.tools.registry import ToolSpec
 
 
 class SearchMemoryArgs(BaseModel):
@@ -102,12 +104,12 @@ class MemoryTools:
         # Idempotent by design: deleting what is already gone is a success, not an error.
         return ToolResult.success({"deleted": deleted, "memory_id": str(args.memory_id)})
 
-    async def count_memories(self, *, user_id: int) -> ToolResult[dict[str, Any]]:
+    async def count_memories(self, *, user_id: int, **_: Any) -> ToolResult[dict[str, Any]]:
         async with self.sessions() as session:
             count = await repositories.count_memories(session, user_id=user_id)
         return ToolResult.success({"count": count})
 
-    async def delete_all_memories(self, *, user_id: int) -> ToolResult[dict[str, Any]]:
+    async def delete_all_memories(self, *, user_id: int, **_: Any) -> ToolResult[dict[str, Any]]:
         """Broad deletion. The caller must have confirmed it (spec §6)."""
 
         async with self.sessions() as session, session.begin():
@@ -126,29 +128,46 @@ class MemoryTools:
         )
 
 
-SPECS: tuple[ToolSpec, ...] = (
-    ToolSpec(
-        name="search_personal_memory",
-        description="Search the user's explicit memories by key or value.",
-        args_model=SearchMemoryArgs,
-        risk_level=0,
-    ),
-    ToolSpec(
-        name="save_preference",
-        description="Save an explicit preference the user stated.",
-        args_model=SavePreferenceArgs,
-        risk_level=1,
-    ),
-    ToolSpec(
-        name="delete_memory",
-        description="Delete one explicit memory by id.",
-        args_model=DeleteMemoryArgs,
-        risk_level=1,
-    ),
-)
+def specs(tools: MemoryTools) -> list[ToolSpec]:
+    """Bind the tool methods into registry entries (PLAN.md §4.3's levels)."""
+
+    return [
+        ToolSpec(
+            name="search_personal_memory",
+            description="Search the user's explicit memories by key or value.",
+            args_model=SearchMemoryArgs,
+            risk_level=RiskLevel.READ,
+            timeout_seconds=10.0,
+            handler=tools.search_personal_memory,
+        ),
+        ToolSpec(
+            name="save_preference",
+            description="Save an explicit preference the user stated.",
+            args_model=SavePreferenceArgs,
+            risk_level=RiskLevel.REVERSIBLE,
+            timeout_seconds=10.0,
+            handler=tools.save_preference,
+        ),
+        ToolSpec(
+            name="delete_memory",
+            description="Delete one explicit memory by id.",
+            args_model=DeleteMemoryArgs,
+            risk_level=RiskLevel.REVERSIBLE,
+            timeout_seconds=10.0,
+            handler=tools.delete_memory,
+        ),
+        ToolSpec(
+            name="list_memories",
+            description="List the user's saved preferences.",
+            args_model=ListMemoriesArgs,
+            risk_level=RiskLevel.READ,
+            timeout_seconds=10.0,
+            handler=tools.list_memories,
+        ),
+    ]
 
 __all__ = [
-    "SPECS",
+    "specs",
     "DeleteMemoryArgs",
     "ListMemoriesArgs",
     "MemoryTools",

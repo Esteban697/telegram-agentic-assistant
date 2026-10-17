@@ -83,6 +83,13 @@ class Settings(BaseSettings):
     request_budget_seconds: float = Field(default=45.0, gt=0)
     rate_limit_per_minute: int = Field(default=20, gt=0)
 
+    # --- Approvals (Phase 3) ------------------------------------------------ #
+    # Spec §12: APPROVAL_TTL_MINUTES. An approval is only valid for this long, and the claim
+    # re-checks it, so a stale button cannot execute an action hours later.
+    approval_ttl_minutes: int = Field(default=30, gt=0)
+    # A `started` tool-ledger row older than this is `unknown` rather than retried (N15).
+    stale_invocation_seconds: int = Field(default=900, gt=0)
+
     # --- Stores (Phase 1: in-memory) --------------------------------------- #
     store_backend: StoreBackend = "memory"
     context_max_messages: int = Field(default=20, gt=0)
