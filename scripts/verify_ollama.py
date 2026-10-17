@@ -14,7 +14,8 @@ Exit codes:
 * ``1`` — the probe ran and the model failed a capability. Tool calling being unsupported is
   the case PLAN.md §10 Phase 1 A10 calls out; the phase then closes with this recorded output
   and the fallback decision, never with a claim that tool calling works.
-* ``2`` — no ``OLLAMA_API_KEY`` is configured, so the probe could not run at all (pending
+* ``2`` — no ``OLLAMA_API_KEY`` is configured (neither in ``.env`` nor in the environment),
+  or the application configuration is invalid, so the probe could not run at all (pending
   external validation).
 
 The authoritative model name is printed from ``/api/tags`` rather than trusted from
@@ -27,7 +28,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import os
 import sys
 import time
 from pathlib import Path
@@ -40,7 +40,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-from app.errors import OllamaError  # noqa: E402
+from app.config import load_settings  # noqa: E402
+from app.errors import ConfigError, OllamaError  # noqa: E402
 from app.llm.ollama_client import OllamaChatClient  # noqa: E402
 from app.llm.protocols import ChatMessage, ToolSpec  # noqa: E402
 
@@ -210,39 +211,59 @@ async def run_probe(*, base_url: str, model: str, api_key: str, timeout: float) 
     return EXIT_CAPABILITY_FAILURE
 
 
-def main(argv: list[str] | None = None) -> int:
+def resolve_config(argv: list[str] | None = None) -> tuple[str, str, str, float]:
+    """Resolve ``(base_url, model, api_key, timeout)``.
+
+    Precedence: command-line flags, then the environment, then ``.env`` — the same sources
+    the application itself reads, so the probe validates the configuration the service will
+    actually run with rather than a built-in default.
+
+    **Changed in the Phase 1 review.** This used to read ``os.environ`` directly, which meant
+    a key stored in ``.env`` — the documented local location, and the file ``Settings`` reads
+    — was invisible here, and ``--model`` silently fell back to the default instead of the
+    configured model. That defeated the point of the probe, whose whole job is to say whether
+    *the selected* model can call tools (PLAN.md §10 A10, spec §3).
+    """
+
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--base-url",
-        default=os.environ.get("OLLAMA_BASE_URL", "https://ollama.com"),
-    )
-    parser.add_argument(
-        "--model",
-        default=os.environ.get("LLM_MODEL", "gpt-oss:120b-cloud"),
-    )
+    parser.add_argument("--base-url", default=None, help="overrides the configured base URL")
+    parser.add_argument("--model", default=None, help="overrides the configured model")
     parser.add_argument("--timeout", type=float, default=60.0)
     args = parser.parse_args(argv)
 
-    api_key = os.environ.get("OLLAMA_API_KEY", "").strip()
-    if not api_key:
-        print("RESULT: PENDING — OLLAMA_API_KEY is not set, so this probe cannot run.")
+    settings = load_settings()
+    return (
+        args.base_url or settings.ollama_base_url,
+        args.model or settings.llm_model,
+        settings.api_key.strip(),
+        args.timeout,
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        base_url, model, api_key, timeout = resolve_config(argv)
+    except ConfigError as exc:
+        # A probe cannot say anything useful about a model if the configuration it would run
+        # with is itself invalid, so this is reported rather than raised as a traceback.
+        print(f"RESULT: cannot resolve configuration — {exc}")
         print("A10 is PENDING EXTERNAL VALIDATION, not passed.")
-        print("To close it, run:")
+        return EXIT_PENDING
+
+    if not api_key:
+        print("RESULT: PENDING — no OLLAMA_API_KEY is configured, so this probe cannot run.")
+        print("A10 is PENDING EXTERNAL VALIDATION, not passed.")
+        print("Set it in .env at the repository root, or in the environment:")
         print(
             '  $env:OLLAMA_API_KEY="<tu-clave>"   # PowerShell\n'
             "  uv run python scripts/verify_ollama.py"
         )
         return EXIT_PENDING
 
-    print(f"Endpoint: {args.base_url}")
-    print(f"Model   : {args.model}")
+    print(f"Endpoint: {base_url}")
+    print(f"Model   : {model}")
     return asyncio.run(
-        run_probe(
-            base_url=args.base_url,
-            model=args.model,
-            api_key=api_key,
-            timeout=args.timeout,
-        )
+        run_probe(base_url=base_url, model=model, api_key=api_key, timeout=timeout)
     )
 
 
