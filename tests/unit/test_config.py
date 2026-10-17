@@ -24,6 +24,21 @@ def test_development_settings_are_valid() -> None:
     assert settings.telegram_allowed_user_ids == frozenset({42})
 
 
+def test_the_test_settings_do_not_depend_on_an_ambient_store_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The unit suite must survive a developer configuring the setting Phase 2 asks for.
+
+    ``make_settings`` promised "development-safe defaults" but left ``store_backend`` to be
+    inherited from the ambient ``.env``/environment — so setting ``STORE_BACKEND=postgres`` in
+    development broke five unit tests that assert the development default. Pinned now, and this
+    test fails if anyone un-pins it.
+    """
+    monkeypatch.setenv("STORE_BACKEND", "postgres")
+
+    assert make_settings().store_backend == "memory"
+
+
 def test_production_settings_with_everything_required_are_valid() -> None:
     settings = make_settings(
         app_env="production",

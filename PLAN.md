@@ -2462,7 +2462,7 @@ Phase 2) — so the dedupe and context stores are in-memory behind protocols (de
 | A7 | Ollama failures are controlled, not crashes | Integration tests with a stub transport returning a timeout, a 429 and a 500: user receives a specific Spanish message; the handler returns 200 (so Telegram does not retry); the error is logged with an `error_code`; no stack trace reaches the user |
 | A8 | The container runs and serves health without credentials | `docker build` succeeds; `docker run` with `.env.example`-derived values starts; `GET /healthz` → 200; the process runs as a non-root user (`id -u` ≠ 0); `grep` of the image finds no secret |
 | A9 | The README's local steps actually work | Execute the README verbatim on a clean clone (no `.env`) and reach a running service with `/healthz` → 200; record the transcript |
-| A10 | Tool calling works with the configured model — **a two-outcome gate, made unambiguous in round 1 (N13)** | `scripts/verify_ollama.py` run with a real key; its real output recorded. **Pass:** the probe reports a tool call with parseable arguments and a structured-output turn. **Fail:** the phase closes only with the recorded failure *and* the fallback decision below — never by asserting tool calling works. |
+| A10 | Tool calling works with the configured model — **a two-outcome gate, made unambiguous in round 1 (N13)** | `scripts/verify_ollama.py` run with a real key; its real output recorded. **Pass:** the probe reports a tool call with parseable arguments and a structured-output turn. **Fail:** the phase closes only with the recorded failure *and* the fallback decision below — never by asserting tool calling works. **Outcome, run 2026-10-17: FAIL.** Tool calling passes; `format`-enforced structured output does not. The fallback decision is recorded in item 2 below, and A10 is **not** passed. |
 | A11 | Commands respond in Spanish | `/start`, `/help`, `/reset` produce catalogue-sourced Spanish replies; `/tasks`, `/memory`, `/forget` return the explicit not-yet-available Spanish message; all strings asserted against `messages.py` keys |
 | A12 | Rate limiting is real and does not drop silently | Over-limit requests still return 200, make zero model calls, and send exactly one notice per window (§7.6) |
 | A13 | The in-memory configuration cannot be deployed | Unit test asserts `APP_ENV=production` + `STORE_BACKEND=memory` raises at startup (B6), and the README states Phase 1 is local-only |
@@ -2475,10 +2475,20 @@ graph with nothing to run on. The fallback is now concrete and ordered:
    in the catalog (Appendix A.1). Others exist (the cloud catalog carries several tool-calling
    models) and the probe enumerates candidates from `/api/tags` rather than asserting names.
 2. **If no cloud model tool-calls reliably, switch the dispatch mechanism, not the architecture:**
-   call the model with `format=<JSON Schema>` and parse a structured decision
+   **state the schema in the prompt** and parse a structured decision
    (`{"tool": ..., "arguments": {...}}`) with the same registry, the same validation, the same policy
    gate and the same ledger — i.e. a schema-driven dispatcher replacing native tool calling, with no
    change to `tools/`, `policy/` or `services/`.
+   **Amended 2026-10-17, from `format=<JSON Schema>`.** A10 was run against the real API and `format`
+   does not constrain `gpt-oss:120b-cloud`. With a schema passed through `format` but *not* stated in
+   the prompt, the model answers with markdown prose (`**Capital de España:** Madrid.` — probe section
+   4a) and, at other thinking levels, with fenced JSON carrying invented field names; its own
+   `thinking` says the schema was never given to it. Stating the fields in the prompt *does* work —
+   section 4b of the same run returned `{"answer":"Madrid","confidence":0.99}`, conformant — so the
+   fallback survives, just not through the parameter this plan named. Whether `format` contributes
+   anything at all when the prompt states the fields is **still unproven**: no run has separated
+   those two variables, and a probe that states the schema in both halves (the first attempt at this
+   amendment) tests nothing while appearing to pass. The probe now keeps them separate on purpose.
 3. **If neither works,** Phase 3's acceptance is **re-scoped, not skipped**: the approval machinery,
    the CAS, the ledger and the policy table are all still demonstrable (they do not require the model
    to call tools — a test driver can emit the tool calls), and the report states plainly that

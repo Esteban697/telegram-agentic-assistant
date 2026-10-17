@@ -47,6 +47,12 @@ def make_settings(**overrides: Any) -> Settings:
 
     base: dict[str, Any] = {
         "app_env": "test",
+        # Pinned deliberately. Without this the value is inherited from the developer's `.env`,
+        # so setting `STORE_BACKEND=postgres` — the setting Phase 2 wants in development — made
+        # the unit suite fail five tests that assert the development default. A helper whose
+        # docstring promises "development-safe defaults" must not depend on ambient `.env`.
+        # Tests that want the database backend use `make_db_settings` or pass it explicitly.
+        "store_backend": "memory",
         "log_level": "WARNING",
         "telegram_bot_token": "test-token-not-a-real-secret",
         "telegram_webhook_secret": WEBHOOK_SECRET,
