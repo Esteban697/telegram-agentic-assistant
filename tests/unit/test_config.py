@@ -185,6 +185,7 @@ def test_environment_values_flow_through_load_settings(
     monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "local-dev-secret")
     monkeypatch.setenv("OLLAMA_BASE_URL", "http://127.0.0.1:9")
     monkeypatch.setenv("LLM_TIMEOUT_SECONDS", "2")
+    monkeypatch.setenv("LLM_MAX_RETRIES", "0")
     monkeypatch.setenv("REQUEST_BUDGET_SECONDS", "5")
 
     from app.config import load_settings
@@ -209,7 +210,7 @@ def test_log_level_is_normalised_and_validated() -> None:
 def test_llm_timeout_must_fit_inside_the_request_budget() -> None:
     with pytest.raises(ConfigError) as excinfo:
         make_settings(llm_timeout_seconds=60.0, request_budget_seconds=45.0)
-    assert "LLM_TIMEOUT_SECONDS must be smaller than REQUEST_BUDGET_SECONDS" in str(excinfo.value)
+    assert "provider call can outlast the request budget" in str(excinfo.value)
 
 
 def test_think_flag_normalisation() -> None:

@@ -54,16 +54,6 @@ def _layer_of(relative: Path) -> int:
     pytest.fail(f"unclassified module: {relative}")
 
 
-def _layer_of_dotted(dotted: str) -> int:
-    """Layer of an imported dotted path, including a bare package import."""
-
-    remainder = dotted[len("app.") :]
-    segments = remainder.split(".")
-    if len(segments) == 1:
-        # `from app.bot import messages` arrives as "app.bot": a package-level import.
-        return _PACKAGE_LAYERS[segments[0]]
-    return _layer_of(Path(*segments))
-
 
 def _imported_app_modules(path: Path) -> set[str]:
     """Return the dotted ``app.*`` modules imported by a file, including relative imports."""

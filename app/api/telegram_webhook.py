@@ -161,7 +161,9 @@ async def _handle_request(request: Request, settings: Settings, *, request_id: s
         return JSONResponse(status_code=200, content={"ok": True})
 
     update_id = update.get("update_id")
-    if not isinstance(update_id, int):
+    # `isinstance(True, int)` is True, so a JSON boolean would be accepted as the integer 0 or
+    # 1 and collide with a real update id in the ledger (found by the Phase 1 review).
+    if not isinstance(update_id, int) or isinstance(update_id, bool):
         _logger.warning(
             "update without an integer update_id",
             extra={"error_code": "update_id_missing", "status": 200},

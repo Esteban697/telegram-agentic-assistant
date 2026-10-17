@@ -36,6 +36,7 @@ from app.errors import (
     OllamaUnsupportedModel,
 )
 from app.llm.protocols import ChatMessage, ChatResult, ToolCall, ToolSpec
+from app.policy.limits import backoff_seconds
 
 _logger = logging.getLogger(__name__)
 
@@ -196,8 +197,10 @@ class OllamaChatClient:
 
     @staticmethod
     async def _backoff(attempt: int) -> None:
-        # Bounded in-process backoff inside one request; not a scheduling mechanism.
-        await asyncio.sleep(min(0.25 * (2 ** (attempt - 1)), 2.0))
+        # Bounded in-process backoff inside one request; not a scheduling mechanism. The
+        # schedule is shared with configuration validation via app.policy.limits, so the
+        # budget arithmetic and the code that actually sleeps cannot drift apart.
+        await asyncio.sleep(backoff_seconds(attempt))
 
     def _check_status(self, response: httpx.Response, *, method: str, path: str) -> httpx.Response:
         status = response.status_code
@@ -283,18 +286,22 @@ class OllamaChatClient:
 
 
 def _safe_error_detail(response: httpx.Response) -> str:
-    """Return a short, structurally safe error string from a provider response.
+    """Return a short, structural summary of a provider error — never its body.
 
-    The provider error body is echoed for diagnostics but truncated; it is never the prompt
-    or the completion, which are not part of an error envelope.
+    **Changed in the Phase 1 review.** This used to return the provider's raw response text,
+    which reached the log as ``error_detail``. A provider error envelope is exactly where a
+    request echo appears: a 400 for a malformed payload comes back quoting the payload, so a
+    user's message ended up in our logs (PLAN.md §7.4 forbids logging message content). The
+    body is untrusted third-party text with no bounded structure, so it is not summarised —
+    only its size is reported, which is enough to distinguish "provider refused the request"
+    from "provider returned an HTML error page" without reproducing anything.
     """
 
     try:
         text = response.text
     except Exception:  # pragma: no cover - defensive
-        return "<unreadable>"
-    text = text.strip().replace("\n", " ")
-    return text[:200]
+        return "body=<unreadable>"
+    return f"status={response.status_code} body_bytes={len(text)}"
 
 
 def _nanos_to_ms(value: Any) -> float | None:

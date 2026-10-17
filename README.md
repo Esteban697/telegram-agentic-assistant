@@ -46,8 +46,11 @@ Telegram  ──HTTPS──▶  app/api/telegram_webhook.py
 
 Regla de dependencias que se comprueba con una prueba (`tests/unit/test_layering.py`):
 `agent/` no importa nunca `app.storage.stores` ni `httpx`. **El handler** lee el contexto de la
-conversación y pasa al grafo la lista de mensajes ya preparada; por eso la Fase 2 podrá
-cambiar el almacén por el estado persistido de LangGraph sin tocar el grafo.
+conversación y pasa al grafo la lista de mensajes ya preparada. Por eso la Fase 2 solo tiene
+que **adjuntar el checkpointer** (`compile(checkpointer=...)` y un `thread_id` en
+`ChatAgent.run`) y sustituir el almacén por el estado persistido: el grafo no se reestructura.
+La regla de dependencias garantiza que el cambio no arrastre el almacén al interior del
+agente, no que `graph.py` no se toque.
 
 ---
 
@@ -201,6 +204,13 @@ incluye `.env`, claves ni ficheros de servicio.
 - **Sin herramientas reales.** El grafo tiene un solo nodo: no hay recordatorios, memoria,
   documentos, búsqueda web ni aprobaciones. Esas capacidades llegan en las fases 2 a 4.
 - **`/tasks`, `/memory` y `/forget` no están implementados**; responden indicándolo.
+- **`429` de Telegram: la respuesta se pierde.** Si la Bot API responde `429`, el cliente
+  lanza `TelegramRateLimited` con el `retry_after` que indique Telegram, pero **no se espera ni
+  se reintenta**: la respuesta de ese turno no se entrega y el `update` queda marcado como
+  fallido en el registro. Consumir el `retry_after` dentro del presupuesto (y encolar la
+  respuesta cuando no quepa) es trabajo de la Fase 3, junto con el traspaso a la cola de
+  reanudación. Se documenta aquí para que sea una limitación conocida y no un
+  comportamiento que se descubra en producción.
 - **Límite de frecuencia por instancia.** El cubo de fichas es local al proceso, así que el
   límite efectivo es `RATE_LIMIT_PER_MINUTE` multiplicado por el número de instancias.
 - **Las imágenes que no sean texto** reciben un aviso; los documentos llegan en la Fase 4.

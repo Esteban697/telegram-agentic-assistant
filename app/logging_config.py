@@ -110,14 +110,43 @@ def clear_request_context() -> None:
 def redact(value: Any, *, key: str | None = None, content_debug: bool = False) -> Any:
     """Redact a value that is known to carry sensitive content.
 
-    Exposed so callers can scrub a nested structure themselves before logging it; the
-    formatter below also applies it to every ``extra`` field.
+    Redaction is **recursive**: a blocked key anywhere in the structure suppresses its value,
+    including nested inside an unblocked container. The earlier form only looked at top-level
+    keys, so ``extra={"meta": {"content": "..."}}`` carried a user message straight into the
+    log (found by the Phase 1 review). Depth and breadth are bounded so a pathological
+    structure cannot turn logging into a denial of service.
     """
 
-    if key is not None and key.lower() in _BLOCKED_KEYS:
-        if content_debug and key.lower() in _CONTENT_KEYS:
-            return _truncate(str(value))
-        return _REDACTED
+    return _redact(value, key=key, content_debug=content_debug, depth=0)
+
+
+_MAX_REDACT_DEPTH = 5
+_MAX_REDACT_ITEMS = 50
+
+
+def _redact(value: Any, *, key: str | None, content_debug: bool, depth: int) -> Any:
+    if key is not None:
+        lowered = key.lower()
+        if lowered in _BLOCKED_KEYS:
+            if content_debug and lowered in _CONTENT_KEYS:
+                return _truncate(str(value))
+            return _REDACTED
+
+    if depth >= _MAX_REDACT_DEPTH:
+        return "[truncated]"
+
+    if isinstance(value, dict):
+        return {
+            item_key: _redact(
+                item_value, key=str(item_key), content_debug=content_debug, depth=depth + 1
+            )
+            for item_key, item_value in list(value.items())[:_MAX_REDACT_ITEMS]
+        }
+    if isinstance(value, (list, tuple)):
+        return [
+            _redact(item, key=key, content_debug=content_debug, depth=depth + 1)
+            for item in list(value)[:_MAX_REDACT_ITEMS]
+        ]
     return value
 
 
@@ -170,19 +199,30 @@ class JsonFormatter(logging.Formatter):
             payload["exc_message"] = redact(
                 str(record.exc_info[1]), key="content", content_debug=self._content_debug
             )
-
         return json.dumps(payload, ensure_ascii=False, default=str)
 
 
+_HANDLER_MARKER = "_assistant_json_handler"
+
+
 def configure_logging(*, level: str, app_env: str, content_debug: bool = False) -> None:
-    """Install the JSON formatter on the root logger. Idempotent."""
+    """Install the JSON formatter on the root logger. Idempotent.
+
+    Only handlers **this function installed** are replaced. An earlier revision removed every
+    root handler, which silently detached a host's own handler — including pytest's log
+    capture, which made the leak tests pass without capturing anything. A logging setup that
+    disables its host's capture is also a hazard in production, where an embedding process may
+    have attached its own handler.
+    """
 
     handler = logging.StreamHandler(stream=sys.stdout)
     handler.setFormatter(JsonFormatter(app_env=app_env, content_debug=content_debug))
+    setattr(handler, _HANDLER_MARKER, True)
 
     root = logging.getLogger()
     for existing in list(root.handlers):
-        root.removeHandler(existing)
+        if getattr(existing, _HANDLER_MARKER, False):
+            root.removeHandler(existing)
     root.addHandler(handler)
     root.setLevel(level.upper())
 

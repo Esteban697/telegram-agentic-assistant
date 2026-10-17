@@ -24,7 +24,7 @@ from collections.abc import Sequence
 from langgraph.graph import END, START, StateGraph
 
 from app.agent.routing import DONE, FAILED, route_after_model
-from app.agent.state import ChatState
+from app.agent.state import ChatState, from_message_dicts, to_message_dicts
 from app.errors import AssistantError, BudgetExceeded, OllamaBadResponse
 from app.llm.protocols import ChatMessage, ChatModel, ChatResult
 
@@ -104,15 +104,12 @@ class ChatAgent:
         return builder.compile()
 
     def _shape(self, messages: Sequence[ChatMessage]) -> list[dict[str, str]]:
-        shaped: list[dict[str, str]] = [{"role": "system", "content": self._system_prompt}]
-        shaped.extend(message.as_dict() for message in messages)
-        return shaped
+        # Uses the shared conversion helper rather than a second hand-rolled loop, so the
+        # dict shape the graph carries is defined in exactly one place (app/agent/state.py).
+        return [{"role": "system", "content": self._system_prompt}, *to_message_dicts(list(messages))]
 
     async def _call_model(self, state: ChatState) -> ChatState:
-        messages = [
-            ChatMessage(role=str(entry.get("role", "user")), content=str(entry.get("content", "")))
-            for entry in state.get("messages", [])
-        ]
+        messages = from_message_dicts(state.get("messages", []))
         try:
             result = await self._model.chat(messages)
         except AssistantError as exc:

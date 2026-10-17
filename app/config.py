@@ -22,12 +22,18 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from app.errors import ConfigError
 from app.policy.authz import parse_allow_list
+from app.policy.limits import worst_case_provider_seconds
 
 AppEnv = Literal["development", "test", "production"]
 StoreBackend = Literal["memory", "postgres"]
 
 # Characters Telegram allows in a webhook secret token (Appendix A.7).
 _WEBHOOK_SECRET_RE = re.compile(r"^[A-Za-z0-9_-]{1,256}$")
+
+# Slack left inside the request budget after the worst-case provider call, for everything the
+# turn still has to do: assemble the prompt, write to the store, call the Bot API with the
+# reply, and write the ledger row.
+_BUDGET_SAFETY_MARGIN_SECONDS = 2.0
 
 
 class Settings(BaseSettings):
@@ -62,8 +68,14 @@ class Settings(BaseSettings):
     ollama_base_url: str = "https://ollama.com"
     ollama_api_key: SecretStr = SecretStr("")
     llm_model: str = "gpt-oss:120b-cloud"
-    llm_timeout_seconds: float = Field(default=30.0, gt=0)
-    llm_max_retries: int = Field(default=2, ge=0)
+    # Defaults chosen so the provider timeout is *reachable* inside the request budget:
+    #   worst case = LLM_TIMEOUT_SECONDS x (LLM_MAX_RETRIES + 1) + backoff + margin
+    #              = 18 x 2 + 0.25 + 2.0 = 38.25 s  <=  REQUEST_BUDGET_SECONDS (45 s)
+    # With the earlier defaults (30 s x 3 = 90 s against a 45 s budget) the provider timeout
+    # could never fire, so every slow turn surfaced as a budget exhaustion and LLM_MAX_RETRIES
+    # had no observable effect. `problems()` recomputes this from the configured values.
+    llm_timeout_seconds: float = Field(default=18.0, gt=0)
+    llm_max_retries: int = Field(default=1, ge=0)
     llm_think: str | None = "low"
 
     # --- Budget and limits ------------------------------------------------- #
@@ -152,11 +164,19 @@ class Settings(BaseSettings):
 
         found: list[str] = []
 
-        if self.llm_timeout_seconds >= self.request_budget_seconds:
+        worst_case = worst_case_provider_seconds(
+            timeout=self.llm_timeout_seconds, max_retries=self.llm_max_retries
+        )
+        if worst_case + _BUDGET_SAFETY_MARGIN_SECONDS > self.request_budget_seconds:
             found.append(
-                "LLM_TIMEOUT_SECONDS must be smaller than REQUEST_BUDGET_SECONDS "
-                f"({self.llm_timeout_seconds} >= {self.request_budget_seconds}); "
-                "otherwise the model timeout can never fire before the request budget"
+                "the provider call can outlast the request budget, so the model timeout could "
+                "never fire and every slow turn would surface as a budget exhaustion: "
+                f"LLM_TIMEOUT_SECONDS({self.llm_timeout_seconds}) x (LLM_MAX_RETRIES"
+                f"({self.llm_max_retries}) + 1) + retry backoff = {worst_case:.2f}s, plus a "
+                f"{_BUDGET_SAFETY_MARGIN_SECONDS:.1f}s margin, exceeds "
+                f"REQUEST_BUDGET_SECONDS({self.request_budget_seconds}). Lower "
+                "LLM_TIMEOUT_SECONDS or LLM_MAX_RETRIES, or raise REQUEST_BUDGET_SECONDS "
+                "(which must stay below Telegram's 60s webhook deadline)"
             )
 
         # The plan's rule is "https outside development": local development may point at a
@@ -214,6 +234,45 @@ class Settings(BaseSettings):
                 context={"problem_count": len(problems)},
             )
         return self
+
+    def access_warnings(self) -> list[str]:
+        """Return the loud startup warnings the plan requires outside production (§7.2).
+
+        Pure and log-free on purpose: the strings are produced here and emitted by the
+        startup wiring, so the wording is unit-testable without capturing log output.
+
+        Two configurations are legitimate in development and dangerous in silence:
+
+        * an **empty allow-list** denies every user, so the bot looks broken rather than
+          closed;
+        * ``DEV_ALLOW_ANY_USER=true`` admits **everybody**, including strangers who guess the
+          bot's name.
+
+        Both must say so at startup; neither did before the Phase 1 review.
+        """
+
+        warnings: list[str] = []
+        if self.app_env == "production":
+            return warnings
+
+        if self.dev_allow_any_user:
+            warnings.append(
+                "DEV_ALLOW_ANY_USER=true: ANY Telegram user may talk to this bot, including "
+                "users who are not in TELEGRAM_ALLOWED_USER_IDS. Never enable this outside "
+                "local testing (PLAN.md §7.2)."
+            )
+        if not self.telegram_allowed_user_ids and not self.dev_allow_any_user:
+            warnings.append(
+                "TELEGRAM_ALLOWED_USER_IDS is empty in "
+                f"{self.app_env}: every user is DENIED by default, so the bot will answer "
+                "nobody. Set your numeric id to be able to talk to it (PLAN.md §7.2)."
+            )
+        if not self.telegram_bot_token.get_secret_value():
+            warnings.append(
+                "TELEGRAM_BOT_TOKEN is empty: outbound messages cannot be delivered, so "
+                "replies will be logged as failures instead of being sent."
+            )
+        return warnings
 
     # ------------------------------------------------------------------ #
     # Convenience accessors (the only place secret values are unwrapped)

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from typing import Any
 
 import httpx
@@ -277,6 +278,34 @@ def test_provider_server_error_produces_a_specific_message() -> None:
 
     assert response.status_code == 200
     assert harness.telegram.sent_texts == [messages.render("error.model_unavailable")]
+
+
+def test_a_provider_failure_is_logged_with_an_error_code(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A7's third clause: the failure "is logged with an ``error_code``".
+
+    Nothing asserted it before the Phase 1 review — the criterion was demonstrated for the
+    user-visible message and for the HTTP status only, so the observability half of the
+    acceptance criterion was unverified.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, json={"error": "slow down"})
+
+    with caplog.at_level(logging.WARNING):
+        with Harness(handler=handler) as harness:
+            harness.post(_message_update(update_id=1, text="hola"))
+            status = harness.status_of(1)
+
+    codes = [getattr(record, "error_code", None) for record in caplog.records]
+    assert caplog.records, "the failure must produce log records"
+    assert "ollama_rate_limited" in codes, f"expected a typed error_code, got {codes}"
+    assert status == "failed", "the ledger must record the failure"
+
+    # And the log line must not carry the provider's body (review item 1).
+    emitted = "\n".join(str(record.__dict__) for record in caplog.records)
+    assert "slow down" not in emitted, "a provider error body must not be logged"
 
 
 def test_unexpected_handler_failure_still_answers_telegram_and_the_user() -> None:

@@ -53,6 +53,12 @@ def create_app(
         content_debug=resolved.log_content_debug,
     )
 
+    # The loud warnings of PLAN.md §7.2. Emitted before anything else can fail, so the
+    # operator sees them on the first screenful rather than discovering the situation from
+    # behaviour: an empty allow-list denies everybody, and DEV_ALLOW_ANY_USER admits anybody.
+    for warning in resolved.access_warnings():
+        _logger.warning(warning, extra={"error_code": "insecure_development_configuration"})
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         dedupe, conversations = build_stores(

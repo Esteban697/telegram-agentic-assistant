@@ -42,7 +42,11 @@ def make_settings(**overrides: Any) -> Settings:
         "telegram_webhook_secret": WEBHOOK_SECRET,
         "telegram_allowed_user_ids": frozenset({USER_ID}),
         "ollama_api_key": "test-api-key-not-a-real-secret",
-        "llm_timeout_seconds": 5.0,
+        # Small values so the suite is fast; the invariant that matters is enforced by
+        # configuration validation (worst-case provider time <= budget - margin):
+        # 2.0 x (1 + 1) + 0.25 backoff + 2.0 margin = 6.25 <= 10.
+        "llm_timeout_seconds": 2.0,
+        "llm_max_retries": 1,
         "request_budget_seconds": 10.0,
         "rate_limit_per_minute": 100,
     }

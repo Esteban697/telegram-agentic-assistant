@@ -225,7 +225,7 @@ def test_settings_model_imports_no_application_module() -> None:
     """Layer 0: ``config.py`` may not import other ``app`` packages."""
 
     tree = ast.parse((APP_DIR / "config.py").read_text(encoding="utf-8"))
-    allowed = {"app.errors", "app.policy.authz"}
+    allowed = {"app.errors", "app.policy.authz", "app.policy.limits"}
     offenders: list[str] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("app"):
