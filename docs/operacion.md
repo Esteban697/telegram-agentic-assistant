@@ -41,6 +41,26 @@ contienen tokens, claves, documentos, embeddings ni el contenido de los mensajes
 - **Regla.** No poner un bucle de reintentos nuevo en el handler: el presupuesto es la garantía de
   que el webhook contesta.
 
+## 2.1 Búsqueda web: timeout, límite o clave inválida
+
+- **Síntoma.** El asistente dice que no ha podido buscar. Logs: `web search timed out`,
+  `web search rate limited`, `web search authentication failed` o `web search returned an error
+  status`, con `error_code`, `status`, `duration_ms` y `query_chars` (nunca la consulta ni el
+  resultado). En el turno, el modelo ve `search_web: error ollama_timeout` (o el código que
+  corresponda).
+- **Qué ocurre.** `POST https://ollama.com/api/web_search` con la misma `OLLAMA_API_KEY` del chat,
+  timeout de 10 s y **sin reintentos ocultos**; los resultados se recortan antes de entrar en el
+  contexto y se tratan como datos no confiables. Si el proveedor falla, el modelo está instruido
+  para decirlo y no sustituirlo por conocimiento general.
+- **Respuesta.** Comprobar el estado de Ollama Cloud y la cuota de la cuenta. Si el código es
+  `ollama_unavailable` con `status: 401/403`, rotar `OLLAMA_API_KEY` en Secret Manager y actualizar
+  el servicio (`gcloud run services update --update-secrets`); si es `ollama_rate_limited`, esperar.
+  Si se quiere desactivar la búsqueda sin desplegar código, `WEB_SEARCH_PROVIDER=none` deja la
+  herramienta respondiendo `CapabilityUnavailable`.
+- **Regla.** No añadir un bucle de reintentos dentro del proveedor: el presupuesto del turno es la
+  garantía de que el webhook contesta. No registrar la consulta ni los resultados: son contenido
+  del usuario y datos de terceros.
+
 ## 3. Telegram: límite de tasa (429)
 
 - **Síntoma.** Un mensaje de respuesta no se entrega. Logs: `telegram rate limited` con

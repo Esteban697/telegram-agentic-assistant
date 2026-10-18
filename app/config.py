@@ -79,6 +79,18 @@ class Settings(BaseSettings):
     llm_max_retries: int = Field(default=1, ge=0)
     llm_think: str | None = "low"
 
+    # --- Web search -------------------------------------------------------- #
+    # Ollama Cloud exposes POST /api/web_search with the same account key as chat. `none`
+    # leaves the tool returning CapabilityUnavailable instead of calling out. Search results
+    # are untrusted data; the prompt says so, and the caps below keep them from crowding the
+    # turn's context (the provider can return thousands of tokens per query).
+    web_search_provider: Literal["ollama", "none"] = "ollama"
+    web_search_base_url: str = "https://ollama.com"
+    web_search_max_results: int = Field(default=5, ge=1, le=10)
+    web_search_timeout_seconds: float = Field(default=10.0, gt=0)
+    web_search_max_content_chars: int = Field(default=2000, ge=100)
+    web_search_max_total_chars: int = Field(default=8000, ge=500)
+
     # --- Budget and limits ------------------------------------------------- #
     request_budget_seconds: float = Field(default=45.0, gt=0)
     rate_limit_per_minute: int = Field(default=20, gt=0)
@@ -271,6 +283,16 @@ class Settings(BaseSettings):
 
         if not self.telegram_api_base_url.startswith(("https://", "http://")):
             found.append("TELEGRAM_API_BASE_URL must be an absolute http(s) URL")
+
+        if not self.web_search_base_url.startswith(("https://", "http://")):
+            found.append("WEB_SEARCH_BASE_URL must be an absolute http(s) URL")
+        elif self.app_env != "development" and not self.web_search_base_url.startswith(
+            "https://"
+        ):
+            found.append(
+                "WEB_SEARCH_BASE_URL must use https:// outside development "
+                f"(got {self.web_search_base_url!r})"
+            )
 
         if self.default_timezone:
             try:

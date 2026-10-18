@@ -17,9 +17,9 @@ coste / IAM / límites / datos personales de la Fase 6.
 ## 1. Resumen ejecutivo
 
 El asistente está **desplegado y funcionando** en `https://taa-prod-api-hzlxaxcstq-ew.a.run.app`:
-un bot privado de Telegram que conversa a través de Ollama Cloud, guarda preferencias y
-recordatorios en PostgreSQL, indexa documentos y responde con la página de la que saca cada dato,
-y prepara acciones externas que solo se ejecutan con una aprobación explícita.
+un bot privado de Telegram que conversa a través de Ollama Cloud, busca en la web datos actuales,
+guarda preferencias y recordatorios en PostgreSQL, indexa documentos y responde con la página de la
+que saca cada dato, y prepara acciones externas que solo se ejecutan con una aprobación explícita.
 
 Evidencia de extremo a extremo, producida **por el usuario** contra el sistema desplegado:
 
@@ -54,7 +54,7 @@ Telegram ──HTTPS──▶ app/api/telegram_webhook.py
   memorias, tareas, documentos y chunks, aprobaciones, ledger de herramientas, `work_items` y los
   checkpoints de LangGraph.
 - **Vertex AI** (`gemini-embedding-001`, 768 dimensiones) para embeddings; **Ollama Cloud** para el
-  modelo de chat; **Cloud Storage** para los originales.
+  modelo de chat y la búsqueda web; **Cloud Storage** para los originales.
 
 ---
 
@@ -90,6 +90,7 @@ primera línea del docstring de cada módulo, abreviada.
 | `app/llm/embeddings.py` | Provedores de embeddings: Vertex (producción) y el doble léxico (pruebas). |
 | `app/llm/errors.py` | Taxonomía de errores de proveedor (referencia, no segunda definición). |
 | `app/llm/ollama_client.py` | Cliente HTTP de Ollama aislado (timeout, reintentos acotados, sin URLs del token en errores). |
+| `app/llm/web_search.py` | Proveedor de búsqueda web de Ollama Cloud (request acotado, resultados recortados, sin reintentos ocultos). |
 | `app/llm/protocols.py` | Puertos del LLM (`ChatModel`, `EmbeddingProvider`) — capa 0. |
 | `app/policy/approval.py` | Máquina de estados de aprobación como funciones puras. |
 | `app/policy/authz.py` | Parseo de la allow-list, extracción de identidad, denegación por defecto. |
@@ -155,6 +156,7 @@ primera línea del docstring de cada módulo, abreviada.
 | `tests/unit/test_limits.py`, `test_timezones.py` | Cubo de fichas y zonas horarias. |
 | `tests/unit/test_messages.py`, `test_readme.py` | Catálogo en español (única fuente), y que el README no miente sobre el código. |
 | `tests/unit/test_ollama_client.py`, `test_verify_ollama_probe.py`, `test_telegram_client.py` | Clientes y sonda, sin red real. |
+| `tests/unit/test_web_search_provider.py` | Búsqueda web: request, recorte, deduplicación, errores tipados y que no se registren consulta ni resultados. |
 | `tests/unit/test_phase2_units.py`, `test_stores.py` | Persistencia: firmas congeladas y almacenes. |
 | `tests/unit/test_phase4_guards.py`, `test_phase4_review_fixes.py`, `test_review_hardening.py` | Guardas de la Fase 4 (ingesta, citas, delimitador, plazos). |
 | `tests/unit/test_deploy_artifacts.py` | El contrato del despliegue: `--project`, secretos nunca impresos, aritmético, idempotencia, `--from-step`, ejecución accidental, aislamiento de las pruebas. |
@@ -167,6 +169,7 @@ primera línea del docstring de cada módulo, abreviada.
 | `tests/evals/test_golden_scorer.py` | El scorer de las evaluaciones (modo 1: transcripciones grabadas, sin credenciales). |
 | `tests/evals/test_rag_evals.py` | Recuperación real sobre el corpus ficticio, con orden y página. |
 | `tests/evals/test_agent_evals.py` | Comportamiento del agente con el modelo real (marcador `live`). |
+| `tests/evals/test_web_search_live.py` | El agente pide `search_web` para un dato actual y responde con una cifra (modelo y API reales). |
 | `tests/live/test_vertex_embeddings.py` | Vertex real: dimensión, página correcta y relación de puntuaciones. |
 
 ### 3.5 Raíz, documentación y configuración
@@ -192,11 +195,15 @@ primera línea del docstring de cada módulo, abreviada.
 
 | Suite | Comando | Resultado real |
 |---|---|---|
-| Unitaria, sin credenciales, sin BD, sin red | `pytest -m "not integration and not live and not eval"` | **434 pasan** |
+| Unitaria, sin credenciales, sin BD, sin red | `pytest -m "not integration and not live and not eval"` | **448 pasan** |
 | Integración contra PostgreSQL | `pytest -m integration` | **130 pasan, 1 se salta** |
 | Evaluaciones deterministas | `pytest -m "eval and not live"` | **23 pasan** |
 | Vertex real | `GOOGLE_CLOUD_PROJECT=telegram-assistant-esteban GOOGLE_CLOUD_REGION=europe-west1 RUN_LIVE_TESTS=1 pytest -m "live and not eval"` | **2 pasan** |
-| Agente sobre Ollama Cloud | `RUN_LIVE_TESTS=1 pytest -m "eval and live"` | **7 pasan** |
+| Agente sobre Ollama Cloud (incluye búsqueda web) | `RUN_LIVE_TESTS=1 pytest -m "eval and live"` | **8 en total: 7 pasan; 1 (nivel 2) falló y pasó al repetirla sola** |
+
+En la primera pasada de las evaluaciones del agente, `test_agent_prepares_a_level2_action_without_performing_it`
+falló porque el modelo no preparó la acción; al repetirla sola pasó. Es la estocasticidad del
+modelo registrada en §7.5, no un cambio de aserción.
 
 El salto de integración es **explícito**: `tests/integration/test_phase4_documents.py`
 (`test_a_and_b_page_level_citations_and_no_evidence`) está marcado como `skip` porque la calidad de
@@ -239,6 +246,8 @@ lo dice con el comando exacto. No hay ningún salto silencioso.
 - La **evaluación de "no hay evidencia"** falla si el suelo deja pasar basura o si `found`/`evidence`
   dejan de ser explícitos; la mitad del modelo falla si menos de 3 de 5 ejecuciones consultan y
   dicen "no encuentro" sin citar.
+- La **evaluación de búsqueda web** falla si el modelo no pide `search_web` para un dato actual, si
+  se niega teniendo la herramienta disponible, o si la respuesta no contiene ninguna cifra.
 
 ---
 
@@ -249,10 +258,10 @@ Los 15 elementos, uno a uno. **Verificado** = hay una ejecución o una prueba co
 
 | # | Elemento | Estado | Evidencia / dependencia |
 |---|---|---|---|
-| 1 | Se puede ejecutar localmente siguiendo el README | **Verificado** | README (setup, `uv sync`, `.env`, `docker`/`uvicorn`) + la suite unitaria corre en una máquina limpia sin credenciales (434) |
+| 1 | Se puede ejecutar localmente siguiendo el README | **Verificado** | README (setup, `uv sync`, `.env`, `docker`/`uvicorn`) + la suite unitaria corre en una máquina limpia sin credenciales (448) |
 | 2 | `.env.example` sin secretos reales | **Verificado** | `.env.example` versionado con valores vacíos; `test_env_example_contains_no_real_looking_secret` |
 | 3 | Migraciones desde una base vacía | **Verificado** | `0001`…`0007` aplicadas al proyecto Supabase nuevo (17.11) y al contenedor local; `scripts/bootstrap_db.py` verifica tablas, `vector` ≥ 0.8, HNSW y una fila activa |
-| 4 | Las pruebas unitarias pasan | **Verificado** | 434 pasan, sin credenciales, sin BD, sin red |
+| 4 | Las pruebas unitarias pasan | **Verificado** | 448 pasan, sin credenciales, sin BD, sin red |
 | 5 | Integración implementada y dependencias documentadas | **Verificado** | 130 pasan, 1 se salta; README documenta el contenedor y `TEST_DATABASE_URL` |
 | 6 | Telegram limitado a usuarios autorizados | **Verificado** | Allow-list + denegación por defecto; `test_authz`, `test_webhook_secret`; en producción una lista vacía **impide arrancar**; desplegado con `TELEGRAM_ALLOWED_USER_IDS` |
 | 7 | El LLM se puede cambiar por configuración | **Verificado** | `LLM_MODEL`; `test_model_name_is_never_hard_coded_outside_configuration`; sonda A10 documentada |
@@ -271,7 +280,7 @@ Los 15 elementos, uno a uno. **Verificado** = hay una ejecución o una prueba co
 
 | # | Entregable | Dónde | Estado |
 |---|---|---|---|
-| 1 | Código fuente funcional y tipado | `app/` (56 módulos, incluidos los `__init__`), con tipos en las fronteras de datos | Entregado |
+| 1 | Código fuente funcional y tipado | `app/` (57 módulos, incluidos los `__init__`), con tipos en las fronteras de datos | Entregado |
 | 2 | `pyproject.toml` con dependencias fijadas y comandos | `pyproject.toml` (pins exactos) + `uv.lock`; comandos de prueba en el README | Entregado |
 | 3 | `Dockerfile` y `.dockerignore` | Imagen multi-etapa, base por digest, no-root; `.dockerignore` con patrones `**/` | Entregado |
 | 4 | Migraciones de base de datos | `migrations/versions/0001`…`0007`; `alembic.ini` | Entregado y aplicado |
@@ -328,8 +337,10 @@ presenten como resueltos (spec §16).
    el primer embedding, no al arrancar.
 9. **Búsqueda híbrida diferida.** Solo hay búsqueda vectorial. El disparador para revisarla está
    escrito en el plan (recall por página < 0,8 en consultas con un token literal raro).
-10. **Proveedor de búsqueda web y de restaurantes sin integrar.** Las herramientas existen como
-    interfaces y responden `CapabilityUnavailable`; no se ha inventado ninguna API.
+10. **Integraciones externas.** La búsqueda web está integrada con Ollama Cloud
+    (`POST /api/web_search`, la misma `OLLAMA_API_KEY` del chat; 5 resultados por defecto, extractos
+    acotados, sin caché ni reintento oculto). Las herramientas de restaurantes siguen siendo
+    interfaces que responden `CapabilityUnavailable`; no se ha inventado ninguna API.
 
 ---
 
@@ -371,7 +382,7 @@ de confirmar** (spec §1.4; PLAN.md §12).
 | Cloud Logging | gratis hasta la franquicia | 0–bajo |
 | Supabase | **plan gratuito** hoy | **se pausa tras 7 días de inactividad y no tiene backups**; **Pro recomendado** (pendiente de confirmar su precio) |
 | Vertex AI (embeddings) | por uso, cuenta del usuario | **pendiente de confirmar** |
-| Ollama Cloud | por token, cuenta del usuario | **pendiente de confirmar** |
+| Ollama Cloud | por token (chat) y por consulta (búsqueda web), cuenta del usuario | **pendiente de confirmar** |
 | Telegram Bot API | gratis | — |
 
 ### 9.2 IAM concedido (y por qué es mínimo)
@@ -415,6 +426,7 @@ servicio siguió respondiendo `/health` y `/readyz` con 200 después del cambio.
 | Aprobaciones | TTL 30 min | una aprobación caducada no ejecuta |
 | Despacho de recordatorios | lease 900 s, máx. 5 intentos | se reconcilia como `unknown`; nunca se reenvía solo |
 | Contexto RAG | top_k 5, 6000 caracteres | fragmentos, nunca documentos completos |
+| Búsqueda web | 5 resultados (máx. 10), 2000 caracteres por resultado, 8000 en total, timeout 10 s | los extractos no desplazan el contexto del turno; cada consulta cuenta en la cuenta de Ollama |
 
 ### 9.4 Datos personales: qué se guarda, cuánto y cómo se borra
 
@@ -426,6 +438,7 @@ servicio siguió respondiendo `/health` y `/readyz` con 200 después del cambio.
 | Tareas y recordatorios | `tasks`, `reminder_dispatches` | avisos | completar/cancelar; borrado manual |
 | Documentos y fragmentos | GCS + `documents` + `document_chunks` (con embeddings) | RAG | borrado por etapas y **verificado** (fragmentos, objeto y fila) |
 | Aprobaciones y ledger de herramientas | `pending_actions`, `tool_invocations` | auditoría y no-duplicación | retención manual |
+| Consultas de búsqueda web | se envían a Ollama Cloud; **no** se persisten ni se registran | responder con datos actuales | no almacenadas; el proveedor aplica su propia política |
 | Logs | Cloud Logging | operación | **sin contenido** por defecto (solo ids, herramienta, duración, estado, puntuaciones) |
 
 **Retención:** no hay purga automática. La decisión de retención sigue **abierta** (PLAN.md §13.7):
@@ -440,7 +453,7 @@ mensajes, documentos, embeddings ni secretos; `LOG_CONTENT_DEBUG=false` es el va
 
 ```bash
 # Suite sin credenciales, sin base de datos y sin red
-uv run pytest -m "not integration and not live and not eval"          # 434
+uv run pytest -m "not integration and not live and not eval"          # 448
 
 # Integración contra el contenedor local
 bash scripts/run_local_db.sh

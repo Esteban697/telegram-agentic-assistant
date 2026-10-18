@@ -37,6 +37,7 @@ from app.config import Settings, load_settings
 from app.llm.embeddings import build_embedding_provider
 from app.llm.ollama_client import OllamaChatClient
 from app.llm.protocols import ChatModel
+from app.llm.web_search import OllamaWebSearchProvider
 from app.logging_config import configure_logging
 from app.services.approvals import ApprovalService
 from app.services.conversation import ConversationService
@@ -182,6 +183,25 @@ def create_app(
             )
         )
 
+        # --- web search ---------------------------------------------------------------- #
+        # The same Ollama account key authenticates chat and search. Without a key the tool
+        # still exists but reports CapabilityUnavailable, which is honest and keeps the local
+        # credential-free setup working.
+        web_provider = None
+        if (
+            resolved.web_search_provider == "ollama"
+            and resolved.api_key
+            and resolved.app_env != "test"
+        ):
+            web_provider = OllamaWebSearchProvider(
+                base_url=resolved.web_search_base_url,
+                api_key=resolved.api_key,
+                timeout=resolved.web_search_timeout_seconds,
+                max_results=resolved.web_search_max_results,
+                max_content_chars=resolved.web_search_max_content_chars,
+                max_total_chars=resolved.web_search_max_total_chars,
+            )
+
         registry: ToolRegistry | None = None
         approvals: ApprovalService | None = None
         work_queue: WorkQueue | None = None
@@ -195,7 +215,7 @@ def create_app(
                 [
                     *memory_specs(memory_tools),
                     *task_specs(task_tools),
-                    *web_specs(WebSearchTool()),
+                    *web_specs(WebSearchTool(provider=web_provider)),
                     *restaurant_specs(RestaurantTools()),
                     *document_specs(document_tools),
                 ],
@@ -300,6 +320,8 @@ def create_app(
                 await model.aclose()
             if telegram_client is None:
                 await telegram.aclose()
+            if web_provider is not None:
+                await web_provider.aclose()
             if owns_checkpointer and getattr(app.state, "checkpointer", None) is not None:
                 await app.state.checkpointer.aclose()
             if owns_database and active_database is not None:

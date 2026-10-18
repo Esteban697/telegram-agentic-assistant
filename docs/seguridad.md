@@ -93,7 +93,7 @@ Una acción de nivel 2 se **prepara**, nunca se ejecuta sola. La fila en `pendin
 - Pruebas: `tests/integration/test_phase3_approvals.py` (incluye dos callbacks concurrentes, caducidad,
   otro usuario y argumentos modificados), `tests/unit/test_phase2_units.py`.
 
-## 6. Inyección de prompt: el documento es **dato**
+## 6. Inyección de prompt: documentos y web son **datos**
 
 La defensa es estructural, porque las instrucciones del prompt no son una frontera de seguridad
 (spec §9, PLAN.md §6.6):
@@ -119,6 +119,10 @@ La defensa es estructural, porque las instrucciones del prompt no son una fronte
    herramienta de escritura de nivel 1 y **no** en el turno del usuario. Se ejecuta sobre el contexto
    real y sobre un turno real con el modelo.
 7. **El texto recuperado nunca se registra**: el log lleva documento, fragmento, página y puntuación.
+8. **Los resultados de la búsqueda web son datos no confiables.** El prompt ordena ignorar
+   instrucciones contenidas en ellos y citar la fuente; el proveedor devuelve título, URL y
+   extracto, y el recorte (`WEB_SEARCH_MAX_*`) limita cuánto texto entra de golpe. La API key viaja
+   en `Authorization`, nunca en la URL, y ni la consulta ni los resultados se registran en los logs.
 
 ## 7. Gestión de secretos
 

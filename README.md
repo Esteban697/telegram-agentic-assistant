@@ -1,9 +1,9 @@
 # Asistente personal en Telegram
 
 Asistente personal privado para Telegram. Un único usuario autorizado conversa con un modelo
-alojado en Ollama Cloud y puede guardar preferencias, crear recordatorios, enviar documentos para
-preguntar por su contenido y preparar acciones externas que solo se ejecutan con aprobación
-explícita.
+alojado en Ollama Cloud, busca en la web datos actuales, y puede guardar preferencias, crear
+recordatorios, enviar documentos para preguntar por su contenido y preparar acciones externas que
+solo se ejecutan con aprobación explícita.
 
 Está desplegado en Google Cloud: el servicio y los tres jobs corren en Cloud Run, el estado vive en
 PostgreSQL (Supabase) y los embeddings se calculan con Vertex AI. La documentación de despliegue,
@@ -15,6 +15,9 @@ operación, seguridad y el informe final están en [`docs/`](docs/).
 
 - **Conversación con contexto persistente.** Cada chat tiene su hilo; el estado del grafo
   (LangGraph) se guarda en PostgreSQL, así que sobrevive a reinicios y a la escala a cero.
+- **Búsqueda web.** Consulta datos que cambian —precios, noticias, horarios, disponibilidad— con
+  la API de búsqueda de Ollama Cloud y responde citando el título y la URL de la fuente. Los
+  resultados se tratan como datos no confiables y se recortan antes de entrar en el contexto.
 - **Preferencias explícitas.** Guarda lo que le pidas recordar y lo consulta después. Solo guarda
   lo que se le pide: no convierte la conversación entera en memoria.
 - **Recordatorios.** Con fecha, hora y zona horaria IANA. Se entregan mediante un job programado;
@@ -43,9 +46,9 @@ No hace falta ningún comando:
 - `Explícame la diferencia entre un préstamo a tipo fijo y uno variable, en cinco líneas.`
 - `Resume esto en tres puntos: <texto pegado>`
 
-Responde en español por defecto. **No tiene proveedor de búsqueda web**, así que no puede consultar
-precios, noticias ni horarios actuales; cuando le pides algo así, dice que esa capacidad no está
-disponible en vez de inventar una respuesta.
+Responde en español por defecto. Para datos que cambian —precios, noticias, horarios,
+disponibilidad— usa la búsqueda web (ver abajo) y cita la fuente; si la búsqueda falla, lo dice en
+vez de inventar una respuesta.
 
 ### Preferencias
 
@@ -89,6 +92,17 @@ advierte.
 
 Un PDF escaneado sin capa de texto se rechaza con un mensaje claro; las fotos y las notas de voz no
 se procesan.
+
+### Búsqueda web
+
+- `¿A cuánto está el bitcoin ahora mismo?`
+- `Busca el horario de apertura del Museo del Prado y dime la fuente.`
+- `¿Qué ha pasado hoy con <tema>? Responde con enlaces.`
+
+Usa `POST https://ollama.com/api/web_search` de Ollama Cloud con la misma `OLLAMA_API_KEY` del
+chat; cada consulta cuenta en la cuenta de Ollama. Devuelve hasta 10 resultados (5 por defecto) con
+título, URL y un extracto acotado. Responde citando título y URL, y si no hay resultados o el
+proveedor falla, lo dice en vez de rellenar con conocimiento general presentado como actual.
 
 ### Aprobaciones
 
@@ -135,7 +149,7 @@ Telegram ──HTTPS──▶ app/api/telegram_webhook.py
                       │                           work_items y checkpoints del grafo
                       ├──▶ Cloud Storage          originales de los documentos
                       ├──▶ Vertex AI              embeddings
-                      └──▶ Ollama Cloud           modelo de chat
+                      └──▶ Ollama Cloud           chat y búsqueda web
 ```
 
 - **Un binario, cuatro comandos**: `uvicorn app.main:app` para el servicio y
@@ -220,6 +234,7 @@ sin consumidor.
 | Aplicación | `APP_ENV`, `LOG_LEVEL`, `LOG_CONTENT_DEBUG` |
 | Telegram | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`, `TELEGRAM_ALLOWED_USER_IDS`, `DEV_ALLOW_ANY_USER`, `TELEGRAM_API_BASE_URL`, `MAX_MESSAGE_CHARS`, `MAX_WEBHOOK_BODY_BYTES` |
 | Modelo | `OLLAMA_BASE_URL`, `OLLAMA_API_KEY`, `LLM_MODEL`, `LLM_TIMEOUT_SECONDS`, `LLM_MAX_RETRIES`, `LLM_THINK`, `REQUEST_BUDGET_SECONDS`, `RATE_LIMIT_PER_MINUTE` |
+| Búsqueda web | `WEB_SEARCH_PROVIDER`, `WEB_SEARCH_BASE_URL`, `WEB_SEARCH_MAX_RESULTS`, `WEB_SEARCH_TIMEOUT_SECONDS`, `WEB_SEARCH_MAX_CONTENT_CHARS`, `WEB_SEARCH_MAX_TOTAL_CHARS` |
 | Persistencia | `STORE_BACKEND`, `DATABASE_URL`, `DATABASE_SYNC_URL`, `DB_POOL_SIZE`, `CHECKPOINTER_POOL_SIZE`, `MIGRATIONS_AUTORUN`, `DEFAULT_TIMEZONE` |
 | Embeddings y documentos | `EMBED_PROVIDER`, `EMBED_MODEL`, `EMBED_DIM`, `EMBED_TIMEOUT_SECONDS`, `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_REGION`, `GCS_BUCKET`, `MAX_UPLOAD_MB`, `MAX_PDF_PAGES`, `MAX_INGEST_SECONDS`, `INGEST_INLINE_BUDGET_SECONDS`, `DOCUMENT_JOB_BATCH_SIZE`, `RAG_*` |
 | Recordatorios | `REMINDER_BATCH_SIZE`, `REMINDER_MAX_ATTEMPTS`, `DISPATCHER_LEASE_SECONDS` |
@@ -313,6 +328,10 @@ RUN_LIVE_TESTS=1 uv run pytest -m "live and not eval"
 # Agente con el modelo real (necesita OLLAMA_API_KEY y base de datos)
 TEST_DATABASE_URL=postgresql+psycopg://postgres:postgres@127.0.0.1:55432/taa \
 RUN_LIVE_TESTS=1 uv run pytest -m "eval and live"
+
+# Búsqueda web real: modelo + /api/web_search (cada consulta cuenta en Ollama)
+TEST_DATABASE_URL=postgresql+psycopg://postgres:postgres@127.0.0.1:55432/taa \
+RUN_LIVE_TESTS=1 uv run pytest -m "eval and live" tests/evals/test_web_search_live.py
 ```
 
 Los marcadores `integration`, `eval` y `live` están declarados en `pyproject.toml`; las pruebas que
@@ -386,6 +405,9 @@ Base de datos en Supabase (PostgreSQL 17.11 + pgvector 0.8.2) y embeddings en Ve
   argumentos exactos; un CAS atómico impide ejecutarlas dos veces.
 - El texto de los documentos es **dato, no instrucción**: se delimita con un marcador no
   falsificable y el prompt ordena ignorar y reportar cualquier orden contenida en él.
+- Los resultados de la búsqueda web son datos no confiables: el prompt ordena ignorar instrucciones
+  contenidas en ellos y citar la fuente. La API key va en la cabecera, nunca en la URL, y los
+  resultados no se registran en los logs.
 - Los secretos viven en Secret Manager (versión fijada, nunca `latest`) y nunca se pasan por
   `argv`. No hay claves de cuenta de servicio: Cloud Run usa su identidad.
 - Los logs son JSON y no contienen tokens, DSN, mensajes, documentos ni embeddings.
@@ -394,9 +416,13 @@ Base de datos en Supabase (PostgreSQL 17.11 + pgvector 0.8.2) y embeddings en Ve
 
 - **Un solo usuario.** Hay aislamiento por propietario y está probado, pero la autorización es una
   lista; el sistema no está pensado para múltiples inquilinos.
-- **Sin búsqueda web ni integraciones externas.** `search_web`, `search_restaurants` y
-  `submit_reservation` existen como interfaces y responden `CapabilityUnavailable` mientras no haya
-  proveedor. No hay correo, calendario ni reservas reales.
+- **Sin integraciones de reservas, correo o calendario.** `search_restaurants`,
+  `check_restaurant_availability` y `submit_reservation` existen como interfaces y responden
+  `CapabilityUnavailable` mientras no haya proveedor. La búsqueda web sí está integrada; no hay
+  `web_fetch` ni scraping de la página completa, solo los extractos que devuelve la búsqueda.
+- **La búsqueda web depende de Ollama Cloud.** Cada consulta cuenta en la cuenta de Ollama y la
+  documentación no publica cuotas ni precios; si el proveedor falla o limita, la herramienta
+  devuelve un error y el asistente lo dice. No hay caché ni reintento oculto.
 - **Solo texto y documentos.** No se procesan notas de voz, fotos ni vídeo. Los PDF escaneados sin
   capa de texto se rechazan.
 - **El proveedor no respeta `format` para salida estructurada.** El *tool calling* funciona; cuando
