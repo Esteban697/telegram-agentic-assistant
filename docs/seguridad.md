@@ -133,6 +133,9 @@ La defensa es estructural, porque las instrucciones del prompt no son una fronte
   capas (`scripts/audit_image.py`) lo comprueba, y su `--self-test` prueba que el detector detecta.
 - **Sin claves de cuenta de servicio.** Cloud Run usa la identidad de la cuenta de servicio
   directamente; Vertex y GCS se autentican con ADC/identidad, no con un JSON.
+- **La cuenta de servicio por defecto de Compute no tiene roles.** Se le retiró el `roles/editor`
+  heredado el 2026-10-18 y se comprobó que no conserva ninguna concesión; ningún recurso la usa
+  (servicio y jobs corren con `taa-prod-runtime`).
 - **Logs sin secretos.** La redacción es por clave y por forma (bearer, token de Telegram, hex largo,
   base64, cabecera PEM); los errores del proveedor nunca llevan la URL con el token.
 

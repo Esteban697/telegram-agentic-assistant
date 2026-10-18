@@ -394,12 +394,12 @@ directamente. `iam.serviceAccountUser` sobre la cuenta de ejecución **no** se c
 (los jobs ya se ejecutan *como* ella; `actAs` sobre esa identidad permitiría leer todos los secretos
 y la base de datos).
 
-**Dos concesiones heredadas de GCP, dichas para que no sorprendan:** el humano es `owner` del
-proyecto —no un rol de despliegue acotado, y no hay un principal separado para desplegar— y la
-cuenta de servicio por defecto `<project-number>-compute@developer.gserviceaccount.com` conserva el
-`roles/editor` que GCP asigna al crear el proyecto. **El despliegue no la usa** (servicio y jobs
-corren con `taa-prod-runtime`), así que quitarla es una mejora de mínimo privilegio pendiente, no un
-riesgo del camino de ejecución.
+**Concesiones heredadas, comprobadas y corregidas:** el humano es `owner` del proyecto —no un rol de
+despliegue acotado, y no hay un principal separado para desplegar—. La cuenta de servicio por
+defecto `<project-number>-compute@developer.gserviceaccount.com` conservaba el `roles/editor` que GCP
+asigna al crear el proyecto; **se le retiró el 2026-10-18** y se verificó que ya no tiene ningún rol
+en el proyecto. **El despliegue nunca la usó** (servicio y jobs corren con `taa-prod-runtime`), y el
+servicio siguió respondiendo `/health` y `/readyz` con 200 después del cambio.
 
 ### 9.3 Límites operativos
 
