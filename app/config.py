@@ -129,6 +129,10 @@ class Settings(BaseSettings):
     # REQUEST_BUDGET_SECONDS, so a deliberately tight request budget is never exceeded by an
     # ingest that was configured to run for longer. The rest belongs to the Phase 5 job.
     ingest_inline_budget_seconds: float = Field(default=30.0, gt=0)
+    # How many documents one run of the `process_documents` job takes on. The job has no request
+    # budget (Cloud Run Jobs have their own timeout), so this bounds a run by work rather than by
+    # time, and the next scheduled run picks up whatever is left.
+    document_job_batch_size: int = Field(default=10, gt=0)
 
     # --- Approvals (Phase 3) ------------------------------------------------ #
     # Spec §12: APPROVAL_TTL_MINUTES. An approval is only valid for this long, and the claim

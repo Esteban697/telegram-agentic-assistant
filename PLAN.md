@@ -2109,7 +2109,7 @@ All fields are typed; secrets use `SecretStr`; every field has a validator. The 
 | LLM | `OLLAMA_BASE_URL` (`https://ollama.com`), `OLLAMA_API_KEY`, `LLM_MODEL` (`gpt-oss:120b-cloud`), `LLM_TIMEOUT_SECONDS`, `LLM_MAX_RETRIES`, `LLM_THINK` |
 | Embeddings | `EMBED_PROVIDER` (`ollama`/`vertex`/`stub`), `EMBED_BASE_URL`, `EMBED_MODEL`, `EMBED_DIM`, `EMBED_BATCH_SIZE`, `EMBED_TIMEOUT_SECONDS` — **added beyond spec §12**, see §3.1. **`RAG_EMBED_MODEL_ACTIVE` was removed in round 1 (B7)**: the active embedding model has exactly one authority, the `embedding_models` row (§6.4, §15). |
 | Data | `DATABASE_URL` (async DSN), `DATABASE_SYNC_URL` (Alembic/scripts), `DB_POOL_SIZE` (`4`), `CHECKPOINTER_POOL_SIZE` (`3`), `STORE_BACKEND` (`memory`/`postgres`; `memory` is a **production startup error**, §7.2), `GCS_BUCKET`, `MIGRATIONS_AUTORUN` |
-| Agent | `REQUEST_BUDGET_SECONDS` (**`45`** — below Telegram's 60 s webhook deadline, N3; it is the hand-off point to the resume queue, not the response deadline), `RAG_TOP_K`, `RAG_CHUNK_CHARS`, `RAG_CHUNK_OVERLAP_CHARS`, `RAG_CHUNK_MAX_CHARS`, `RAG_CHUNK_MIN_CHARS`, `RAG_MAX_CONTEXT_CHARS`, **`RAG_MIN_SCORE` (`0.10` — the degenerate-match filter of §6.2/§13.1, *not* a relevance threshold)**, `INGEST_INLINE_BUDGET_SECONDS`, `MAX_PDF_PAGES`, `MAX_INGEST_SECONDS` |
+| Agent | `REQUEST_BUDGET_SECONDS` (**`45`** — below Telegram's 60 s webhook deadline, N3; it is the hand-off point to the resume queue, not the response deadline), `RAG_TOP_K`, `RAG_CHUNK_CHARS`, `RAG_CHUNK_OVERLAP_CHARS`, `RAG_CHUNK_MAX_CHARS`, `RAG_CHUNK_MIN_CHARS`, `RAG_MAX_CONTEXT_CHARS`, **`RAG_MIN_SCORE` (`0.10` — the degenerate-match filter of §6.2/§13.1, *not* a relevance threshold)**, `INGEST_INLINE_BUDGET_SECONDS`, `DOCUMENT_JOB_BATCH_SIZE` (`10` — how many documents one run of `app/jobs/process_documents.py` takes on), `MAX_PDF_PAGES`, `MAX_INGEST_SECONDS` |
 | Phase 1 stores | `CONTEXT_MAX_MESSAGES` (`20`), `CONTEXT_TTL_SECONDS` (`3600`), `UPDATE_DEDUPE_TTL_SECONDS` (`3600`), `UPDATE_DEDUPE_MAX_ENTRIES` (`10000`) — **added in round 1 (N14)**: the in-memory context cap/TTL and dedupe TTL/bound were referenced but never configured. Bounds are enforced (positive, and the dedupe store evicts oldest-first at the entry cap). |
 | Policy | `APPROVAL_TTL_MINUTES` (`30`), `ENABLE_LEVEL3` (must be false), `MAX_UPLOAD_MB` (`20`), `RATE_LIMIT_PER_MINUTE` (**implemented in §7.6**, N4) |
 | Ops | `REMINDER_BATCH_SIZE` (`50`), `REMINDER_MAX_ATTEMPTS` (`5`, mirrored onto `tasks.max_attempts` at creation), `DISPATCHER_LEASE_SECONDS` (`900`), `STALE_INVOCATION_SECONDS` (`900`) — **defaults added in round 2 (RN4), because §15 makes §8.1 the authority for every variable *and its default*, and because B2's reconciliation is only sound if the lease exceeds the dispatcher's own maximum run time** (the job's Cloud Run timeout, §11.3): a lease shorter than the run can reconcile an in-flight send to `unknown` while the message is actually being delivered, so the constraint is **`DISPATCHER_LEASE_SECONDS ≥ job timeout`** and it is asserted at startup. `RETENTION_DAYS` was removed in round 1 (N4) and is re-added only when a retention policy is chosen and a consumer exists (§13.7). |
@@ -2382,8 +2382,13 @@ credential coupling cannot silently spread into the default suite.
 
 ### 9.5 Additional guards
 
-- **No-secret-in-image test:** after `docker build`, inspect the image layers/manifest in CI for
-  `.env`, `*.json` service-account shapes, and private-key headers; fail if found.
+- **No-secret-in-image test:** after `docker build`, inspect the image layers/manifest for `.env`,
+  `*.json` service-account shapes, and private-key headers; fail if found. **Built in Phase 5 as
+  `scripts/audit_image.py`** (`docker create` + `docker export`, then walk every member): it looks
+  for forbidden names, private-key **material** (a PEM header followed by a real base64 body — a
+  public certificate is not a finding), a service-account body with `private_key`/`private_key_id`,
+  and an optional `--sentinel` value. `--self-test` plants all four plus the two false-positive
+  shapes and is what the credential-free suite runs, so the detector cannot rot silently.
 - **Repo secret scan:** `scripts/`-based grep for known secret patterns before each commit
   (documented, not enforced by a hook, to avoid adding tooling the spec did not ask for).
 - **Coverage gate:** the credential-free suite must keep ≥ 85% line coverage on `app/policy/`,
@@ -2709,6 +2714,81 @@ graph with nothing to run on. The fallback is now concrete and ordered:
   so what remains is approval for the specific resources rather than for a project — plus the
   credential-requiring items of §13 (the GCS bucket among them).
 
+- **Status, Phase 5 (2026-10-17).** Artefacts built; **no billable resource was created** — the
+  boundary spec §1/§13 draws was held, and every `gcloud` command exists to be *printed*.
+
+  Built: the hardened `Dockerfile` (§11.1, digest-pinned, non-root, `--no-cache-dir`, exec-form
+  `CMD`, and now carrying `migrations/` + `alembic.ini` so the migrator can run as a one-off job
+  from the image alone — without them `scripts/migrate.py` had no `alembic.ini` in the container);
+  `scripts/deploy.sh` (§12's print-first gate, `--yes-i-have-approval`, the `--project` rule, the
+  `SHOW max_connections` gate, the three jobs and the three schedules); `scripts/set_webhook.py`;
+  `scripts/audit_image.py`; `scripts/check_pool_budget.py`; `scripts/lib/redact.sh`;
+  `docs/despliegue.md` (deployment, webhook, migrations, operations, rollback, cost disposition).
+
+  | Criterion | Status | Evidence |
+  |---|---|---|
+  | (a) webhook operative, no `last_error_message` | **pending** | needs approval + real `TELEGRAM_BOT_TOKEN`/`TELEGRAM_WEBHOOK_SECRET` (both empty in `.env`); the closing commands are printed by step 15 |
+  | (b) two concurrent runs, one reminder | **demonstrated locally** | two `python -m app.jobs.dispatch_reminders` processes against the local PostgreSQL: reports `claimed: 0` and `claimed: 1`, and exactly **one** delivery in the transport record; repeatable as `test_two_concurrent_dispatchers_send_exactly_one_reminder`. The *deployed* variant (Cloud Run Job + Scheduler) is pending |
+  | (c) image and logs carry no secret | **demonstrated locally** | `docker build` + `scripts/audit_image.py --image telegram-assistant:phase5` → `AUDIT OK`; the audit's `--self-test` proves it detects a planted `.env`, service-account JSON, private-key material and a sentinel, and that it does **not** flag a CA bundle or a library quoting a PEM header; an image carrying a sentinel fails it (exit 1) |
+  | (d) `/readyz` green from Cloud Run, `/healthz` silent | **pending** | needs the deployment; both endpoints are covered by tests against the local database |
+  | (e) documented rollback | **documented, not executed** | `docs/despliegue.md` §8: `update-traffic` to the previous revision, the backup-restore path for a destructive migration, and `--i-have-a-backup` on `migrate.py downgrade` |
+
+  **Three defects found while building the artefacts, all fixed:**
+
+  1. **`app/jobs/process_documents.py` did not exist.** §11.1 makes four commands the authority and
+     §11.3 schedules this one every five minutes, so the `job-documents` Cloud Run Job would have
+     run a module that was not in the image. Phase 4 built the pipeline but not its job. Added,
+     with the same claim predicate as the inline path (`_CLAIMABLE_PREDICATE` — one authority) and
+     an integration test that drives it end to end.
+  2. **`.dockerignore` patterns only matched the context root.** Docker's matching is not
+     `.gitignore`'s: `*` does not cross a `/`. Measured on real builds — a bare `*.pem` kept
+     `./sub/private.pem` **inside the image**, and a bare `__pycache__/` let
+     `migrations/__pycache__` and `scripts/__pycache__` ship. Every security and residue pattern now
+     has a `**/` prefix, and `tests/unit/test_deploy_artifacts.py` asserts the depth-independent
+     spellings exist.
+  3. **The image audit itself was unusable at first, then too weak.** Its first run produced 174
+     findings (Mozilla's CA bundle, `certifi/cacert.pem`, and the *source* of `cryptography` and
+     `google-auth`, which necessarily contain PEM headers), and it flagged its own pattern list.
+     Fixed by detecting a key by its **material** (a PEM header followed by a real base64 body) and
+     a service-account file by `type` **and** `private_key`/`private_key_id`, and by exempting the
+     trust stores and the auditor's own file.
+
+  **Costs are not quoted.** §12 and spec §1.4 both forbid estimating from memory, and
+  `cloud.google.com/sql/pricing` returned no usable price data to the fetch made during this phase,
+  so every line of the cost table is **"pendiente de confirmar"** with the URL to confirm it from.
+  `docs/despliegue.md` §1 carries the table and one clearly-labelled *unverified* third-party
+  reference, marked as not usable for approval.
+
+  **Appendix B.5 is now resolved** (the socket DSN parses and reaches psycopg as `host=/cloudsql/…`,
+  asserted by a test). **B.6 is still open**: the minimum IAM role that can invoke a Cloud Run Job
+  and the exact `run.googleapis.com/v2 …/jobs:run` shape need `gcloud scheduler jobs create http
+  --help` against a live SDK, and `scripts/deploy.sh` prints `roles/run.invoker` with that caveat.
+
+- **Adversarial review of the Phase 5 artefacts, and its eight blockers (fixed 2026-10-17).** Each
+  fix has a test that fails without it, and each was proved by reverting (14 revert proofs, all red).
+  The first two would each have produced a deployed system that does not work:
+
+  | # | Finding | Fix | Guard |
+  |---|---|---|---|
+  | B1 | The service and all three jobs failed `Settings.problems()`: no `TELEGRAM_ALLOWED_USER_IDS`, no `DATABASE_SYNC_URL`, and the jobs never mounted `TELEGRAM_WEBHOOK_SECRET`. The revision would exit on `config_error` (every Telegram request a 502) and each scheduled run would exit 1 once a minute for ever | one `COMMON_ENV`/`common_secrets` authority for all four components, and `scripts/validate_deploy_env.py`, which runs **the application's own validation against the exact environment the script deploys** — as step 0, before anything is created | `test_the_deployed_environment_passes_the_application_own_validation` + its can-fail companion; the validator is hermetic (a process variable can no longer mask a missing one — that hole was found while testing it) |
+  | B2 | Step 8 demanded a `/cloudsql/…` socket DSN from the operator's machine, could never succeed there, and ran **after** Cloud SQL was created — leaving the dominant billable resource running | the pre-create gate is pure arithmetic against the tier's documented `max_connections`; the live measurement became a later, non-fatal step. Everything free (validation, image build, audit, arithmetic) now runs before the first `create` | `test_every_free_validation_runs_before_the_first_billable_create`, `test_the_pre_create_pool_gate_needs_no_database` |
+  | B3 | Step 14 ran `set_webhook.py --print` (a dry run) against a hard-coded `<URL-DEL-SERVICIO>`, so the webhook was never registered and step 17's `curl` tripped the error trap after a good deploy — acceptance **(a)** was unreachable | the URL is resolved from `gcloud run services describe`, and the step runs `--set` | `test_the_plan_registers_the_webhook_with_the_resolved_url` (+ companion) |
+  | B4 | **The plan was the source**: §11.4 omitted `roles/aiplatform.user`, so a user-created runtime SA would get 403 from Vertex on every embedding — ingestion *and* retrieval — surfacing as `EmbeddingUnavailable` | granted, and §11.4 corrected | `test_the_runtime_can_use_vertex_and_cannot_impersonate_itself`, `test_the_plan_agrees_with_the_script_about_the_roles` |
+  | B5 | The scheduler SA held `roles/iam.serviceAccountUser` on the runtime SA — `actAs` on the identity that can read every secret and the database — and nothing needs it | binding removed, §11.4 row deleted with the reasoning | same two tests (the role scan distinguishes *granted* from *mentioned*) |
+  | B6 | Not re-entrant, and in this project it aborted at step 2 because the repo, both SAs and the bucket already exist | every creation is `describe … \|\| create` (`run_ensure`), and `--from-step N` resumes — printing the whole plan while executing only from N | `test_a_second_run_creates_nothing_because_everything_exists`, `test_from_step_skips_both_the_printing_and_the_execution` |
+  | B7 | The documented rollback `set_webhook.py --delete` did not exist (`unrecognized arguments`, exit 2) | implemented, offline-tested by replacing the module's client | `test_delete_mode_deregisters_the_webhook` |
+  | B8 | `process_documents` starved behind permanently-stuck rows: `failed` is claimable for ever, `mark_document_failed` never bumped `attempts`, and the scan ordered by `created_at` — reproduced live with ten stuck rows and one new document | `ORDER BY attempts, created_at` + the `attempts` bump; `mark_document_failed` is now guarded on `processing`, and the `original_missing` branch claims before marking (it could otherwise flip a row a concurrent ingest had just set `ready`) | `test_the_job_reaches_a_new_document_sitting_behind_stuck_ones`, `test_marking_a_document_failed_cannot_clobber_a_ready_one` |
+
+  Also fixed from the same review: the redaction's literal guarantee (a value containing `[` survived
+  un-substituted, and a PEM body was left in clear — and the loop could hang); `.dockerignore`'s
+  remaining root-only patterns (`scripts/build/`, `dist/`, `venv/`, `htmlcov/`, `.coverage`, `id_rsa`
+  — a Docker-driven integration test now builds probe contexts and proves the guard can fail); the
+  image audit now walks `docker save` **layers** instead of a container's merged filesystem (a secret
+  `COPY`ed and later `rm`ed was invisible) and applies credential-shape rules to our own paths; the
+  `TAA_PROJECT` override is gone (one exported variable could retarget the whole deployment while
+  both project tests still passed); and the runbook's stale passages (project state, the delete list,
+  the SQL password file, the migrations step that makes `/readyz` green).
+
 ### Phase 6 — Hardening and final documentation (spec §16 Fase 6) — contract level
 
 - **Deliverables:** the full evaluation run; incident/runbook documentation in Spanish; the
@@ -2740,14 +2820,18 @@ readable and IAM bindings can be scoped by prefix.
   `PYTHONDONTWRITEBYTECODE=1`; exec-form `CMD` so uvicorn receives `SIGTERM` directly and can drain
   (relevant because a drain cut mid-turn is exactly the case the resume queue exists for).
 - `.dockerignore` excludes `.env`, `.git`, `tests/`, `*.md` (except what the app needs), caches and
-  local DB volumes.
+  local DB volumes — **with `**/` prefixes where a pattern has to match at any depth** (Phase 5; see
+  §10's status block: a bare `*.pem` was measured to keep `./sub/private.pem` inside the image).
 - **One image, four commands** (decision 18; **this line is the authority** for the count, per §15):
   `uvicorn app.main:app` for the service, and
   `python -m app.jobs.dispatch_reminders` / `-m app.jobs.process_documents` / `-m app.jobs.resume_work`
   for the three jobs. *Corrected in round 1 (N5); the circular cross-reference to §15 was removed in
   round 2 (RN3).*
-- No secret is baked in: no `.env`, no service-account JSON (spec §12/§13), and the Phase 1
-  acceptance includes a scan of the built image.
+- No secret is baked in: no `.env`, no service-account JSON (spec §12/§13). **Built in Phase 5:**
+  `scripts/audit_image.py` exports the image's union filesystem and scans every member — names,
+  private-key *material*, service-account bodies, and an optional sentinel — with `--self-test` to
+  prove the detector is not inert. It also ships `migrations/` and `alembic.ini`, without which
+  `scripts/migrate.py` (which resolves `alembic.ini` next to itself) could not run from the image.
 
 ### 11.2 Cloud Run Service (the webhook)
 
@@ -2811,6 +2895,13 @@ Consequences, all recorded rather than left implicit:
 resume queue exists, and dropping it would break decision 2's hand-off. Each job above states why it
 cannot be folded into another.*
 
+*Built in Phase 5.* `app/jobs/process_documents.py` did not exist before this phase — Phase 4 built
+the ingestion pipeline but not its job, so this table named a command the image would not have had.
+It scans for `pending`/`failed`/lease-expired documents and re-ingests each from its stored original
+through the *same* pipeline (so the content hash resolves to the same row), and it shares
+`_CLAIMABLE_PREDICATE` with `claim_document` so the sweep and the claim cannot disagree about what
+is reclaimable.
+
 - Each job is one-shot and idempotent: it scans the database, claims with `FOR UPDATE SKIP LOCKED`,
   does its work and exits. **No job depends on an in-process timer or a long-running loop**
   (spec §11, spec §17 "Los jobs no dependen de procesos en memoria").
@@ -2835,11 +2926,19 @@ cannot be folded into another.*
 | Principal | Role | Scope |
 |---|---|---|
 | Runtime SA (`taa-<env>-runtime`) | `roles/cloudsql.client` | Project (there is no narrower primitive for the socket) |
+| Runtime SA | **`roles/aiplatform.user`** | Project — **added 2026-10-17 (B4): the table omitted it and the omission was load-bearing.** The embeddings adapter authenticates as the runtime SA (`google.auth.default()`), and a user-created service account starts with no roles, so ingestion *and* retrieval would have received 403 from Vertex on every call, surfacing as `EmbeddingUnavailable` — a deployed system that cannot answer a single document question |
 | Runtime SA | `roles/storage.objectAdmin` — **prefer** a custom role limited to `storage.objects.{get,create,delete,list}` | Bound to the one bucket via an IAM condition on `resource.name.startsWith("projects/_/buckets/<bucket>/")` |
 | Runtime SA | `roles/secretmanager.secretAccessor` | Per-secret, not project-wide |
 | Scheduler SA | minimum role that can invoke a Cloud Run Job (verify: `roles/run.invoker` vs `roles/run.jobsExecutorWithOverrides` vs `roles/run.developer`) — Appendix B.6 | Per-job |
-| Scheduler SA | `roles/iam.serviceAccountUser` | On the job's runtime SA only |
 | Deploying identity | `roles/run.admin`, `roles/artifactregistry.writer`, `roles/iam.serviceAccountUser` | Human/deploy only, never the runtime SA |
+
+**The Scheduler SA's `roles/iam.serviceAccountUser` row was deleted (B5, 2026-10-17).** Nothing
+needs it: the jobs already run *as* the runtime SA, and Cloud Scheduler's requirement is that the
+caller **attaching** an account holds `actAs` on the *scheduler* SA — which the deploying operator
+has. `iam.serviceAccountUser` is `actAs` + get + list, so granting it to the scheduler principal
+would hand a second identity the ability to attach — and so indirectly use — the service account
+that can read all the secrets and the database. `scripts/deploy.sh` does not grant it, and
+`tests/unit/test_deploy_artifacts.py` fails if it reappears.
 
 Explicitly **not** granted: `roles/editor`, `roles/owner`, `roles/storage.admin` at project level,
 `roles/cloudsql.admin` to the runtime, or any secret-level `secretVersionManager` to the runtime
@@ -3421,7 +3520,15 @@ installed package, running a probe, or reading current docs — never by guessin
    documented route, but a helper may also exist).
 5. **The exact psycopg-3 / SQLAlchemy async DSN for the Cloud SQL Unix socket**
    (`?host=/cloudsql/...` vs a different spelling) and whether `psycopg[binary]` + SQLAlchemy's
-   async adapter accept it unchanged. Verify locally against a socket first, then on Cloud Run.
+   async adapter accept it unchanged. **RESOLVED in Phase 5, for the half that is checkable
+   locally:** the spelling
+   `postgresql+psycopg://user:pass@/dbname?host=/cloudsql/PROJECT:REGION:INSTANCE` parses with
+   `url.host is None` and reaches psycopg's connect arguments as
+   `host='/cloudsql/PROJECT:REGION:INSTANCE'`, `dbname` and `user` as expected — asserted by
+   `tests/unit/test_deploy_artifacts.py::test_the_cloud_sql_socket_dsn_reaches_psycopg_as_a_host`,
+   with a companion proving a DSN without `?host=` loses the socket path entirely. **Still
+   unverified:** a real connection through the Auth Proxy socket, which needs Cloud Run (a Windows
+   development machine has no such socket).
 6. **The minimum IAM role and the exact Scheduler→Cloud Run Jobs invocation shape**
    (`roles/run.invoker` vs `jobsExecutorWithOverrides` vs `developer`; the `run.googleapis.com/v2`
    `jobs:run` URI). Read from `gcloud scheduler jobs create http --help` and the current docs.

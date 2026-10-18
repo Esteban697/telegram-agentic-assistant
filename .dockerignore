@@ -1,14 +1,54 @@
+# `.dockerignore` — what must never enter the build context (PLAN.md §11.1, §9.5).
+#
+# **Depth matters, and the first two versions of this file got it wrong.** Docker's matching is
+# *not* `.gitignore`'s: a pattern is matched against the path relative to the context root, and `*`
+# does not cross a `/`. Measured on real builds:
+#
+#   * a bare `*.pem` excluded `./private.pem` and kept `./sub/private.pem` — a private key inside
+#     the image;
+#   * a bare `__pycache__/` let `migrations/__pycache__` and `scripts/__pycache__` ship;
+#   * a bare `build/`, `dist/`, `venv/`, `htmlcov/` and `.coverage` did the same for
+#     `scripts/build/…`, `scripts/dist/…`, `scripts/venv/…`, `scripts/htmlcov/…` and
+#     `scripts/.coverage`;
+#   * `id_rsa` had **no pattern at all**, although `scripts/audit_image.py` treats it as forbidden
+#     by name — the two disagreed.
+#
+# Every pattern that has to match at any depth therefore carries a `**/` prefix. The root-level
+# spellings are kept as well where they existed, because they cost nothing and make the intent
+# obvious. `tests/integration/test_dockerignore.py` builds probe contexts and checks the result
+# **with Docker itself**, and it builds a stripped variant to prove the check can fail.
+
 .git
 .gitignore
+
+# --- Secrets and keys: the reason this file exists ---------------------------- #
 .env
 .env.*
+**/.env
+**/.env.*
 !.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+service-account*.json
+id_rsa
+id_rsa*
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+**/service-account*.json
+**/id_rsa
+**/id_rsa*
 
-# Test and tooling artefacts are not part of the runtime image.
-# `scripts/` is deliberately NOT excluded: the Ollama compatibility probe ships in the image
-# so an operator can run it against a real key without rebuilding.
+# --- Test and tooling artefacts ------------------------------------------------ #
+# `scripts/` is deliberately NOT excluded: the migrator, the webhook registrar and the Ollama
+# compatibility probe ship in the image, so an operator can run them without a checkout.
 tests/
+**/tests/
 docs/
+**/docs/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -16,22 +56,31 @@ docs/
 .coverage.*
 htmlcov/
 coverage.xml
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.coverage
+**/.coverage.*
+**/htmlcov/
+**/coverage.xml
 
+# --- Build residue -------------------------------------------------------------- #
 __pycache__/
+**/__pycache__/
 *.py[cod]
+**/*.py[cod]
 *.egg-info/
+**/*.egg-info/
 build/
 dist/
 .venv/
 venv/
+**/build/
+**/dist/
+**/.venv/
+**/venv/
 
-# Never ship secrets or keys.
-*.pem
-*.key
-*.p12
-*.pfx
-service-account*.json
-
+# --- Planning documents (not part of the runtime image) ------------------------- #
 PLAN.md
 PLAN-REVIEW-LOG.md
 PROJECT_SPEC.md

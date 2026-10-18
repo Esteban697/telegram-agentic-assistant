@@ -253,15 +253,53 @@ Telegram precisamente para evitarlo.
 ## Docker
 
 ```bash
-docker build -t telegram-assistant:phase1 .
+docker build --no-cache -t telegram-assistant:phase5 .
 
 # El contenedor arranca sin secretos y responde a /healthz
-docker run --rm -p 8080:8080 telegram-assistant:phase1
+docker run --rm -p 8080:8080 telegram-assistant:phase5
 curl http://127.0.0.1:8080/healthz
+
+# Auditoría de la imagen: no debe contener secretos (Fase 5, criterio (c))
+python scripts/audit_image.py --image telegram-assistant:phase5   # => AUDIT OK
+python scripts/audit_image.py --self-test                        # prueba que el detector no es inerte
 ```
 
-La imagen se construye en dos etapas, corre como usuario sin privilegios (uid 10001) y no
-incluye `.env`, claves ni ficheros de servicio.
+Un solo binario, **cuatro comandos** (decisión 18 del plan): `uvicorn app.main:app` para el
+servicio, y `python -m app.jobs.dispatch_reminders`, `-m app.jobs.process_documents` y
+`-m app.jobs.resume_work` para los tres jobs programados.
+
+La imagen se construye en dos etapas, corre como usuario sin privilegios (uid 10001), lleva la base
+fijada **por digest** (`python:3.13-slim@sha256:70729b46…`), instala con `--no-cache-dir`, no
+incluye `.env`, claves ni ficheros de servicio, y su `CMD` es exec-form para que uvicorn reciba
+`SIGTERM` y pueda drenar.
+
+## Despliegue en Google Cloud (Fase 5)
+
+El runbook completo está en **[`docs/despliegue.md`](docs/despliegue.md)**: recursos, coste, secretos,
+migraciones, operación, reversión y el estado de cada criterio de aceptación.
+
+```bash
+bash scripts/deploy.sh                          # IMPRIME todos los comandos gcloud; no ejecuta nada
+bash scripts/deploy.sh --yes-i-have-approval    # ejecuta, tras aprobar el coste
+```
+
+Dos reglas que no son convenciones, sino tests:
+
+- **Todos los comandos llevan `--project telegram-assistant-esteban`.** En esta máquina el proyecto
+  por defecto de `gcloud` es **otro** (`presupuesto-esteban`), así que un flag olvidado crearía
+  recursos facturables en el sitio equivocado. Lo comprueba `tests/unit/test_deploy_artifacts.py`
+  recorriendo el script.
+- **Ningún valor secreto se imprime nunca**, ni en el camino de éxito ni en el de error: los valores
+  los lee `gcloud` de un fichero (`--data-file=`) o el terminal (`--prompt-for-password`), y
+  `scripts/lib/redact.sh` sustituye por `<redacted>` cualquier valor conocido o con forma de
+  credencial. Hay una prueba con un centinela, y otra que demuestra que la prueba puede fallar.
+
+**Estado**: las APIs están habilitadas y ya existen (creados a mano, con aprobación) el repositorio
+de imágenes, las dos cuentas de servicio, el bucket y la imagen publicada. **No** hay todavía
+instancia de Cloud SQL, servicio, jobs ni schedules: los criterios (a), (d) y (e) siguen pendientes
+de las credenciales del usuario — `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET` y
+`TAA_ALLOWED_USER_IDS`, que sin él no despliega nada (la aplicación no arranca sin lista de
+autorizados). (b) y (c) están demostrados en local — ver `docs/despliegue.md` §10.
 
 ## Limitaciones conocidas de la Fase 1
 
@@ -321,9 +359,16 @@ app/
   llm/                  puertos (protocolos) y cliente de Ollama
   storage/              modelos, migraciones de datos, repositorios, checkpointer y almacenes
   services/             conversación, recordatorios y entrega de mensajes
-  tools/                memoria y recordatorios: esquemas de argumentos y resultados tipados
-  jobs/                 despacho de recordatorios (una sola ejecución, sin bucles)
+  tools/                memoria, recordatorios y documentos: esquemas y resultados tipados
+  jobs/                 tres jobs de una sola ejecución, sin bucles: recordatorios,
+                        ingestas pendientes y reanudación de turnos
 migrations/             revisiones de Alembic (0001..0006)
-scripts/verify_ollama.py
-tests/unit/  tests/integration/
+docs/despliegue.md      runbook del despliegue, operación y reversión
+scripts/
+  deploy.sh             imprime (y solo con aprobación ejecuta) el despliegue completo
+  set_webhook.py        registra el webhook sin imprimir nunca el token
+  audit_image.py        audita la imagen en busca de secretos
+  check_pool_budget.py  puerta del aritmético de conexiones (§11.2)
+  migrate.py, bootstrap_db.py, verify_ollama.py, run_local_db.sh
+tests/unit/  tests/integration/  tests/evals/  tests/live/
 ```

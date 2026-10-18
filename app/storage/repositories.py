@@ -825,15 +825,42 @@ _GET_DOCUMENT = (
     _SELECT_DOCUMENT
     + "WHERE id = :id AND user_id = :user_id AND deleted_at IS NULL"
 )
+# **One authority for "this document has no live owner"** (PLAN.md §5.4). The claim predicate and
+# the ingestion job's scan are both built from this text, so they cannot drift into disagreeing
+# about what is reclaimable — the failure that produces would be a job that keeps picking up work
+# another worker is still doing.
+_CLAIMABLE_PREDICATE = (
+    "(ingest_status IN ('pending', 'failed') "
+    "OR (ingest_status = 'processing' AND claimed_at < now() - interval '15 minutes'))"
+)
+
 _CLAIM_DOCUMENT_RETURNING = (
     "UPDATE documents SET ingest_status = 'processing', claimed_at = now(), "
     "claimed_by = :executor, attempts = attempts + 1, updated_at = now() "
-    "WHERE id = :id AND (ingest_status IN ('pending', 'failed') "
-    "OR (ingest_status = 'processing' "
-    "AND claimed_at < now() - interval '15 minutes')) "
-    "RETURNING id, user_id, original_filename, sanitized_filename, mime_type, size_bytes, "
+    "WHERE id = :id AND "
+    + _CLAIMABLE_PREDICATE
+    + " RETURNING id, user_id, original_filename, sanitized_filename, mime_type, size_bytes, "
     "content_sha256, ingest_status, pipeline_version, chunk_count, gcs_uri, page_count, "
     "delete_state"
+)
+
+# What `app/jobs/process_documents.py` scans. Two deliberate clauses:
+#
+# * `deleted_at IS NULL` — a document the user asked to delete must never be re-ingested by a
+#   background sweep;
+# * **`ORDER BY attempts, created_at`** — not by age alone. `failed` is claimable for ever, so a
+#   document that can never succeed (its stored original is gone, say) would sit at the head of an
+#   age-ordered queue and starve every newer one: measured with ten stuck rows and one new
+#   `pending` document, two consecutive runs claimed the same ten rows and never reached the new
+#   one, while the scheduler runs this job every five minutes. Ordering by `attempts` first means
+#   a never-attempted document always outranks a stuck one, and the stuck ones rotate to the back
+#   as their count grows.
+_CLAIMABLE_DOCUMENTS = (
+    _SELECT_DOCUMENT
+    + "WHERE deleted_at IS NULL AND "
+    + _CLAIMABLE_PREDICATE
+    + " ORDER BY attempts, created_at "
+    + "LIMIT :limit"
 )
 _LIST_READY_DOCUMENTS = (
     _SELECT_DOCUMENT
@@ -947,15 +974,46 @@ async def claim_document(
     return None if row is None else _as_document(row)
 
 
+async def list_claimable_documents(
+    session: AsyncSession, *, limit: int
+) -> list[DocumentRows]:
+    """Documents a background worker should pick up: `pending`, `failed`, or lease-expired.
+
+    The scan and the claim share one predicate (`_CLAIMABLE_PREDICATE`), so this is a *hint*, not a
+    reservation: two workers may see the same row, and `claim_document` decides which one owns it.
+    """
+
+    rows = (
+        await session.execute(sa.text(_CLAIMABLE_DOCUMENTS).bindparams(limit=limit))
+    ).all()
+    return [_as_document(row) for row in rows]
+
+
 async def mark_document_failed(
     session: AsyncSession, *, document_id: UUID, error: str
-) -> None:
-    await session.execute(
+) -> bool:
+    """Record a failed ingest. **Guarded on `processing`**, and it bumps `attempts`.
+
+    Two reasons, both found by review:
+
+    * the guard: without it, a job that decided a document was un-ingestable could flip a row that
+      a concurrent webhook ingest had just set `ready` back to `failed`. The caller must hold the
+      claim (`claim_document` sets `processing`) for this to apply;
+    * the bump: `attempts` is the ageing signal `_CLAIMABLE_DOCUMENTS` orders by. `claim_document`
+      increments it on the way in, but the paths that fail *without* a claim never would, so the
+      count would stay 0 for exactly the rows that most need to rotate to the back.
+
+    Returns True when a row was updated.
+    """
+
+    result = await session.execute(
         sa.text(
             "UPDATE documents SET ingest_status = 'failed', ingest_error = :error, "
-            "updated_at = now() WHERE id = :id"
+            "attempts = attempts + 1, claimed_at = NULL, claimed_by = NULL, "
+            "updated_at = now() WHERE id = :id AND ingest_status = 'processing'"
         ).bindparams(id=document_id, error=error[:500])
     )
+    return bool(result.rowcount)
 
 
 async def mark_document_ready(
@@ -1755,6 +1813,7 @@ __all__ = [
     "find_document_by_hash",
     "get_document",
     "insert_chunks",
+    "list_claimable_documents",
     "list_ready_documents",
     "mark_document_deleted",
     "mark_document_failed",
