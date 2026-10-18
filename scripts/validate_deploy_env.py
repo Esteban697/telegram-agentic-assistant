@@ -37,14 +37,20 @@ DEPLOY = REPO_ROOT / "scripts" / "deploy.sh"
 # Placeholder values for the mounted secrets. They must be *plausible* — the point is to exercise
 # the application's own validators, so a placeholder that would itself be rejected (an invalid
 # webhook secret, say) would produce a false alarm rather than a finding.
+#
+# They must also not be *shaped* like the real thing: this file ships inside the image, and the
+# deploy's image audit scans it for credential shapes. A token-shaped placeholder is a true
+# positive by shape and stopped the first deploy, so this one is deliberately a plain word —
+# `TELEGRAM_BOT_TOKEN` is validated only for emptiness, never for shape.
 PLACEHOLDER_VALUES: dict[str, str] = {
-    "TELEGRAM_BOT_TOKEN": "000000000:AAFplaceholder000000000000000000000000",
+    "TELEGRAM_BOT_TOKEN": "placeholder-bot-token",
     "TELEGRAM_WEBHOOK_SECRET": "placeholder-webhook-secret",
     "OLLAMA_API_KEY": "placeholder-ollama-key",
-    # The socket DSN §11.2 deploys; only the shape matters to validation.
+    # The shape the deploy actually ships: Supabase's pooler over TCP with TLS, not a Cloud SQL
+    # socket. Only the shape matters to validation, but it must be the deployed shape.
     "DATABASE_URL": (
-        "postgresql+psycopg://taa:placeholder@/taa"
-        "?host=/cloudsql/telegram-assistant-esteban:europe-west1:taa-prod-pg"
+        "postgresql+psycopg://taa_app.placeholder:placeholder"
+        "@aws-0-eu-west-1.pooler.supabase.com:5432/postgres?sslmode=require"
     ),
 }
 PLACEHOLDER_VALUES["DATABASE_SYNC_URL"] = PLACEHOLDER_VALUES["DATABASE_URL"]

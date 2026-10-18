@@ -2167,6 +2167,12 @@ exercises `/healthz` and `/readyz` together from the first phase. Both
 return a small fixed JSON body and **no** version strings, DSNs, bucket names, counts, or internal
 hostnames (spec §13 "endpoints de salud que no revelen secretos ni información interna").
 
+**`/healthz` is local-only — found by running the deploy.** Cloud Run's Google Frontend intercepts
+paths ending in `z` (Cloud Run known issues; Google's issue tracker 544098208), so on Cloud Run
+`/healthz` answers with the frontend's own HTML 404 and **never reaches the container**, while it
+works locally and in the image. The deployable liveness path is therefore **`/health`**; both are
+served, and the deploy's post-check curls `/health` and `/readyz`.
+
 Basic alerting (Phase 5, documented in Spanish): a Cloud Logging-based alert on an error-rate
 threshold, and one on the dispatcher job failing twice in a row (spec §13 "alertas básicas para
 errores persistentes"). Alert policy creation is a billable-ish/observability resource and is

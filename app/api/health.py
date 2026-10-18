@@ -52,6 +52,17 @@ async def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
+# **Cloud Run's Google Frontend intercepts paths ending in `z`** (Cloud Run known issues: avoid all
+# such paths). `/healthz` therefore never reaches the container on Cloud Run — the frontend answers
+# with its own HTML 404 — while it works locally and in the image. `/health` is the deployable
+# liveness path; the `healthz` spelling is kept for local use and for everything already documented.
+@router.get("/health")
+async def health() -> dict[str, str]:
+    """Liveness for Cloud Run, where paths ending in `z` are reserved by the frontend."""
+
+    return {"status": "ok"}
+
+
 @router.get("/readyz")
 async def readyz(request: Request) -> JSONResponse:
     """Readiness: settings validated, and every dependency this configuration needs."""

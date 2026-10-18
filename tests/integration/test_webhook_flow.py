@@ -555,10 +555,15 @@ def test_rate_limit_answers_200_makes_no_model_call_and_notifies_once() -> None:
 def test_health_and_readiness() -> None:
     with Harness() as harness:
         health = harness._client.get("/healthz")
+        deployable = harness._client.get("/health")
         ready = harness._client.get("/readyz")
 
     assert health.status_code == 200
     assert health.json() == {"status": "ok"}
+    # Cloud Run's frontend intercepts paths ending in `z`, so `/health` is the deployable liveness
+    # path. Both must answer, or the deploy's post-check and the local README would disagree.
+    assert deployable.status_code == 200
+    assert deployable.json() == {"status": "ok"}
     assert ready.status_code == 200
     assert ready.json() == {"status": "ready"}
 

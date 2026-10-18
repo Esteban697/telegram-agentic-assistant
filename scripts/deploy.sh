@@ -679,14 +679,8 @@ for secret in "$SECRET_BOT_TOKEN" "$SECRET_WEBHOOK" "$SECRET_OLLAMA" "$SECRET_DA
       --role="roles/secretmanager.secretAccessor" \
       --project "$PROJECT"
 done
-for job in "$JOB_REMINDERS" "$JOB_DOCUMENTS" "$JOB_RESUME"; do
-  run "scheduler: invocar el job ${job}" "gratis" \
-    gcloud run jobs add-iam-policy-binding "$job" \
-      --member="serviceAccount:${SCHEDULER_SA_EMAIL}" \
-      --role="roles/run.invoker" \
-      --region="$REGION" \
-      --project "$PROJECT"
-done
+# The scheduler's `run.invoker` bindings live in step 10, beside the jobs they name: a binding on a
+# job that does not exist yet fails with NOT_FOUND — which is exactly what the first live deploy hit.
 
 # ============================================================================================ #
 step 9 "Cloud Run Service (el webhook)" \
@@ -749,6 +743,16 @@ for job in "$JOB_REMINDERS" "$JOB_DOCUMENTS" "$JOB_RESUME"; do
       --service-account="$RUNTIME_SA_EMAIL" \
       --set-env-vars="$(common_env_payload)" \
       --set-secrets="$(common_secrets_payload)" \
+      --project "$PROJECT"
+done
+# `run.invoker` must come **after** the job exists — binding it earlier fails with NOT_FOUND.
+# `add-iam-policy-binding` is idempotent, so a re-run is harmless.
+for job in "$JOB_REMINDERS" "$JOB_DOCUMENTS" "$JOB_RESUME"; do
+  run "scheduler: invocar el job ${job}" "gratis" \
+    gcloud run jobs add-iam-policy-binding "$job" \
+      --member="serviceAccount:${SCHEDULER_SA_EMAIL}" \
+      --role="roles/run.invoker" \
+      --region="$REGION" \
       --project "$PROJECT"
 done
 
@@ -853,6 +857,8 @@ run "estado del webhook (sin last_error_message)" "gratis" \
   "$PYTHON" "${REPO_ROOT}/scripts/set_webhook.py" \
     --info \
     --token-file="${SECRETS_DIR}/telegram-bot-token"
+run "liveness del servicio (/health: el frontend de Cloud Run intercepta las rutas que acaban en z)" "gratis" \
+  curl -fsS "${SERVICE_URL}/health"
 run "readiness del servicio" "gratis" \
   curl -fsS "${SERVICE_URL}/readyz"
 note "y una prueba manual: enviar /start desde la cuenta autorizada."

@@ -334,7 +334,11 @@ gcloud run services describe taa-prod-api \
 
 ## 7. Operación
 
-- **Salud.** `GET /healthz` (liveness) y `GET /readyz` (readiness). `/readyz` comprueba la base de
+- **Salud.** En Cloud Run: `GET /health` (liveness) y `GET /readyz` (readiness).
+  **No uses `GET /healthz` en Cloud Run**: Google Frontend intercepta las rutas que terminan en `z`
+  (known issues de Cloud Run y el issue tracker 544098208), así que la petición nunca llega al
+  contenedor y responde un 404 HTML de Google. Localmente `/healthz` sí funciona, y se conserva.
+  `/readyz` comprueba la base de
   datos, la extensión `vector` ≥ 0,8 y que exista **una** fila activa en `embedding_models`; no
   revela DSN, nombre de bucket ni versiones. Si está en 503, Telegram no debe entregar.
 - **Logs.** JSON estructurado, sin contenido de mensajes, documentos, embeddings ni secretos
