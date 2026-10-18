@@ -244,49 +244,59 @@ async def test_the_job_scan_and_the_claim_predicate_agree(job_harness) -> None:
 # --------------------------------------------------------------------------- #
 # §11.2 / §9.2: the pool budget, tested rather than asserted
 # --------------------------------------------------------------------------- #
-def test_the_pool_arithmetic_fits_the_configured_tier() -> None:
-    """`(DB_POOL_SIZE + CHECKPOINTER_POOL_SIZE) x processes + reserve <= TEST_DB_MAX_CONNECTIONS`.
+def test_the_pool_arithmetic_fits_the_supavisor_ceiling() -> None:
+    """`(DB_POOL_SIZE + CHECKPOINTER_POOL_SIZE) x procesos + reserva <= 14`.
 
-    `TEST_DB_MAX_CONNECTIONS` is set **explicitly** to the §12 tier's default (50 for the ~1.7 GB
-    shared-core tier, 100 for the recommended 1 vCPU / 3.75 GB one) and never read from the local
-    container: the local image defaults to 100, so reading it would make this pass whatever the
-    real instance allows.
+    The binding limit against Supabase is **Supavisor's session-mode ceiling of 14**, measured, not
+    the server's `max_connections` (60). It is a hard stop: the 15th connection fails instantly with
+    `EMAXCONNSESSION`, so this is arithmetic that must fit, not a pool that can queue.
     """
 
-    from scripts.check_pool_budget import required_connections, verdict
-
-    settings = make_db_settings()
-    required = required_connections(
-        db_pool=settings.db_pool_size,
-        checkpointer_pool=settings.checkpointer_pool_size,
-        concurrent_processes=6,
+    from scripts.check_pool_budget import (
+        DEFAULT_CONCURRENT_PROCESSES,
+        DEFAULT_POOLER_MAX_CONNECTIONS,
+        DEFAULT_RESERVE,
+        required_connections,
+        verdict,
     )
 
-    assert required == 42, (
-        "7 x 6 = 42 is the number §11.2 derives the tier from; if this changes, the tier changes"
+    # What the deploy actually ships: 2 + 1 pools across the service and the three jobs.
+    deployed = required_connections(
+        db_pool=2,
+        checkpointer_pool=1,
+        concurrent_processes=DEFAULT_CONCURRENT_PROCESSES,
     )
-
-    tier_default = int(os.environ.get("TEST_DB_MAX_CONNECTIONS", "50"))
-    ok, message = verdict(required=required, reserve=5, max_connections=tier_default)
+    assert deployed == 12
+    ok, message = verdict(
+        required=deployed,
+        reserve=DEFAULT_RESERVE,
+        pooler_limit=DEFAULT_POOLER_MAX_CONNECTIONS,
+    )
     assert ok, message
 
-    # The negative side: the smallest tier really is too small, and the message says what to do.
-    ok_small, message_small = verdict(required=required, reserve=5, max_connections=25)
-    assert not ok_small
-    assert "subir el tier" in message_small and "bajar los pools" in message_small
-
-
-def test_the_budget_gate_reads_max_connections_from_the_server() -> None:
-    """The gate is only a gate if it measures. Measured against the real local PostgreSQL."""
-
-    from scripts.check_pool_budget import measure_max_connections
-
-    measured = measure_max_connections(TEST_DATABASE_URL)
-
-    assert measured >= 50, (
-        f"the local server reports max_connections={measured}: the gate would refuse a deploy "
-        "that the real tier allows"
+    # The Cloud SQL-era tuple really is too large, and the refusal names the failure it would cause.
+    cloud_sql_era = required_connections(db_pool=4, checkpointer_pool=3, concurrent_processes=6)
+    assert cloud_sql_era == 42
+    ok_big, message_big = verdict(
+        required=cloud_sql_era, reserve=5, pooler_limit=DEFAULT_POOLER_MAX_CONNECTIONS
     )
+    assert not ok_big
+    assert "EMAXCONNSESSION" in message_big
+
+
+def test_the_gate_is_arithmetic_and_never_measures_the_server() -> None:
+    """The Cloud SQL-era gate measured `SHOW max_connections`. Under Supavisor that is the wrong
+    number: the binding limit is the pooler's session-mode ceiling, which is *declared* — a property
+    of the provider's plan — not measured. A reintroduced measurement path would silently describe
+    the server (60) instead of the pooler (14), and pass a deploy that cannot start.
+    """
+
+    import scripts.check_pool_budget as gate
+
+    assert not hasattr(gate, "measure_max_connections"), (
+        "the gate must not measure the server: the binding limit belongs to the pooler"
+    )
+    assert gate.DEFAULT_POOLER_MAX_CONNECTIONS == 14
 
 
 # --------------------------------------------------------------------------- #

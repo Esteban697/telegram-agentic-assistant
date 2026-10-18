@@ -1,86 +1,104 @@
-"""Connection-budget gate for the deploy — PLAN.md §11.2, §9.2, Appendix A.11.
+"""Connection-budget gate for the deploy — PLAN.md §11.2, §9.2; Supabase decision (2026-10-18).
 
-    python scripts/check_pool_budget.py --database-sync-url-file ~/.taa/secrets/database-url
-    python scripts/check_pool_budget.py --max-connections 50      # arithmetic only, no connection
+    python scripts/check_pool_budget.py --use-app-defaults                     # los pools desplegados
+    python scripts/check_pool_budget.py --db-pool-size 2 --checkpointer-pool-size 1
+    TAA_POOLER_MAX_CONNECTIONS=14 python scripts/check_pool_budget.py
 
-**Why this is a script and not a comment.** §11.2 derives the Cloud SQL tier from an inequality:
+**The binding limit is the pooler's, not the server's.** The database is Supabase behind
+Supavisor in **session mode on port 5432**, and that mode allows **14 client connections** —
+measured: 1–14 succeed, the 15th fails immediately with `EMAXCONNSESSION`, which is a hard failure
+and not a wait. The server-side `max_connections` is 60 and is irrelevant here; sizing against it
+would oversubscribe the pooler by four times.
 
-    (DB_POOL_SIZE + CHECKPOINTER_POOL_SIZE) x concurrent_processes  <=  max_connections - 5
+The inequality this script enforces:
 
-with 7 x 6 = 42 connections required and a 5-connection reserve, so the smallest tier that fits is
-the one whose default `max_connections` is 50. Oversubscribing a connection pool is not a slowdown,
-it is an outage: the last processes to start get "too many clients already" and their work fails.
-So the deploy **measures** `SHOW max_connections` on the real instance and refuses if the
-inequality does not hold, printing the two remedies rather than a stack trace.
+    (DB_POOL_SIZE + CHECKPOINTER_POOL_SIZE) x concurrent_processes + reserve <= pooler_limit
 
-`--database-sync-url-file` exists so the DSN — which contains the database password — is read from
-a file instead of an argument, keeping it out of the shell history and out of `ps`. The same rule
-as `scripts/deploy.sh`.
+With `--max-instances=1` (mandatory now, not a cost choice) the concurrent processes are the
+service plus the three jobs when they overlap, i.e. **4**. The deployed values are
+`DB_POOL_SIZE=2`, `CHECKPOINTER_POOL_SIZE=1`, reserve 2: (2 + 1) x 4 + 2 = **14 <= 14** — it fits
+exactly, with the two spare connections the reserve is for.
 
-Exit codes: 0 = fits, 1 = does not fit, 2 = could not measure.
+`--use-app-defaults` is what the deploy uses: it reads the **class defaults**, not this machine's
+`.env`, because the containers are given the pool sizes explicitly and the arithmetic has to
+describe the deployment rather than the operator's laptop.
+
+Exit codes: 0 = fits, 1 = does not fit (and the deploy refuses), 2 = bad input.
 """
 
 from __future__ import annotations
 
 import argparse
-import pathlib
 import sys
+from pathlib import Path
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.config import Settings  # noqa: E402
-from app.storage.postgres import build_sync_engine  # noqa: E402
+
+# The Supavisor session-mode ceiling, measured. It is a declared input on purpose: it is a property
+# of the provider's plan, not of the server, and it must be visible where the arithmetic is made.
+DEFAULT_POOLER_MAX_CONNECTIONS = 14
+# The service plus the three jobs, which can overlap: with `--max-instances=1` this is the real
+# worst case.
+DEFAULT_CONCURRENT_PROCESSES = 4
+DEFAULT_RESERVE = 2
 
 
 def required_connections(
     *, db_pool: int, checkpointer_pool: int, concurrent_processes: int
 ) -> int:
-    """The arithmetic of §11.2, as a function so it can be asserted rather than restated."""
+    """The first half of the inequality, as a function so it can be asserted not restated."""
 
     return (db_pool + checkpointer_pool) * concurrent_processes
 
 
-def verdict(*, required: int, reserve: int, max_connections: int) -> tuple[bool, str]:
-    """The inequality, and a message that names the arithmetic and both remedies."""
+def verdict(
+    *,
+    required: int,
+    reserve: int,
+    pooler_limit: int,
+    concurrent_processes: int = DEFAULT_CONCURRENT_PROCESSES,
+) -> tuple[bool, str]:
+    """The inequality, and a message that names the arithmetic and the remedies."""
 
     budget = required + reserve
-    if budget <= max_connections:
+    if budget <= pooler_limit:
         return True, (
-            f"fits: {required} conexiones requeridas + {reserve} de reserva = {budget} "
-            f"<= max_connections {max_connections}"
+            f"cabe: {required} conexiones requeridas + {reserve} de reserva = {budget} "
+            f"<= límite del pooler {pooler_limit}"
         )
+    per_process = (pooler_limit - reserve) // max(1, concurrent_processes)
     return False, (
         f"NO cabe: {required} requeridas + {reserve} de reserva = {budget} > "
-        f"max_connections {max_connections}.\n"
-        "  Dos salidas:\n"
-        "   1. subir el tier de Cloud SQL (más memoria, más max_connections); o\n"
-        "   2. bajar los pools: DB_POOL_SIZE y CHECKPOINTER_POOL_SIZE, con el sacrificio de\n"
-        "      rendimiento que eso supone (con max_connections=25 hacen falta 2 y 2).\n"
-        "  Sobresuscribir el pool no es una lentitud: los últimos procesos en arrancar reciben\n"
-        "  'too many clients already' y su trabajo falla."
+        f"límite del pooler {pooler_limit} (Supavisor, modo sesión).\n"
+        f"  El pooler no espera: la conexión número {pooler_limit + 1} falla al instante con "
+        "EMAXCONNSESSION.\n"
+        "  Salidas:\n"
+        "    1. bajar los pools: con "
+        f"{concurrent_processes} procesos y {reserve} de reserva, DB_POOL_SIZE + "
+        f"CHECKPOINTER_POOL_SIZE no puede pasar de {per_process}; o\n"
+        "    2. bajar los procesos concurrentes — pero `--max-instances=1` es obligatorio y los "
+        "tres\n       jobs pueden solaparse con el servicio, así que la palanca práctica es la 1.\n"
+        "  Sobresuscribir el pooler no es una lentitud: es un fallo inmediato en el arranque."
     )
 
 
-def measure_max_connections(database_sync_url: str) -> int:
-    """`SHOW max_connections` on the real instance (there is no offline equivalent)."""
-
-    import sqlalchemy as sa
-
-    engine = build_sync_engine(Settings(database_sync_url=database_sync_url))
-    try:
-        with engine.connect() as connection:
-            return int(connection.execute(sa.text("SHOW max_connections")).scalar_one())
-    finally:
-        engine.dispose()
-
-
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Puerta del aritmético de conexiones (§11.2).")
-    parser.add_argument("--database-sync-url-file", default="", help="fichero con la DSN")
-    parser.add_argument("--database-sync-url", default="", help="DSN (evítalo: queda en el historial)")
-    parser.add_argument("--max-connections", type=int, default=0, help="valor medido, si ya lo tienes")
-    parser.add_argument("--concurrent-processes", type=int, default=6)
-    parser.add_argument("--reserve", type=int, default=5)
+    parser = argparse.ArgumentParser(description="Puerta del aritmético de conexiones (Supabase).")
+    parser.add_argument(
+        "--pooler-max-connections",
+        type=int,
+        default=0,
+        help=(
+            "límite del pooler en modo sesión; por defecto TAA_POOLER_MAX_CONNECTIONS "
+            f"({DEFAULT_POOLER_MAX_CONNECTIONS})"
+        ),
+    )
+    parser.add_argument(
+        "--concurrent-processes", type=int, default=DEFAULT_CONCURRENT_PROCESSES
+    )
+    parser.add_argument("--reserve", type=int, default=DEFAULT_RESERVE)
     parser.add_argument("--db-pool-size", type=int, default=0)
     parser.add_argument("--checkpointer-pool-size", type=int, default=0)
     parser.add_argument(
@@ -88,57 +106,49 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help=(
             "usa los valores por defecto de la clase Settings, no los del .env de esta máquina: "
-            "el despliegue no fija DB_POOL_SIZE ni CHECKPOINTER_POOL_SIZE en el entorno del "
-            "contenedor, así que el contenedor usa los defectos — y el aritmético debe describir "
-            "el despliegue, no la máquina del operador"
+            "los contenedores reciben DB_POOL_SIZE y CHECKPOINTER_POOL_SIZE explícitos, y el "
+            "aritmético debe describir el despliegue, no la máquina del operador"
         ),
     )
     args = parser.parse_args(argv)
 
+    import os
+
     if args.use_app_defaults:
-        # `Settings()` reads `.env`; the deployment's containers do not get these variables at all.
-        defaults = Settings.model_fields
-        db_pool = defaults["db_pool_size"].default
-        checkpointer_pool = defaults["checkpointer_pool_size"].default
+        fields = Settings.model_fields
+        db_pool = fields["db_pool_size"].default
+        checkpointer_pool = fields["checkpointer_pool_size"].default
     else:
         settings = Settings()
         db_pool = settings.db_pool_size
         checkpointer_pool = settings.checkpointer_pool_size
     db_pool = args.db_pool_size or db_pool
     checkpointer_pool = args.checkpointer_pool_size or checkpointer_pool
+
+    pooler_limit = args.pooler_max_connections or int(
+        os.environ.get("TAA_POOLER_MAX_CONNECTIONS", DEFAULT_POOLER_MAX_CONNECTIONS)
+    )
+    if pooler_limit <= 0 or args.concurrent_processes <= 0 or args.reserve < 0:
+        print("error: límites y procesos deben ser positivos", file=sys.stderr)
+        return 2
+
     required = required_connections(
         db_pool=db_pool,
         checkpointer_pool=checkpointer_pool,
         concurrent_processes=args.concurrent_processes,
     )
-
-    if args.max_connections:
-        max_connections = args.max_connections
-        source = "valor pasado por argumento"
-    else:
-        dsn = args.database_sync_url
-        if args.database_sync_url_file:
-            path = pathlib.Path(args.database_sync_url_file)
-            if not path.is_file():
-                print(f"error: no existe {path}", file=sys.stderr)
-                return 2
-            dsn = path.read_text(encoding="utf-8").strip()
-        if not dsn:
-            print(
-                "error: hace falta --database-sync-url-file (o --max-connections) para medir",
-                file=sys.stderr,
-            )
-            return 2
-        try:
-            max_connections = measure_max_connections(dsn)
-        except Exception as exc:  # noqa: BLE001 - a gate that cannot measure must not pass
-            print(f"error: no se pudo medir max_connections: {type(exc).__name__}", file=sys.stderr)
-            return 2
-        source = "SHOW max_connections en la instancia"
-
-    ok, message = verdict(required=required, reserve=args.reserve, max_connections=max_connections)
+    ok, message = verdict(
+        required=required,
+        reserve=args.reserve,
+        pooler_limit=pooler_limit,
+        concurrent_processes=args.concurrent_processes,
+    )
     print(f"pools: DB_POOL_SIZE={db_pool} CHECKPOINTER_POOL_SIZE={checkpointer_pool}")
-    print(f"procesos concurrentes: {args.concurrent_processes} ({source}: {max_connections})")
+    print(
+        f"procesos concurrentes: {args.concurrent_processes} "
+        f"(1 servicio + 3 jobs solapables, --max-instances=1)"
+    )
+    print(f"límite del pooler (Supavisor, modo sesión): {pooler_limit}")
     print(message)
     return 0 if ok else 1
 

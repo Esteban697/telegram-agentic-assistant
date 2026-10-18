@@ -46,7 +46,7 @@ Every change is marked inline with its finding ID, so the round-2 critic can see
 Build, in the existing empty repository, a small, typed, security-first Python service that
 lets a single authorised Telegram user converse with a model on Ollama Cloud, keep explicit
 preferences and reminders in PostgreSQL, ask questions about their own documents with
-verifiable citations (RAG over pgvector in Cloud SQL), perform a small set of typed web /
+verifiable citations (RAG over pgvector in Supabase Postgres), perform a small set of typed web /
 availability lookups through provider-agnostic adapters, and prepare externally-committing
 actions that can only execute after an explicit, expiring, single-use, atomic approval — all
 running as one Docker image on Cloud Run with Cloud Scheduler + Cloud Run Jobs for periodic
@@ -97,7 +97,8 @@ phase's acceptance criteria demonstrated by executed tests rather than asserted.
    embedding-provider decision (§13.1) — the port, the stub provider and everything up to the
    provider boundary is built and tested regardless.
 7. **Phase 5 — Deployment.** Dockerfile hardening, Cloud Run service, Cloud Run Jobs, Cloud
-   Scheduler, Secret Manager, Cloud SQL wiring, minimum-privilege IAM, rollback runbook.
+   Scheduler, Secret Manager, Supabase wiring (the database is provisioned outside the deploy),
+   minimum-privilege IAM, rollback runbook.
    Every command that creates a billable resource is printed for approval before it is run
    (§12) — the spec forbids creating them unilaterally.
 8. **Phase 6 — Hardening and final report.** Full evaluations, incident/runbook documentation,
@@ -329,14 +330,12 @@ critic should attack.
    the ORM's unit of work puts both at risk. So: two pools, sized explicitly. Committed values are
    `DB_POOL_SIZE=4` and `CHECKPOINTER_POOL_SIZE=3` (7 per process), and the arithmetic that must
    hold is `(DB_POOL_SIZE + CHECKPOINTER_POOL_SIZE) × concurrent_processes ≤ tier max_connections`.
-   Concurrent processes = 3 service instances (`--max-instances=3`) + 3 job containers = 6, so
-   **7 × 6 = 42 connections**. Cloud SQL's default `max_connections` scales with instance memory:
-   25 / 50 / 100 for ~0.6 GB / ~1.7 GB / ~3.75 GB tiers. The smallest tier that fits is therefore
-   the ~1.7 GB shared-core tier (50), and §12 derives the database tier from that number. This must
-   be re-checked against `SHOW max_connections` before the Phase 5 deploy is accepted, and the
-   deploy fails the check if `connections_required + 5 > max_connections` (the +5 reserves room for
-   admin and migration sessions). If the user insists on the smallest tier (25), the pools must drop
-   to `2 + 2` (4 × 6 = 24) and that is recorded as a deliberate throughput sacrifice.
+   **Superseded 2026-10-18 (Supabase).** Concurrent processes = 1 service instance
+   (`--max-instances=1`, mandatory) + 3 job containers = **4**, the deployed pools are
+   `DB_POOL_SIZE=2` and `CHECKPOINTER_POOL_SIZE=1`, so **(2 + 1) × 4 + 2 reserve = 14**, exactly the
+   **Supavisor session-mode ceiling of 14** (measured: the 15th connection fails immediately with
+   `EMAXCONNSESSION`). The server-side `max_connections` (60) is not the binding limit. The deploy
+   refuses when the inequality does not hold; see §11.2.
 5. **Cold starts and the Telegram webhook deadline.** Telegram's webhook deadline is **60 seconds**
    (verified in round 1, Appendix A.7); exceeding it makes `getWebhookInfo` report
    "Read timeout expired" and Telegram re-POSTs. Two consequences, both now handled explicitly:
@@ -367,11 +366,12 @@ critic should attack.
    jitter on idempotent calls only, `think: "low"` for latency-sensitive turns, and a
    `LLM_TIMEOUT_SECONDS` budget that fails a turn with a clear Spanish message instead of hanging
    past the Cloud Run request timeout.
-10. **Cloud SQL cost.** A managed PostgreSQL instance is the single largest recurring cost in
-    this design and cannot scale to zero; the instance is also the thing that must exist before
-    migrations can be verified in the cloud. The user must approve it explicitly (§12, §13.6).
-    Everything except the final cloud verification runs against a local `pgvector/pgvector:pg17`
-    container.
+10. **Cloud SQL cost — SUPERSEDED 2026-10-18 by Supabase.** The database is a managed Supabase
+    project (PostgreSQL 17.11 + pgvector 0.8.2) provisioned outside this deployment, so the
+    dominant recurring cost is Supabase's plan rather than an instance created by the deploy. The
+    free plan pauses on inactivity and has no backups, which is why the **Pro** plan is
+    recommended (§12). The local `pgvector/pgvector:pg17` container remains the development and
+    test database.
 11. **Redundant update bookkeeping is deliberate.** `inbox_updates.update_id` (primary key) is
     the authoritative inbound idempotency constraint; `messages.telegram_update_id` also carries
     a partial unique index because spec §8 asks for it on `messages`. The redundancy is one
@@ -726,9 +726,11 @@ Deliberately **not** added, with the reason:
 
 ### 3.1 Conventions
 
-- **PostgreSQL 17** on Cloud SQL (`europe-west1`), `vector` extension **0.8.5** (the current
-  Cloud SQL-supported build for PG 13+, verified Appendix A.2) — 0.8.x is required for
-  `hnsw.iterative_scan`, which decision 6 depends on.
+- **PostgreSQL 17** on **Supabase** (managed Postgres, `aws-0-eu-west-1`, Supavisor pooler in
+  session mode), `vector` extension **0.8.2** — 0.8.x is required for `hnsw.iterative_scan`, which
+  decision 6 depends on. **Changed 2026-10-18; Cloud SQL was superseded** (see §13.6). The extension
+  lives in the **`extensions` schema**, so the database `search_path` is `public, extensions` and
+  the app role has `USAGE` on it.
 - Primary keys: `uuid` (`gen_random_uuid()`, from `pgcrypto` or built into PG 13+ as
   `gen_random_uuid()` in core) for externally-referenced entities (`conversations`, `documents`,
   `memories`, `tasks`, `pending_actions`); `bigserial` for append-only ledgers (`messages`,
@@ -1110,14 +1112,16 @@ This is the table a reviewer should check against the spec's idempotency claims.
 Ordered, reproducible, and the exact acceptance criterion of spec §17 ("Las migraciones se pueden
 aplicar desde una base vacía"):
 
-1. `CREATE DATABASE` (or, on Cloud SQL, the instance's app database) — done by
-   `scripts/bootstrap_db.py` connecting to the maintenance database, or by the Cloud SQL console.
+1. `CREATE DATABASE` — on Supabase the project's `postgres` database already exists; the app role
+   `taa_app` is created in the dashboard and the two grants (`extensions` USAGE and the database
+   `search_path`) are applied there. `scripts/bootstrap_db.py` connects through the pooler.
 2. **Revision `0001_extensions`**: `op.execute("CREATE EXTENSION IF NOT EXISTS vector")`, plus
    `pgcrypto` if `gen_random_uuid()` is unavailable (it is core in PG 13+, so likely unnecessary —
    confirmed at implementation). A guard `SELECT extversion FROM pg_extension WHERE extname='vector'`
    asserts `>= 0.8` and raises a clear error otherwise, because `hnsw.iterative_scan` (decision 6)
-   requires it. On Cloud SQL the `postgres` user may create allow-listed extensions; if the
-   app's own DB user cannot, the migration fails loudly with the exact remediation
+   requires it. **On Supabase the extension is installed in the `extensions` schema, not `public`**,
+   so the database `search_path` must be `public, extensions` and the app role needs `USAGE` on it;
+   if it cannot resolve the type, the migration fails loudly with the exact remediation
    (`CREATE EXTENSION` must be run by a user with sufficient privilege) rather than leaving a
    half-migrated database.
 3. **Revisions `0002…00NN`**, one per table group in dependency order: `conversations` →
@@ -1156,8 +1160,8 @@ complete) and `pgvector.sqlalchemy` (so the `vector` type is comparable), sets
 comparison so it does not oscillate. The first revision is hand-written rather than autogenerated;
 subsequent ones are autogenerated and then reviewed, never committed unreviewed. Rollback:
 every revision gets a real `downgrade()`; destructive operations (`DROP COLUMN`, `DROP TABLE`)
-are documented as forward-only in the README (Spanish), with the restore path being the Cloud SQL
-backup rather than a downgrade.
+are documented as forward-only in the README (Spanish), with the restore path being the Supabase
+backup (Pro plan; the free plan has none) rather than a downgrade.
 
 ---
 
@@ -2026,10 +2030,10 @@ accident:
   (spec §14).
 - The GCS bucket is private (uniform bucket-level access, no public ACLs, no `allUsers`); the
   runtime service account is the only principal with access, scoped to that bucket.
-- Database access is restricted to the app's own user over the Cloud SQL socket; no public
-  database exposure (§11).
-- TLS everywhere: Telegram (HTTPS by requirement), Ollama Cloud (`https://ollama.com`), GCS and
-  Cloud SQL via their managed transports.
+- Database access is restricted to the app role `taa_app` (not superuser, no `createdb`/`createrole`)
+  through the Supabase pooler over TLS; no database is exposed to this deployment's network (§11).
+- TLS everywhere: Telegram (HTTPS by requirement), Ollama Cloud (`https://ollama.com`), GCS, and
+  PostgreSQL through the Supabase pooler with `sslmode=require`.
 - Retention and deletion are documented in Spanish, including how the user deletes data:
   `/forget` for a memory or a document (+ its chunks + its GCS object), and the documented manual
   procedure for a full wipe (spec §6 "explicar cómo borrar datos y documentos"). Retention
@@ -2592,7 +2596,8 @@ graph with nothing to run on. The fallback is now concrete and ordered:
   exactly one active `embedding_models` row and the `pending_actions_args_immutable` trigger in
   place (B7, N1), and a direct `UPDATE` of an approved row's `args_json` raises.**
 - **Blockers:** a local PG 17 + pgvector ≥ 0.8 container (available — Docker 29.7.2 present).
-  Cloud SQL is **not** required until Phase 5.
+  The managed database (Supabase) is provisioned outside the deploy and is not required until
+  Phase 5.
 
 ### Phase 3 — LangGraph, tools, approvals (spec §16 Fase 3) — contract level
 
@@ -2688,7 +2693,8 @@ graph with nothing to run on. The fallback is now concrete and ordered:
 
 - **Deliverables:** the hardened `Dockerfile`; `scripts/deploy.sh` printing every `gcloud` command;
   the Cloud Run service, the three Cloud Run Jobs, the Scheduler schedules, Secret Manager secrets,
-  Cloud SQL wiring, the minimum-privilege IAM bindings, log-based alerts, and the Spanish deployment
+  the Supabase wiring (a pre-provisioned database, no instance to create), the minimum-privilege IAM
+  bindings, log-based alerts, and the Spanish deployment
   / webhook / migrations / operations / rollback documentation.
 - **Acceptance (spec §16: "despliegue documentado; webhook operativo; job idempotente; no hay
   secretos en la imagen ni en logs"):** (a) the documented steps, followed on a clean project,
@@ -2789,6 +2795,23 @@ graph with nothing to run on. The fallback is now concrete and ordered:
   both project tests still passed); and the runbook's stale passages (project state, the delete list,
   the SQL password file, the migrations step that makes `/readyz` green).
 
+- **Database changed to Supabase (2026-10-18; replaces Cloud SQL).** Reworked in the Phase 5
+  artefacts: `scripts/deploy.sh` no longer creates an instance, a database or a user, no longer
+  attaches a Cloud SQL socket and no longer grants `roles/cloudsql.client`; the one secret holds the
+  Supabase pooler DSN and is mounted as both `DATABASE_URL` and `DATABASE_SYNC_URL`. Step 0 gained
+  two checks that fail *before* anything billable: `scripts/check_database.py` (connectivity through
+  the pooler, `pgvector >= 0.8`, `vector` in the `extensions` schema **and resolvable from the app
+  role**, `hnsw.iterative_scan` present, and the role without `super`/`createdb`/`createrole`) and
+  the re-derived pool gate in `scripts/check_pool_budget.py`.
+  *The pool arithmetic, concretely:* `(DB_POOL_SIZE=2 + CHECKPOINTER_POOL_SIZE=1) × 4 concurrent
+  processes (1 service + 3 jobs) + 2 reserve = 14 ≤ 14`, the measured **Supavisor session-mode
+  ceiling**; `--max-instances=1` is mandatory because of it, and the deploy passes the pool sizes
+  explicitly (the application defaults, 4 + 3, would be 30). The gate refuses when it does not fit.
+  The runbook documents the role and the two SQL statements a fresh project needs (`grant usage on
+  schema extensions to taa_app;` and `alter database postgres set search_path = public,
+  extensions;`), the session-mode/TLS requirements, the 14-connection ceiling, and the free plan's
+  pausing and lack of backups (Pro recommended; Supabase's daily backups are the restore path).
+
 ### Phase 6 — Hardening and final documentation (spec §16 Fase 6) — contract level
 
 - **Deliverables:** the full evaluation run; incident/runbook documentation in Spanish; the
@@ -2842,41 +2865,35 @@ readable and IAM bindings can be scoped by prefix.
 | `--concurrency` | `8` | Async I/O; keeps in-flight LLM calls per instance reasonable. |
 | `--timeout` | `300` | Must exceed `REQUEST_BUDGET_SECONDS` (**45**, corrected in round 1 from 90 — see the row below) plus reply overhead, and is far below the webhook's usefulness window. |
 | `--min-instances` | `0` | Scale to zero; the cold-start/retry interaction is safe because of §5.1 (Risks item 5), and the 60 s Telegram deadline is respected by the 45 s budget (N3). |
-| `--max-instances` | `3` | Bounds cost and concurrent Ollama spend — **and is the multiplier in the connection-pool arithmetic below (A3/N10).** |
+| `--max-instances` | **`1`** (changed 2026-10-18) | **Mandatory, not a cost choice**: the Supabase pooler (Supavisor, session mode) allows 14 client connections, and one instance plus three jobs already accounts for all of them. With more instances the arithmetic cannot fit. It also bounds concurrent Ollama spend. |
 | `--cpu-throttling` | **default (request-based)** | We deliberately do **not** need CPU after the response returns (decision 2), so we do not pay for instance-based billing. This is the setting that makes decision 2 a requirement rather than a preference. |
 | `--allow-unauthenticated` | yes, for the service | Telegram cannot send IAM credentials; the webhook's own secret header is the authentication (spec §13 "El endpoint del webhook valida el secreto de Telegram"). |
-| `--add-cloudsql-instances` | the instance connection name | Enables the Cloud SQL Unix socket. |
-| `--set-env-vars` | `INSTANCE_UNIX_SOCKET=/cloudsql/PROJECT:REGION:INSTANCE`, `APP_ENV=production`, `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_REGION`, non-secret tunables | Verified mechanics: the Unix-socket path is `/cloudsql/<project>:<region>:<instance>`; do **not** set `INSTANCE_HOST` when using it (Appendix A.9). |
-| `--set-secrets` | `TELEGRAM_BOT_TOKEN=…:N`, `TELEGRAM_WEBHOOK_SECRET=…:N`, `OLLAMA_API_KEY=…:N`, `DATABASE_URL=…:N` | Verified: env-var secrets are read once at instance start, so versions are **pinned numerically**, never `latest` (Appendix A.8). |
+| `--set-env-vars` | `APP_ENV=production`, `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_REGION`, `STORE_BACKEND=postgres`, `EMBED_PROVIDER=vertex`, `GCS_BUCKET`, `TELEGRAM_ALLOWED_USER_IDS`, **`DB_POOL_SIZE=2`**, **`CHECKPOINTER_POOL_SIZE=1`**, non-secret tunables | The pool sizes are passed **explicitly**: the application defaults (4 and 3) would be 7 × 4 + 2 = 30 against a pooler of 14. |
+| `--set-secrets` | `TELEGRAM_BOT_TOKEN=…:N`, `TELEGRAM_WEBHOOK_SECRET=…:N`, `OLLAMA_API_KEY=…:N`, `DATABASE_URL=…:N`, `DATABASE_SYNC_URL=…:N` (the same secret: same DSN string) | Verified: env-var secrets are read once at instance start, so versions are **pinned numerically**, never `latest` (Appendix A.8). |
 | `--service-account` | `taa-<env>-runtime@…` | Minimum privilege (§11.4). |
 
-`DATABASE_URL` for the Unix-socket path is an async DSN of the form
-`postgresql+psycopg://USER:PASSWORD@/DBNAME?host=/cloudsql/PROJECT:REGION:INSTANCE`; **the exact
-psycopg-3 URL form for a socket host must be confirmed at implementation** (Appendix B.5). The
-checkpointer needs its own connection string in the same form (decision 8 / Risks item 4), also
-from Secret Manager.
+`DATABASE_URL` is the **Supabase pooler DSN**: `postgresql+psycopg://taa_app.<ref>:PASSWORD@
+aws-0-eu-west-1.pooler.supabase.com:5432/postgres?sslmode=require`. **TLS is mandatory**, and the
+host is the **pooler**, not the direct database host: Cloud Run has no IPv6 egress and Supabase's
+direct host is IPv6. The pooler must be in **session mode** — transaction mode cannot carry the
+checkpointer's session semantics or `SET LOCAL hnsw.iterative_scan`. `DATABASE_SYNC_URL` mounts the
+same secret: the DSN string is identical and the `postgresql+psycopg` driver serves both engines.
 
-**Connection-pool arithmetic, computed rather than deferred (A3, N10).** Cloud SQL's default
-`max_connections` is a function of instance memory (25 / 50 / 100 for ~0.6 GB / ~1.7 GB / ~3.75 GB
-tiers — verified this round, Appendix A.11). The requirement is
+**Connection-pool arithmetic, re-derived for the pooler (2026-10-18, Supabase).** The binding limit
+is **Supavisor session mode: 14 client connections**, measured (1–14 connect in ~0.3 s; the 15th
+fails immediately with `EMAXCONNSESSION`). The server's `max_connections` is 60 and is irrelevant.
+The inequality is
 
 ```
-(DB_POOL_SIZE + CHECKPOINTER_POOL_SIZE) × concurrent_processes  ≤  tier max_connections − 5
-(4            + 3                     ) × (3 service instances + 3 job containers = 6)  =  42
+(DB_POOL_SIZE + CHECKPOINTER_POOL_SIZE) × procesos_concurrentes + reserva  ≤  14
+(2            + 1                     ) × (1 servicio + 3 jobs = 4)      + 2      = 14  ✔
 ```
 
-so the smallest tier that fits is the **~1.7 GB shared-core tier (default 50)**. **Recommended tier
-(round-2 ruling):** the first dedicated-core tier (1 vCPU / ~3.75 GB, default 100) — the shared-core
-types are excluded from the Cloud SQL SLA (§12), and the extra tier buys coverage plus headroom.
-Consequences, all recorded rather than left implicit:
+`--max-instances=1` is mandatory because of this. The deployed pools are `DB_POOL_SIZE=2` and
+`CHECKPOINTER_POOL_SIZE=1`; the deploy passes them explicitly and the gate refuses when the sum does
+not fit. The **checkpointer pool at 1** is workable because checkpointer calls are short and serial
+per run.
 
-- §12 derives the database tier from this number instead of picking one and hoping.
-- The **deploy is gated on `SHOW max_connections`** on the real instance: if
-  `42 + 5 > max_connections`, the deploy script refuses and prints the two remedies (raise the tier,
-  or reduce the pools) — pool oversubscription is an outage, not a slowdown.
-- If the user insists on the smallest tier (25), the pools drop to `DB_POOL_SIZE=2` and
-  `CHECKPOINTER_POOL_SIZE=2` (4 × 6 = 24), recorded as a deliberate throughput sacrifice — the
-  checkpointer's pool at 2 is workable because checkpointer calls are short and serial per run.
 - The §9.2 integration suite opens exactly this many connections and asserts
   `required + 5 ≤ TEST_DB_MAX_CONNECTIONS`, where that variable is **set explicitly to the §12 tier's
   value, not read from the container** (§9.2; NN5, corrected in round 3 — the local image defaults to
@@ -2925,7 +2942,6 @@ is reclaimable.
 
 | Principal | Role | Scope |
 |---|---|---|
-| Runtime SA (`taa-<env>-runtime`) | `roles/cloudsql.client` | Project (there is no narrower primitive for the socket) |
 | Runtime SA | **`roles/aiplatform.user`** | Project — **added 2026-10-17 (B4): the table omitted it and the omission was load-bearing.** The embeddings adapter authenticates as the runtime SA (`google.auth.default()`), and a user-created service account starts with no roles, so ingestion *and* retrieval would have received 403 from Vertex on every call, surfacing as `EmbeddingUnavailable` — a deployed system that cannot answer a single document question |
 | Runtime SA | `roles/storage.objectAdmin` — **prefer** a custom role limited to `storage.objects.{get,create,delete,list}` | Bound to the one bucket via an IAM condition on `resource.name.startsWith("projects/_/buckets/<bucket>/")` |
 | Runtime SA | `roles/secretmanager.secretAccessor` | Per-secret, not project-wide |
@@ -2967,17 +2983,19 @@ identity is used directly (spec §12, §13).
   to revisit: if versioning is ever enabled for accidental-deletion recovery, a
   `Delete noncurrent versions older than N days` rule becomes appropriate and is added in the same
   change.
-- Cloud SQL is reached over the Cloud SQL socket; whether the instance also has a public IP (simpler,
-  socket path) or Private IP only (requires Direct VPC egress / a connector) is a user-facing cost
-  and complexity tradeoff (§13.6).
+- The database is reached at the **Supabase pooler** (`aws-0-eu-west-1.pooler.supabase.com:5432`,
+  session mode, TLS). There is no instance, no socket and no public/private-IP choice to make: the
+  pooler is IPv4, which is what Cloud Run can reach (§13.6).
 
 ### 11.6 Migrations, configuration and rollback (spec §13 "Documentar cómo…")
 
 Documented in Spanish, with runnable commands:
 
-- **Migrations:** run from a machine with Cloud SQL access (or a one-off Cloud Run Job) —
-  `python scripts/migrate.py upgrade head` with `DATABASE_SYNC_URL` pointed at the instance; then
-  `python scripts/bootstrap_db.py` for the checkpointer tables. Never automatic on app start in
+- **Migrations:** run from any machine that can reach the Supabase pooler over TLS (or as a
+  one-off Cloud Run Job) — `python scripts/migrate.py upgrade head` with `DATABASE_SYNC_URL` pointed
+  at the pooler DSN; then `python scripts/bootstrap_db.py` for the checkpointer tables. There is no
+  proxy to run: Supabase is TCP + TLS. The pooler allows 14 session-mode connections, so do not
+  migrate while the service is under load. Never automatic on app start in
   production except the idempotent `setup()` call guarded by `MIGRATIONS_AUTORUN=false` by default
   (an app boot must not be the thing that changes the schema).
 - **Configuration:** the full variable table (§8.1), which are secrets and where they live, and the
@@ -2987,7 +3005,8 @@ Documented in Spanish, with runnable commands:
   authorised account).
 - **Rollback:** `gcloud run services update-traffic SERVICE --to-revisions PREV=100` for code; for
   schema, migrations are forward-only in practice — a destructive revision's rollback path is
-  "restore from the Cloud SQL backup taken before the migration", documented explicitly, and
+  **the Supabase backup taken before the migration** (daily on the Pro plan; the free plan has none,
+  so an explicit `pg_dump` through the pooler is the only fallback), documented explicitly, and
   `scripts/migrate.py downgrade` refuses in production without `--i-have-a-backup`.
 
 ---
@@ -3001,7 +3020,7 @@ report records what was approved, what was created, and the resulting monthly co
 
 | Resource | Billable? | Approx. cost | Notes |
 |---|---|---|---|
-| **Cloud SQL for PostgreSQL 17** | **Yes — the dominant cost** | **Recommended (ruling applied in round 2, A3): the first dedicated-core tier — 1 vCPU / ~3.75 GB, default `max_connections` 100.** The pool arithmetic (§11.2) requires 42 connections plus a 5-connection reserve, so the *minimum* tier that fits is the ~1.7 GB shared-core type (default 50) — but Google excludes shared-core types (`db-f1-micro`, `db-g1-small`) from the Cloud SQL SLA and documents them as dev/test-oriented, and this instance holds the reminders, approvals and checkpoints whose loss is the whole risk this plan manages. The recommended tier therefore buys SLA coverage and 2× headroom for the difference in cost, and it is the tier §11.2's gate is checked against. **Cheaper alternative, kept costed:** the shared-core ~1.7 GB type satisfies the arithmetic but carries the SLA exclusion, and at the smallest tier (25 connections) the pools must drop to `2 + 2` (4 × 6 = 24), recorded in §11.2 as a deliberate throughput sacrifice. **The final choice is the user's at §13.6.** It **cannot scale to zero.** Exact SKU pricing must be quoted from the current price list at Phase 5, not from memory (the plan states the *constraint*, not a dollar figure it cannot verify). | Raising `--max-instances` or the pool sizes means re-deriving the tier — the deploy script enforces that (§11.2). **Requires explicit approval. This is the item to decide first (§13.6).** |
+| **Supabase (PostgreSQL 17.11 + pgvector 0.8.2)** | **Yes — the main recurring cost; fixed monthly, not per request** | **Provisioned outside this deployment** (the deploy does not create it). **Recommendation: the Pro plan.** The free plan **pauses on inactivity** and has **no backups**; the Pro plan adds daily backups (the documented restore path) and no pausing. The binding limit is the **Supavisor session-mode ceiling of 14 client connections** (measured), which is what §11.2's arithmetic is derived from and what makes `--max-instances=1` mandatory. Pricing must be quoted from supabase.com/pricing before approval, not from memory. | Raising `--max-instances` or the pool sizes means re-deriving the arithmetic — the deploy script refuses when it does not fit (§11.2). Requires the user's own project and plan. |
 | pgvector | No | — | An extension on the same instance |
 | Cloud Run Service | Yes (per request + CPU/memory-seconds) | Cents/month at personal volume, and zero when idle with `min-instances=0` | Requires approval (creates a service) |
 | Cloud Run Jobs (×3) | Yes (per execution) | Fractions of a cent per run; a per-minute reminder job is the largest contributor and still tiny | Requires approval |
@@ -3136,12 +3155,13 @@ until it is answered. Items 1–3 are the ones that can stop Phase 4.
    record the name it prints; `LLM_MODEL` is then set from that, and neither spelling is
    hard-coded. Secondary question: whether to keep `LLM_THINK=low` for latency or allow reasoning
    in exchange for slower turns.
-6. **GCP project, region and Cloud SQL shape.** **Needed:** the project id, confirmation of
-   `europe-west1`, the Cloud SQL tier the user is willing to pay for, and whether the instance may
-   have a public IP (the simplest Cloud SQL socket path) or must be Private-IP-only (requires
-   Direct VPC egress / a connector and more setup). Also: whether a Cloud SQL instance should be
-   created at all in Phase 5, or whether the user prefers to defer it and validate the cloud
-   deployment at a later date (the plan is fully verifiable locally up to Phase 4).
+6. **GCP project, region and database shape — DECIDED 2026-10-18.** The GCP project is
+   `telegram-assistant-esteban` and the region `europe-west1` (already in use). **The database is
+   Supabase**, not Cloud SQL: a managed PostgreSQL 17.11 + pgvector 0.8.2 project behind the
+   Supavisor pooler in session mode (IPv4, TLS, 14-connection ceiling), provisioned by the user and
+   already migrated. The reasons are cost (no always-on Cloud SQL instance) with the same engine,
+   the same `pgvector` and the same guarantees that matter here. The Cloud SQL tier/IP questions
+   are therefore withdrawn.
 7. **Retention policy.** **Needed:** the retention window for message content and for documents, and
    whether an automatic purge job should exist. The schema already supports it
    (`messages.content_retained`, `documents.deleted_at`), and spec §6 requires "retención razonable
@@ -3296,7 +3316,8 @@ per row after RB2).
 **Two facts verified in round 1 are recorded here as verified, with sources, per the instruction to
 promote rather than bury them:** Telegram's 60-second webhook deadline (Appendix A.7) and Cloud SQL's
 `max_connections`-by-memory-tier table (Appendix A.11). Both were previously absent or unhedged, and
-both are now load-bearing (`REQUEST_BUDGET_SECONDS=45` and the derived database tier).
+both are now load-bearing (`REQUEST_BUDGET_SECONDS=45`; A.11 was load-bearing until 2026-10-18, when
+Supabase replaced Cloud SQL and the binding limit became the pooler's 14 client connections).
 
 ---
 
@@ -3365,7 +3386,8 @@ prefers it over the spec's assumption and says so.
    `hnsw.scan_mem_multiplier`. `ivfflat.max_probes` for IVFFlat. *Sources: pgvector/pgEdge docs,
    AWS Aurora pgvector 0.8.0 benchmarks.* This is why §6.2 uses `strict_order` (citation ordering
    must be exact) **and** why `ef_search` remains a tunable to revisit in Phase 4.
-4. **Cloud SQL support.** pgvector **0.8.5** is supported on PostgreSQL 13+ (rolled out by
+4. **Cloud SQL support — historical (the database is Supabase since 2026-10-18).** pgvector
+   **0.8.5** is supported on PostgreSQL 13+ (rolled out by
    2026-08-27); PostgreSQL 12 caps at 0.7.4; PG 11 at 0.5.1. PostgreSQL 17 (17.11) is supported;
    PostgreSQL 18 is now the default version. Recommended storage mode `external` for PG 13+.
    *Source: Cloud SQL for PostgreSQL extensions / release notes.* So PG 17 + pgvector 0.8.5 gives us
@@ -3454,7 +3476,7 @@ secrets unsupported; mounted path must not be `/dev`, `/proc`, `/sys`; no duplic
 mounting over a non-empty directory hides its contents. *Source: Cloud Run "Configure secrets for
 instances/jobs" + `gcloud run deploy` reference.* Drives §11.2's numeric version pinning.
 
-### A.9 Cloud Run ↔ Cloud SQL
+### A.9 Cloud Run ↔ Cloud SQL — SUPERSEDED 2026-10-18 (the database is Supabase)
 
 Documented methods: (1) **Unix socket** via the Cloud SQL Auth Proxy — set
 `INSTANCE_UNIX_SOCKET=/cloudsql/PROJECT_ID:REGION:INSTANCE_NAME` and do **not** set `INSTANCE_HOST`,
@@ -3462,7 +3484,9 @@ with `--add-cloudsql-instances` on deploy; (2) the **language connector** (`INST
 only); (3) **TCP** by private IP or direct host (needs Direct VPC egress / a connector). The
 quickstart's deploy command uses method (1). *Source: Cloud SQL "Connect from Cloud Run" quickstart
 + extensions docs.* Drives §11.2 and the §11.5 public-vs-private-IP question in §13.6. The exact
-psycopg-3 DSN spelling for a socket host remains Appendix B.5.
+psycopg-3 DSN spelling for a socket host remains Appendix B.5. **Superseded:** Cloud Run now
+reaches Supabase at its IPv4 pooler over TCP with `sslmode=require`; no socket, no
+`--add-cloudsql-instances`, no Auth Proxy.
 
 ### A.10 Cloud Run CPU allocation (why decision 2 is not optional)
 
@@ -3558,8 +3582,9 @@ installed package, running a probe, or reading current docs — never by guessin
     behaviour rather than a literal expression, and the **three** A1 tests in §5.3 exist precisely to
     catch a wrong reading here (a replayed node executing twice, re-worded arguments failing to raise,
     or two deliberate requests collapsing into one).
-13. **The real instance's `max_connections`** after creation, to confirm §11.2's arithmetic
-    (42 + 5 ≤ 50 — the **constraint's minimum** tier, not §12's recommended first dedicated-core
+13. **The real instance's `max_connections` — WITHDRAWN 2026-10-18.** There is no instance: the
+    binding limit is the Supabase pooler's measured **14** session-mode connections, and §11.2's
+    arithmetic is derived from it. (Historical text follows.) (42 + 5 ≤ 50 — the **constraint's minimum** tier, not §12's recommended first dedicated-core
     tier; the two are consistent, not contradictory) rather than trusting the published tier table
     (Appendix A.11). Read with
     `SHOW max_connections`; the Phase 5 deploy is gated on it (§11.2) and the tier in §12 is a

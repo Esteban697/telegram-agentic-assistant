@@ -69,9 +69,6 @@ JOB_DOCUMENTS="${PREFIX}-job-documents"
 JOB_RESUME="${PREFIX}-job-resume"
 RUNTIME_SA="${PREFIX}-runtime"
 SCHEDULER_SA="${PREFIX}-scheduler"
-SQL_INSTANCE="${PREFIX}-pg"
-SQL_DATABASE="taa"
-SQL_USER="taa"
 BUCKET="${PREFIX}-documents"
 AR_REPO="${PREFIX}-images"
 IMAGE="${REGION}-docker.pkg.dev/${PROJECT}/${AR_REPO}/${PREFIX}-app"
@@ -103,17 +100,18 @@ VERSION_WEBHOOK="$SECRET_VERSION_DEFAULT"
 VERSION_OLLAMA="$SECRET_VERSION_DEFAULT"
 VERSION_DATABASE_URL="$SECRET_VERSION_DEFAULT"
 
-# Tier de Cloud SQL y su `max_connections` por defecto (Apéndice A.11). El aritmético de
-# conexiones (§11.2) se comprueba **contra el valor documentado del tier**, porque la medida real
-# (`SHOW max_connections`) solo se puede tomar desde dentro de la VPC — ver el paso 9.
-SQL_TIER="${TAA_SQL_TIER:-db-custom-1-3840}"
-SQL_STORAGE_GB="${TAA_SQL_STORAGE_GB:-10}"
-SQL_MAX_CONNECTIONS="${TAA_SQL_MAX_CONNECTIONS:-100}"
-CONCURRENT_PROCESSES="${TAA_CONCURRENT_PROCESSES:-6}"   # 3 instancias del servicio + 3 jobs
-POOL_RESERVE="${TAA_POOL_RESERVE:-5}"
-
-CONNECTION_NAME="${PROJECT}:${REGION}:${SQL_INSTANCE}"
-SOCKET_PATH="/cloudsql/${CONNECTION_NAME}"
+# **La base de datos es Supabase, no Cloud SQL** (decisión del 2026-10-18). El límite que manda
+# no es el `max_connections` del servidor (60) sino el del **pooler Supavisor en modo sesión: 14
+# conexiones de cliente**, medido — la 15 falla al instante con EMAXCONNSESSION, que es un fallo y
+# no una espera. Se declara como entrada para que el aritmético no dependa de un número escondido.
+POOLER_MAX_CONNECTIONS="${TAA_POOLER_MAX_CONNECTIONS:-14}"
+# `--max-instances=1` es obligatorio: el pooler no admite más. Los procesos concurrentes son el
+# servicio más los tres jobs cuando se solapan.
+CONCURRENT_PROCESSES="${TAA_CONCURRENT_PROCESSES:-4}"
+POOL_RESERVE="${TAA_POOL_RESERVE:-2}"
+# Los pools que se despliegan. (2 + 1) x 4 + 2 = 14, exactamente el límite, con la reserva de 2.
+DB_POOL_SIZE="${TAA_DB_POOL_SIZE:-2}"
+CHECKPOINTER_POOL_SIZE="${TAA_CHECKPOINTER_POOL_SIZE:-1}"
 SERVICE_URL=""
 
 export CLOUDSDK_CORE_PROJECT="$PROJECT"
@@ -341,6 +339,10 @@ COMMON_ENV=(
   "MIGRATIONS_AUTORUN=false"
   "NOTIFICATIONS_TRANSPORT=telegram"
   "TELEGRAM_ALLOWED_USER_IDS=${ALLOWED_USER_IDS}"
+  # Los pools **desplegados**: sin esto los contenedores usarían los defectos (4 y 3), que son
+  # 7 x 4 + 2 = 30 conexiones contra un pooler de 14.
+  "DB_POOL_SIZE=${DB_POOL_SIZE}"
+  "CHECKPOINTER_POOL_SIZE=${CHECKPOINTER_POOL_SIZE}"
 )
 
 common_env_payload() {
@@ -394,17 +396,6 @@ secret_exists() {
 }
 bucket_exists() {
   gcloud storage buckets describe "gs://${BUCKET}" --project "$PROJECT" >/dev/null 2>&1
-}
-sql_instance_exists() {
-  gcloud sql instances describe "$SQL_INSTANCE" --project "$PROJECT" >/dev/null 2>&1
-}
-sql_database_exists() {
-  gcloud sql databases describe "$SQL_DATABASE" \
-    --instance="$SQL_INSTANCE" --project "$PROJECT" >/dev/null 2>&1
-}
-sql_user_exists() {
-  gcloud sql users list --instance="$SQL_INSTANCE" --project "$PROJECT" \
-    --format='value(name)' 2>/dev/null | grep -qx "$SQL_USER"
 }
 job_exists() {
   gcloud run jobs describe "$job" --region="$REGION" --project "$PROJECT" >/dev/null 2>&1
@@ -486,14 +477,23 @@ run "validar el entorno de los cuatro componentes" "sin coste" \
   "$PYTHON" "${REPO_ROOT}/scripts/validate_deploy_env.py"
 
 note ""
-note "Aritmético de conexiones (§11.2) contra el max_connections documentado del tier"
-note "(${SQL_TIER} -> ${SQL_MAX_CONNECTIONS}); la medida real se confirma en el paso 9."
+note "Aritmético de conexiones contra el límite del **pooler** (Supavisor, modo sesión):"
+note "(${DB_POOL_SIZE} + ${CHECKPOINTER_POOL_SIZE}) x ${CONCURRENT_PROCESSES} procesos + ${POOL_RESERVE} de reserva <= ${POOLER_MAX_CONNECTIONS}."
 run "comprobar el aritmético de conexiones" "sin coste" \
   "$PYTHON" "${REPO_ROOT}/scripts/check_pool_budget.py" \
-    --max-connections "$SQL_MAX_CONNECTIONS" \
+    --pooler-max-connections "$POOLER_MAX_CONNECTIONS" \
+    --db-pool-size "$DB_POOL_SIZE" \
+    --checkpointer-pool-size "$CHECKPOINTER_POOL_SIZE" \
     --concurrent-processes "$CONCURRENT_PROCESSES" \
-    --reserve "$POOL_RESERVE" \
-    --use-app-defaults
+    --reserve "$POOL_RESERVE"
+
+note ""
+note "Base de datos Supabase: conectividad (select 1) y esquema vectorial (pgvector >= 0.8 en el"
+note "esquema 'extensions', y el tipo resoluble desde el rol de la aplicación). Las dos cosas"
+note "fallan en el primer embedding si están mal, así que se comprueban antes de crear nada."
+run "comprobar conectividad y esquema de Supabase" "sin coste" \
+  "$PYTHON" "${REPO_ROOT}/scripts/check_database.py" \
+    --database-url-file "${SECRETS_DIR}/database-url"
 
 # ============================================================================================ #
 step 1 "Habilitar las APIs necesarias" \
@@ -653,73 +653,19 @@ run "dar al runtime acceso de objetos solo en este bucket" "gratis" \
     --project "$PROJECT"
 
 # ============================================================================================ #
-step 8 "Cloud SQL para PostgreSQL 17 (con pgvector)" \
-     "FACTURABLE — el coste dominante; NO escala a cero (pendiente de confirmar la tarifa)"
+step 8 "IAM de mínimo privilegio" "gratis"
 # ============================================================================================ #
-note "Tier ${SQL_TIER}: 1 vCPU / 3,75 GB, max_connections por defecto ${SQL_MAX_CONNECTIONS}."
-note "El aritmético ya se comprobó en el paso 0, antes de crear nada."
-run_ensure "crear la instancia (si no existe)" "facturable: el coste dominante" \
-  "gcloud sql instances describe ${SQL_INSTANCE}" sql_instance_exists \
-  gcloud sql instances create "$SQL_INSTANCE" \
-    --database-version=POSTGRES_17 \
-    --tier="$SQL_TIER" \
-    --storage-size="${SQL_STORAGE_GB}GB" \
-    --region="$REGION" \
-    --project "$PROJECT"
-run_ensure "crear la base de datos (si no existe)" "sin coste adicional" \
-  "gcloud sql databases describe ${SQL_DATABASE}" sql_database_exists \
-  gcloud sql databases create "$SQL_DATABASE" \
-    --instance="$SQL_INSTANCE" \
-    --project "$PROJECT"
-run_ensure "crear el usuario de la aplicación (si no existe)" "sin coste adicional" \
-  "gcloud sql users list --filter=name=${SQL_USER}" sql_user_exists \
-  gcloud sql users create "$SQL_USER" \
-    --instance="$SQL_INSTANCE" \
-    --project "$PROJECT"
-note ""
-note "La contraseña se pide por el terminal (--prompt-for-password) y nunca entra en argv ni en"
-note "el historial. El mismo valor debe estar ya en el fichero database-url del paso 6."
-run "fijar la contraseña del usuario (interactivo)" "sin coste adicional" \
-  gcloud sql users set-password "$SQL_USER" \
-    --instance="$SQL_INSTANCE" \
-    --prompt-for-password \
-    --project "$PROJECT"
-
-# ============================================================================================ #
-step 9 "Confirmar max_connections en la instancia real" "sin coste"
-# ============================================================================================ #
-note "El paso 0 usó el **valor documentado** del tier (${SQL_MAX_CONNECTIONS}) porque la medida"
-note "real necesita una conexión desde dentro de la VPC, y hacerla antes de crear la instancia era"
-note "imposible: la versión anterior de este script la intentaba desde la máquina del operador con"
-note "una DSN de socket y abortaba después de crear Cloud SQL, dejando el recurso dominante en"
-note "marcha sin nada que lo usara."
-note "Para medirlo de verdad, ejecuta el script DENTRO de la VPC (Cloud Run Job o el Cloud SQL"
-note "Auth Proxy en local) con la DSN montada:"
-run_soft "medir max_connections desde un entorno con acceso al socket" "sin coste" \
-  "$PYTHON" "${REPO_ROOT}/scripts/check_pool_budget.py" \
-    --database-sync-url-file "${SECRETS_DIR}/database-url" \
-    --concurrent-processes "$CONCURRENT_PROCESSES" \
-    --reserve "$POOL_RESERVE"
-
-# ============================================================================================ #
-step 10 "IAM de mínimo privilegio" "gratis"
-# ============================================================================================ #
-note "Runtime: cloudsql.client (a nivel de proyecto: no hay primitiva más estrecha para el"
-note "socket), aiplatform.user (Vertex: sin él, **todo** embedding —ingesta y búsqueda— recibe 403"
+note "Runtime: aiplatform.user (Vertex: sin él, **todo** embedding —ingesta y búsqueda— recibe"
 note "y aparece como EmbeddingUnavailable), secretmanager.secretAccessor **por secreto**, y el"
 note "acceso al bucket del paso 7."
-note "NO se concede: editor, owner, storage.admin, cloudsql.admin, ni secretVersionManager"
+note "403). **No hay 'cloudsql.client'**: la base de datos es Supabase y se alcanza por TCP con"
+note "TLS, no por el socket de Cloud SQL."
+note "NO se concede: editor, owner, storage.admin, ni secretVersionManager"
 note "(rotar es un acto de despliegue, no de ejecución)."
 note "**Tampoco se concede iam.serviceAccountUser a la cuenta de Scheduler**: los jobs ya se"
 note "ejecutan *como* la cuenta de runtime, y actAs sobre ella dejaría que un segundo principal"
 note "se pusiera su identidad, que puede leer los cuatro secretos y la base de datos. Quien crea"
 note "los schedules es el operador, que ya tiene ese permiso sobre la cuenta de Scheduler."
-run "runtime: cliente de Cloud SQL" "gratis" \
-  gcloud projects add-iam-policy-binding "$PROJECT" \
-    --member="serviceAccount:${RUNTIME_SA_EMAIL}" \
-    --role="roles/cloudsql.client" \
-    --condition=None \
-    --project "$PROJECT"
 run "runtime: usuario de Vertex AI (embeddings)" "gratis" \
   gcloud projects add-iam-policy-binding "$PROJECT" \
     --member="serviceAccount:${RUNTIME_SA_EMAIL}" \
@@ -743,11 +689,14 @@ for job in "$JOB_REMINDERS" "$JOB_DOCUMENTS" "$JOB_RESUME"; do
 done
 
 # ============================================================================================ #
-step 11 "Cloud Run Service (el webhook)" \
+step 9 "Cloud Run Service (el webhook)" \
      "facturable por petición y por CPU/memoria-segundo; 0 cuando está inactivo (min-instances=0)"
 # ============================================================================================ #
 note "min-instances=0 (escala a cero) y cpu-throttling por defecto (solo se paga CPU durante la"
 note "petición): es lo que hace segura la decisión 2 del plan."
+note "**max-instances=1 no es una elección de coste**: el pooler de Supabase admite 14 conexiones"
+note "de cliente en modo sesión y el aritmético del paso 0 está calculado para una instancia más"
+note "los tres jobs."
 note "--allow-unauthenticated SÍ: Telegram no puede enviar credenciales de IAM; la autenticación"
 note "es el secreto del webhook (spec §13)."
 note "gcloud run deploy crea o actualiza: es idempotente por sí solo."
@@ -761,16 +710,15 @@ run "desplegar el servicio" "facturable (pendiente de confirmar)" \
     --concurrency=8 \
     --timeout=300 \
     --min-instances=0 \
-    --max-instances=3 \
+    --max-instances=1 \
     --allow-unauthenticated \
     --service-account="$RUNTIME_SA_EMAIL" \
-    --add-cloudsql-instances="$CONNECTION_NAME" \
     --set-env-vars="$(common_env_payload)" \
     --set-secrets="$(common_secrets_payload)" \
     --project "$PROJECT"
 
 # ============================================================================================ #
-step 12 "Los tres Cloud Run Jobs" "facturable por ejecución; fracciones de céntimo"
+step 10 "Los tres Cloud Run Jobs" "facturable por ejecución; fracciones de céntimo"
 # ============================================================================================ #
 note "Un binario, cuatro comandos (decisión 18): los jobs reutilizan la misma imagen y el mismo"
 note "entorno que el servicio — si el entorno no valida, no arrancan."
@@ -799,14 +747,13 @@ for job in "$JOB_REMINDERS" "$JOB_DOCUMENTS" "$JOB_RESUME"; do
       --max-retries=1 \
       --task-timeout="${JOB_TIMEOUT[$job]}" \
       --service-account="$RUNTIME_SA_EMAIL" \
-      --add-cloudsql-instances="$CONNECTION_NAME" \
       --set-env-vars="$(common_env_payload)" \
       --set-secrets="$(common_secrets_payload)" \
       --project "$PROJECT"
 done
 
 # ============================================================================================ #
-step 13 "Cloud Scheduler (dispara los jobs con un token OAuth)" \
+step 11 "Cloud Scheduler (dispara los jobs con un token OAuth)" \
      "3 jobs/mes dentro del nivel gratuito; coste 0 con estas cadencias"
 # ============================================================================================ #
 note "El destino es la API de administración de Cloud Run, no una URL secreta (spec §13)."
@@ -834,7 +781,7 @@ for job in "$JOB_REMINDERS" "$JOB_DOCUMENTS" "$JOB_RESUME"; do
 done
 
 # ============================================================================================ #
-step 14 "Observabilidad: métrica de logs y política de alerta" \
+step 12 "Observabilidad: métrica de logs y política de alerta" \
      "Cloud Logging es gratis hasta la franquicia; los canales de notificación son aparte"
 # ============================================================================================ #
 run_ensure "crear la métrica de errores (si no existe)" "gratis hasta la franquicia" \
@@ -848,18 +795,19 @@ note "(PLAN.md §13.11). Cuando exista, se añade con:"
 note "  gcloud alpha monitoring policies create --notification-channels=CHANNEL --policy-from-file=POLICY.json --project ${PROJECT}"
 
 # ============================================================================================ #
-step 15 "Migraciones: el paso que pone /readyz en verde" "sin coste adicional"
+step 13 "Migraciones: el paso que pone /readyz en verde" "sin coste adicional"
 # ============================================================================================ #
 note "MIGRATIONS_AUTORUN=false en todo el despliegue, así que el esquema NO se crea solo: sin"
-note "este paso, /readyz responde 503 y no hay tablas. Necesita acceso a Cloud SQL, que desde la"
-note "máquina del operador significa el Cloud SQL Auth Proxy en marcha:"
-note "  cloud-sql-proxy ${CONNECTION_NAME} --port 5432"
-note "y DATABASE_SYNC_URL apuntando a 127.0.0.1 (o la DSN del socket, dentro de la VPC)."
+note "este paso, /readyz responde 503 y no hay tablas. La base de datos es Supabase y se alcanza"
+note "por TCP con TLS (session mode, puerto 5432), así que no hace falta ningún proxy:"
+note "  export DATABASE_SYNC_URL=\$(cat ${SECRETS_DIR}/database-url)"
+note "El valor no pasa por argv; el export es local y transitorio."
+note "Ojo con el pooler: migrate.py abre una conexión más y el límite es ${POOLER_MAX_CONNECTIONS}."
 run_soft "aplicar las migraciones y crear las tablas del checkpointer" "sin coste adicional" \
   "$PYTHON" "${REPO_ROOT}/scripts/migrate.py" upgrade head
 
 # ============================================================================================ #
-step 16 "Registrar el webhook de Telegram" "gratis"
+step 14 "Registrar el webhook de Telegram" "gratis"
 # ============================================================================================ #
 note "La URL se resuelve **del propio Cloud Run** en tiempo de ejecución; en modo imprimir no se"
 note "puede conocer, así que se muestra el comando que la obtiene."
@@ -897,7 +845,7 @@ run "registrar el webhook (--set, con la URL resuelta)" "gratis" \
     --secret-file="${SECRETS_DIR}/telegram-webhook-secret"
 
 # ============================================================================================ #
-step 17 "Comprobación posterior (aceptación (a) y (d))" "gratis"
+step 15 "Comprobación posterior (aceptación (a) y (d))" "gratis"
 # ============================================================================================ #
 note "Estos comandos cierran (a) y (d). Se imprimen para que el despliegue no se declare bueno"
 note "sin ejecutarlos: si (a) no se cumple, el bot no recibe nada."

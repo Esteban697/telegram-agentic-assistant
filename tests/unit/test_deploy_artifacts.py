@@ -592,26 +592,56 @@ def test_the_runbook_teardown_can_actually_run() -> None:
     * it prescribed `gcloud storage buckets delete` for a bucket full of document originals, and
       that command refuses a non-empty bucket (409 `BucketNotEmpty`) — so the one destructive step
       that matters most could not be performed as written;
-    * it claimed to be complete while step 10's IAM bindings had no teardown at all, leaving the
-      runtime SA holding project-level `roles/cloudsql.client` and `roles/aiplatform.user`.
+    * it claimed to be complete while the IAM bindings had no teardown at all, leaving the runtime
+      SA holding project-level roles after everything else was gone.
+
+    The database is Supabase now, so the block no longer contains the Cloud SQL deletes it used to;
+    the marker is the Artifact Registry deletion, which stays.
     """
 
     runbook = (REPO / "docs" / "despliegue.md").read_text(encoding="utf-8")
     blocks = re.findall(r"```bash\n(.*?)```", runbook, re.DOTALL)
-    teardown = [block for block in blocks if "sql instances delete" in block]
+    teardown = [block for block in blocks if "artifacts repositories delete" in block]
     assert len(teardown) == 1, "the teardown block moved or was duplicated"
     text = teardown[0]
 
     assert "gcloud storage rm --recursive gs://taa-prod-documents" in text, (
         "the bucket holds originals, so `buckets delete` alone cannot empty it"
     )
-    for role in ("roles/cloudsql.client", "roles/aiplatform.user", "roles/secretmanager.secretAccessor", "roles/run.invoker"):
-        assert f"remove-iam-policy-binding" in text and role in text, (
+    assert "gcloud sql" not in text, "Cloud SQL is no longer part of the deployment"
+    for role in ("roles/aiplatform.user", "roles/secretmanager.secretAccessor", "roles/run.invoker"):
+        assert "remove-iam-policy-binding" in text and role in text, (
             f"the teardown does not retire {role}"
         )
-    assert text.count("remove-iam-policy-binding") >= 5, (
-        "the project bindings, the four secrets and the three jobs all need a teardown"
+    assert text.count("remove-iam-policy-binding") >= 4, (
+        "the project binding, the four secrets and the three jobs all need a teardown"
     )
+
+
+def test_the_runbook_documents_the_supabase_reality() -> None:
+    """The prerequisites a human must have applied, and the caveats that make the plan choice.
+
+    A fresh Supabase project installs `vector` in `extensions` but does not put it on the app role's
+    search path: the deploy then fails at the first embedding with an error that names no cause.
+    The two statements are the fix, and they have to be in the runbook, not only in this review.
+    """
+
+    runbook = (REPO / "docs" / "despliegue.md").read_text(encoding="utf-8")
+
+    for needle in (
+        "grant usage on schema extensions to taa_app;",
+        "alter database postgres set search_path = public, extensions;",
+        "aws-0-eu-west-1.pooler.supabase.com",
+        "sslmode=require",
+        "taa_app",
+        "14 conexiones",
+        "plan Pro",
+        "se pausa",
+        "no tiene copias",
+    ):
+        assert needle.lower() in runbook.lower(), f"the runbook does not mention {needle!r}"
+
+    assert "gcloud sql" not in runbook, "the runbook still prescribes Cloud SQL commands"
 
 
 def test_the_teardown_check_can_fail() -> None:
@@ -816,7 +846,8 @@ def test_the_environment_check_can_fail() -> None:
 FREE_VALIDATIONS = (
     "services enable",
     "validate_deploy_env.py",
-    "check_pool_budget.py --max-connections",
+    "check_pool_budget.py --pooler-max-connections",
+    "check_database.py --database-url-file",
     "docker build",
     "audit_image.py --image",
 )
@@ -862,43 +893,53 @@ def test_the_ordering_check_can_fail() -> None:
     assert len(problems) == len(FREE_VALIDATIONS), problems
 
 
-def test_the_pre_create_pool_gate_needs_no_database(secrets_dir: pathlib.Path) -> None:
-    """Step 8 used to demand the Cloud SQL socket DSN from the operator's machine and always fail.
+def test_the_pre_create_pool_gate_is_pure_arithmetic_against_the_pooler() -> None:
+    """The gate is a declared pooler ceiling and the deployed pool sizes — no database needed.
 
-    The pre-create gate is pure arithmetic against the tier's *documented* default; the live
-    measurement is a separate, non-fatal step that needs an environment with socket access.
+    The previous database was Cloud SQL, and the gate demanded a `/cloudsql/…` socket DSN from the
+    operator's machine: it could never pass there, and it ran *after* the instance was created.
+    Supabase's binding limit (14, session mode) is a property of the provider plan, so it is
+    declared as an input and the arithmetic needs nothing but itself.
     """
 
     plan = run_deploy(extra_env={"TAA_ALLOWED_USER_IDS": "42"}).stdout
     pre_create = plan[: plan.index("repositories create")]
 
-    assert "check_pool_budget.py --max-connections" in pre_create
+    assert "check_pool_budget.py --pooler-max-connections" in pre_create
+    assert "--max-connections" not in pre_create, "the Cloud SQL ceiling is gone"
     assert "--database-sync-url-file" not in pre_create, (
-        "the pre-create gate must not need a database the operator's machine cannot reach"
+        "the pre-create gate must not need a database"
     )
 
-    # Behavioural: the arithmetic gate really does pass and really can fail, with no database.
-    def pool_gate(max_connections: str) -> int:
+    # Behavioural: the deployed values fit, the application defaults do not.
+    def pool_gate(*extra: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [
-                sys.executable,
-                str(REPO / "scripts" / "check_pool_budget.py"),
-                "--max-connections",
-                max_connections,
-                "--concurrent-processes",
-                "6",
-                "--reserve",
-                "5",
-            ],
+            [sys.executable, str(REPO / "scripts" / "check_pool_budget.py"), *extra],
+            cwd=REPO,
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
             timeout=120,
-        ).returncode
+        )
 
-    assert pool_gate("100") == 0
-    assert pool_gate("25") == 1
+    deployed = pool_gate(
+        "--pooler-max-connections", "14",
+        "--db-pool-size", "2",
+        "--checkpointer-pool-size", "1",
+        "--concurrent-processes", "4",
+        "--reserve", "2",
+    )
+    assert deployed.returncode == 0, deployed.stdout + deployed.stderr
+    too_big = pool_gate(
+        "--pooler-max-connections", "14",
+        "--db-pool-size", "4",
+        "--checkpointer-pool-size", "3",
+        "--concurrent-processes", "4",
+        "--reserve", "2",
+    )
+    assert too_big.returncode == 1, too_big.stdout + too_big.stderr
+    assert "EMAXCONNSESSION" in too_big.stdout, too_big.stdout
 
 
 # --------------------------------------------------------------------------- #
@@ -1123,7 +1164,7 @@ def test_from_step_skips_both_the_printing_and_the_execution(
     # `secrets versions list` DOES run: it is a free read whose result steps 11-13 need, and
     # skipping it is what used to pin version 1 (see the B-1 tests below).
     # ...and step 8 onwards did run.
-    assert any("sql instances describe" in line for line in commands), commands
+    assert any("add-iam-policy-binding" in line for line in commands), commands
 
 
 def test_the_from_step_flag_rejects_nonsense() -> None:
@@ -1215,7 +1256,7 @@ def test_resuming_still_runs_the_free_checks(
     assert "[SIEMPRE: las comprobaciones gratis no se omiten]" in result.stdout
     recorded = marker.read_text(encoding="utf-8")
     assert "validate_deploy_env.py" in recorded, "the resumed run skipped the environment validation"
-    assert "check_pool_budget.py --max-connections" in recorded, (
+    assert "check_pool_budget.py --pooler-max-connections" in recorded, (
         "the resumed run skipped the connection arithmetic"
     )
 
@@ -1400,6 +1441,50 @@ def test_every_gcloud_command_printed_in_a_note_carries_the_project() -> None:
     assert missing == [], f"a printed command would land in the wrong project: {missing}"
 
 
+EXECUTING_IN_TEXT = re.compile(r"(?<!\\)\$\(")
+
+
+def executing_text_problems(source: str) -> list[str]:
+    """Lines whose `note`/`step`/`run` **string** would execute something when printed.
+
+    Two real incidents, same class: a backtick around `gcloud run deploy` inside a `note` ran it;
+    a `$(cat <secret file>)` in a migrations note printed a secret into the plan. Both were text
+    meant for the operator, and both executed. Escaped (`\$(…)`) is fine — that is how a command
+    is *documented* without running it.
+    """
+
+    problems: list[str] = []
+    for line in source.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith(("note ", "step ", "run ")):
+            continue
+        if '"' not in stripped:
+            continue
+        text = stripped[stripped.index('"') + 1 : stripped.rindex('"')]
+        if "`" in text:
+            problems.append(f"backtick in a printed string: {stripped[:90]}")
+        if EXECUTING_IN_TEXT.search(text):
+            problems.append(f"unescaped $( in a printed string: {stripped[:90]}")
+    return problems
+
+
+def test_no_shell_string_can_execute_a_command_by_accident() -> None:
+    """The guard that was lost in a test-file splice, and that the migrations note would have hit."""
+
+    problems = executing_text_problems(DEPLOY.read_text(encoding="utf-8"))
+
+    assert problems == [], problems
+
+
+def test_the_execution_guard_can_fail() -> None:
+    """**The companion**: both shapes are caught, and the escaped form is not."""
+
+    assert executing_text_problems('note "  run `gcloud run deploy`"') != []
+    assert executing_text_problems('note "  export X=$(cat secret)"') != []
+    assert executing_text_problems('note "  export X=\$(cat secret)"') == []
+    assert executing_text_problems('note "usa ${PROJECT} y ${SECRETS_DIR}"') == []
+
+
 def test_the_note_command_scan_can_fail() -> None:
     assert gcloud_commands_inside_notes(
         'note "  gcloud alpha monitoring policies create --channels=X"\n'
@@ -1426,7 +1511,7 @@ def test_the_executed_webhook_call_carries_the_resolved_url(
     existing_shims(shims, marker)
 
     result = run_deploy(
-        ["--yes-i-have-approval", "--from-step", "16"],
+        ["--yes-i-have-approval", "--from-step", "14"],
         shim_dir=shims,
         secrets_dir=secrets_dir,
         extra_env={"TAA_ALLOWED_USER_IDS": "42"},
@@ -1466,17 +1551,20 @@ def test_the_pool_gate_uses_the_deployment_defaults_not_the_operators_env() -> N
     """`check_pool_budget.py` read pool sizes from the local `Settings()`, i.e. from `.env`."""
 
     plan = run_deploy(extra_env={"TAA_ALLOWED_USER_IDS": "42"}).stdout
-    assert "--use-app-defaults" in plan
+    # The deploy passes the pool sizes **explicitly** (they are what the containers get), so there
+    # is no `.env` to read in the first place.
+    assert "--db-pool-size" in plan and "--checkpointer-pool-size" in plan
 
     def pool_gate(extra_env: dict[str, str]) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [
                 sys.executable,
                 str(REPO / "scripts" / "check_pool_budget.py"),
-                "--max-connections", sql_max_connections(),
-                "--concurrent-processes", "6",
-                "--reserve", "5",
-                "--use-app-defaults",
+                "--pooler-max-connections", pooler_max_connections(),
+                "--db-pool-size", deployed_pool("DB_POOL_SIZE"),
+                "--checkpointer-pool-size", deployed_pool("CHECKPOINTER_POOL_SIZE"),
+                "--concurrent-processes", "4",
+                "--reserve", "2",
             ],
             cwd=REPO,
             env={**os.environ, **extra_env, "PYTHONIOENCODING": "utf-8"},
@@ -1488,31 +1576,236 @@ def test_the_pool_gate_uses_the_deployment_defaults_not_the_operators_env() -> N
         )
 
     assert pool_gate({}).returncode == 0
-    # A hostile `.env` (or exported variable) must not change the answer: the containers get the
-    # application defaults, so the arithmetic has to describe those.
+    # A hostile `.env` (or exported variable) must not change the answer: the pools are passed
+    # explicitly, so the arithmetic describes the deployment and not this machine.
     hostile = pool_gate({"DB_POOL_SIZE": "99", "CHECKPOINTER_POOL_SIZE": "99"})
     assert hostile.returncode == 0, (
-        "the gate picked up the operator's environment instead of the deployment's defaults: "
+        "the gate picked up the operator's environment instead of the deployment's values: "
         f"{hostile.stdout} {hostile.stderr}"
     )
 
 
-def sql_max_connections() -> str:
+def pooler_max_connections() -> str:
     """Read from the script, so the test cannot drift from the deployed value."""
 
     match = re.search(
-        r'SQL_MAX_CONNECTIONS="\$\{TAA_SQL_MAX_CONNECTIONS:-(\d+)\}"',
+        r'POOLER_MAX_CONNECTIONS="\$\{TAA_POOLER_MAX_CONNECTIONS:-(\d+)\}"',
         DEPLOY.read_text(encoding="utf-8"),
     )
-    assert match, "precondition: the script must declare SQL_MAX_CONNECTIONS with a default"
+    assert match, "precondition: the script must declare POOLER_MAX_CONNECTIONS with a default"
     return match.group(1)
 
 
-def test_the_test_reads_the_pool_ceiling_from_the_script() -> None:
-    """The gate test hardcoded 100; drift between the script and the test would be invisible."""
+def deployed_pool(name: str) -> str:
+    match = re.search(
+        rf'{name}="\$\{{TAA_{name}:-(\d+)\}}"', DEPLOY.read_text(encoding="utf-8")
+    )
+    assert match, f"precondition: the script must declare {name} with a default"
+    return match.group(1)
 
-    assert sql_max_connections().isdigit()
-    assert int(sql_max_connections()) >= 50
+
+def test_the_test_reads_the_pooler_ceiling_from_the_script() -> None:
+    """A hardcoded 14 would not notice the script changing; a hardcoded 100 once hid a 4x error."""
+
+    assert pooler_max_connections() == "14"
+    assert int(deployed_pool("DB_POOL_SIZE")) + int(deployed_pool("CHECKPOINTER_POOL_SIZE")) == 3, (
+        "the deployed pools must total 3 per process for the 4-process arithmetic to fit 14"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# The Supabase decision (2026-10-18): Cloud SQL is gone, the pooler is the limit
+# --------------------------------------------------------------------------- #
+CLOUD_SQL_MARKERS = (
+    "gcloud sql",
+    "--add-cloudsql-instances",
+    "/cloudsql/",
+    "roles/cloudsql.client",
+    "SHOW max_connections",
+)
+
+
+def cloud_sql_problems(source: str) -> list[str]:
+    """Every Cloud SQL remnant in the plan. Shared with the companion, so it drives the predicate."""
+
+    return [marker for marker in CLOUD_SQL_MARKERS if marker in source]
+
+
+def test_cloud_sql_is_gone_from_the_deployment() -> None:
+    """The database is Supabase: no instance, no socket, no Cloud SQL IAM, no server-side probe."""
+
+    plan = run_deploy(extra_env={"TAA_ALLOWED_USER_IDS": "42"}).stdout
+
+    assert cloud_sql_problems(plan) == [], cloud_sql_problems(plan)
+    assert cloud_sql_problems(DEPLOY.read_text(encoding="utf-8")) == []
+
+
+def test_the_cloud_sql_removal_check_can_fail() -> None:
+    """**The companion**: the pre-decision plan is rejected by the same predicate."""
+
+    old_plan = (
+        "gcloud sql instances create taa-prod-pg --project telegram-assistant-esteban\n"
+        "gcloud run deploy taa-prod-api --add-cloudsql-instances=telegram-assistant-esteban:"
+        "europe-west1:taa-prod-pg\n"
+        "  postgresql+psycopg://taa:pw@/taa?host=/cloudsql/telegram-assistant-esteban:europe-west1:taa-prod-pg\n"
+        "gcloud projects add-iam-policy-binding P --role=roles/cloudsql.client\n"
+        "python scripts/check_pool_budget.py --measure SHOW max_connections\n"
+    )
+    assert len(cloud_sql_problems(old_plan)) == len(CLOUD_SQL_MARKERS), cloud_sql_problems(old_plan)
+
+
+def test_one_instance_because_the_pooler_allows_no_more() -> None:
+    """`--max-instances=1` is a consequence of the 14-connection ceiling, not a cost choice."""
+
+    plan = run_deploy(extra_env={"TAA_ALLOWED_USER_IDS": "42"}).stdout
+
+    assert "--max-instances=1" in plan
+    assert "--max-instances=3" not in plan, "three instances could not fit the pooler"
+
+
+def test_the_deployed_pools_are_the_ones_the_gate_checks() -> None:
+    """The gate's numbers must be the environment the containers actually get.
+
+    The application defaults (DB_POOL_SIZE=4, CHECKPOINTER_POOL_SIZE=3) are 7 x 4 + 2 = 30 against
+    a pooler of 14; if the deploy did not pass the sizes explicitly, the gate would describe a
+    deployment that is not the one being created.
+    """
+
+    from scripts.validate_deploy_env import parse_dump
+
+    components = parse_dump(deploy_env_dump())
+    environment = dict(components["service"]["env"])
+    plan = run_deploy(extra_env={"TAA_ALLOWED_USER_IDS": "42"}).stdout
+
+    assert environment["DB_POOL_SIZE"] == deployed_pool("DB_POOL_SIZE")
+    assert environment["CHECKPOINTER_POOL_SIZE"] == deployed_pool("CHECKPOINTER_POOL_SIZE")
+    assert f"--db-pool-size {environment['DB_POOL_SIZE']}" in plan
+    assert f"--checkpointer-pool-size {environment['CHECKPOINTER_POOL_SIZE']}" in plan
+
+
+def test_the_connection_check_reads_the_dsn_from_a_file() -> None:
+    """The Supabase DSN carries the password; it must not travel in argv."""
+
+    plan = run_deploy(extra_env={"TAA_ALLOWED_USER_IDS": "42"}).stdout
+    section = plan[: plan.index("repositories create")]
+
+    assert "check_database.py --database-url-file" in section
+    assert "--database-url " not in section, "the DSN must not be passed on the command line"
+
+
+def test_the_database_checks_are_right() -> None:
+    """`check_database.py` against a fake connection: every failure mode is a finding."""
+
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "check_database", REPO / "scripts" / "check_database.py"
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    # A `@dataclass` in a module that is not in `sys.modules` makes dataclasses raise
+    # `AttributeError: 'NoneType' object has no attribute '__dict__'` — register it first.
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    class Result:
+        def __init__(self, scalar=None, row=None) -> None:
+            self.scalar = scalar
+            self.row = row
+
+        def scalar_one_or_none(self):
+            return self.scalar
+
+        def one(self):
+            return self.row
+
+    class Fake:
+        def __init__(self, responses: dict[str, object]) -> None:
+            self.responses = responses
+
+        def execute(self, statement):  # noqa: ANN001, ANN201 - the surface `checks` uses
+            sql = str(statement)
+            for needle, response in self.responses.items():
+                if needle in sql:
+                    if isinstance(response, Exception):
+                        raise response
+                    return response
+            return Result()
+
+    healthy = Fake(
+        {
+            "SELECT 1": Result(scalar=1),
+            "extversion": Result(scalar="0.8.2"),
+            "n.nspname": Result(scalar="extensions"),
+            "'[1,2,3]'::vector": Result(scalar="[1,2,3]"),
+            "current_setting": Result(scalar="off"),
+            "pg_roles": Result(row=("taa_app", False, False, False)),
+        }
+    )
+    assert [check.name for check in module.checks(healthy) if not check.ok] == []
+
+    old_vector = Fake(
+        {
+            "SELECT 1": Result(scalar=1),
+            "extversion": Result(scalar="0.7.4"),
+            "n.nspname": Result(scalar="extensions"),
+            "'[1,2,3]'::vector": Result(scalar="[1,2,3]"),
+            "current_setting": Result(scalar=None),
+            "pg_roles": Result(row=("taa_app", False, False, False)),
+        }
+    )
+    failed = [check.name for check in module.checks(old_vector) if not check.ok]
+    assert any("0.8" in name for name in failed), failed
+    assert any("iterative" in name for name in failed), failed
+
+    wrong_schema = Fake(
+        {
+            "SELECT 1": Result(scalar=1),
+            "extversion": Result(scalar="0.8.2"),
+            "n.nspname": Result(scalar="public"),
+            "'[1,2,3]'::vector": Result(scalar="[1,2,3]"),
+            "current_setting": Result(scalar="off"),
+            "pg_roles": Result(row=("taa_app", False, False, False)),
+        }
+    )
+    assert any(
+        check.name == "esquema de vector" and not check.ok for check in module.checks(wrong_schema)
+    )
+
+    unresolved = Fake(
+        {
+            "SELECT 1": Result(scalar=1),
+            "extversion": Result(scalar="0.8.2"),
+            "n.nspname": Result(scalar="extensions"),
+            "'[1,2,3]'::vector": RuntimeError("type vector does not exist"),
+            "current_setting": Result(scalar="off"),
+            "pg_roles": Result(row=("taa_app", False, False, False)),
+        }
+    )
+    assert any(
+        check.name.startswith("vector resuelve") and not check.ok
+        for check in module.checks(unresolved)
+    )
+
+    superuser = Fake(
+        {
+            "SELECT 1": Result(scalar=1),
+            "extversion": Result(scalar="0.8.2"),
+            "n.nspname": Result(scalar="extensions"),
+            "'[1,2,3]'::vector": Result(scalar="[1,2,3]"),
+            "current_setting": Result(scalar="off"),
+            "pg_roles": Result(row=("postgres", True, True, True)),
+        }
+    )
+    assert any("sin privilegios" in check.name and not check.ok for check in module.checks(superuser))
+
+    unreachable = Fake({"SELECT 1": RuntimeError("connection refused")})
+    problems = module.checks(unreachable)
+    assert len(problems) == 1 and not problems[0].ok, problems
+
+    assert module.parse_version("0.8.2") == (0, 8, 2)
+    assert module.version_at_least("0.8.0", (0, 8)) is True
+    assert module.version_at_least("0.7.9", (0, 8)) is False
 
 
 # --------------------------------------------------------------------------- #

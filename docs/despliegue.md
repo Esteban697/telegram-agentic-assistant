@@ -12,10 +12,13 @@ cada comando de este documento lleva `--project telegram-assistant-esteban`, y p
 `CLOUDSDK_CORE_PROJECT`. Lo comprueba `tests/unit/test_deploy_artifacts.py`, que recorre el script:
 no es una convención que haya que recordar.
 
-> **Estado actual del proyecto (2026-10-17).** Ya existen, creados **a mano y con aprobación**: las
+> **Estado actual del proyecto (2026-10-18).** Ya existen, creados **a mano y con aprobación**: las
 > APIs habilitadas, el repositorio `taa-prod-images`, las dos cuentas de servicio, el bucket
-> `taa-prod-documents` con su binding, y la imagen publicada. **No** existe todavía ninguna
-> instancia de Cloud SQL, ningún servicio de Cloud Run, ningún job ni ningún schedule.
+> `taa-prod-documents` con su binding, y la imagen publicada. **La base de datos ya está
+> provisionada y migrada en Supabase** (PostgreSQL 17.11 + pgvector 0.8.2, alembic `0007`,
+> 12 tablas de aplicación y 4 del checkpointer). **No** existe todavía ningún servicio de Cloud Run,
+> ningún job ni ningún schedule. **Cloud SQL ya no forma parte del despliegue**: la decisión de
+> 2026-10-18 lo sustituyó por Supabase.
 >
 > Este runbook y `scripts/deploy.sh` son **idempotentes**: cada creación va precedida de su
 > comprobación, así que volver a ejecutarlos sobre lo que ya existe no hace nada (y no produce el
@@ -30,13 +33,15 @@ no es una convención que haya que recordar.
 
 ## 1. Antes de aprobar nada: el coste
 
-Spec §1 y §13: **no se crea ningún recurso facturable sin aprobación explícita**. El recurso caro
-es **Cloud SQL**, y no escala a cero: existe y se factura mientras exista. Los demás son céntimos o
-cero a este volumen.
+Spec §1 y §13: **no se crea ningún recurso facturable sin aprobación explícita**. El recurso con
+coste fijo es **Supabase**, que ya está provisionado (no lo crea este despliegue): en el plan
+gratuito **se pausa** por inactividad y **no tiene copias de seguridad**, así que para un asistente
+personal que debe responder a cualquier hora la recomendación es el **plan Pro**. Los demás
+recursos son céntimos o cero a este volumen.
 
 | Recurso | Nombre | ¿Facturable? | Coste |
 |---|---|---|---|
-| Cloud SQL PostgreSQL 17 + pgvector | `taa-prod-pg` | **Sí — el dominante** | **pendiente de confirmar** |
+| **Supabase** (PostgreSQL 17.11 + pgvector 0.8.2) | proyecto del usuario, pooler `aws-0-eu-west-1.pooler.supabase.com:5432` | **Sí — coste fijo mensual** | **pendiente de confirmar**; **recomendado el plan Pro** (el gratuito se pausa y no tiene backups) |
 | Cloud Run Service (webhook) | `taa-prod-api` | Sí, por petición y por CPU/memoria-segundo; 0 en reposo (`min-instances=0`) | pendiente de confirmar |
 | Cloud Run Jobs ×3 | `taa-prod-job-reminders`, `-job-documents`, `-job-resume` | Sí, por ejecución | pendiente de confirmar |
 | Cloud Scheduler ×3 | `<job>-tick` | 3 jobs/mes dentro del nivel gratuito | 0 con estas cadencias |
@@ -54,36 +59,32 @@ memoria» (spec §1.4 aplica el mismo criterio a las integraciones). Durante est
 `https://cloud.google.com/sql/pricing` y la página no devolvió datos de precios utilizables, así que
 **no se cita ninguna cifra**. Antes de aprobar, confirma cada línea en:
 
-- Cloud SQL: <https://cloud.google.com/sql/pricing> (y la calculadora de la misma página)
+- Supabase: <https://supabase.com/pricing> (y la calculadora de la propia página)
 - Cloud Run y Jobs: <https://cloud.google.com/run/pricing>
 - Artifact Registry: <https://cloud.google.com/artifact-registry/pricing>
 - Cloud Storage: <https://cloud.google.com/storage/pricing>
 - Secret Manager: <https://cloud.google.com/secret-manager/pricing>
 - Cloud Scheduler: <https://cloud.google.com/scheduler/pricing>
 
-> Referencia **no verificada** (una búsqueda devolvió, de una fuente secundaria de octubre de 2026,
-> que el tier `db-custom-1-3840` en `europe-west1` cuesta del orden de 49 USD/mes de cómputo y unos
-> 51 USD/mes con 10 GB de SSD). Se incluye solo como punto de partida para la conversación de
-> coste: **no la uses para aprobar**. La cifra oficial es la de la calculadora.
-
-El tier recomendado por §11.2 es `db-custom-1-3840` (1 vCPU / 3,75 GB, `max_connections` por defecto
-100). El motivo no es el rendimiento, es el **aritmético de conexiones**:
+**El límite que manda es el del pooler, no el del servidor.** El proyecto está detrás de
+**Supavisor en modo sesión, puerto 5432** (IPv4: Cloud Run no tiene salida IPv6, así que el host
+directo no sirve), y ese modo admite **14 conexiones de cliente** — medido: de la 1 a la 14 entran
+en ~0,3 s, y la 15 falla al instante con `EMAXCONNSESSION`. El `max_connections` del servidor es 60 y
+es irrelevante aquí: dimensionar contra 60 sobresuscribe el pooler cuatro veces.
 
 ```
-(DB_POOL_SIZE + CHECKPOINTER_POOL_SIZE) × procesos concurrentes ≤ max_connections − 5
-(4            + 3                     ) × (3 instancias + 3 jobs = 6)  =  42   ≤  100 − 5 = 95  ✔
+(DB_POOL_SIZE + CHECKPOINTER_POOL_SIZE) × procesos concurrentes + reserva ≤ 14
+(2            + 1                     ) × (1 servicio + 3 jobs = 4)   + 2      = 14  ✔
 ```
 
-El **paso 0** comprueba el aritmético contra el `max_connections` **documentado** del tier
-(`scripts/check_pool_budget.py --max-connections 100 --use-app-defaults`) y **se niega a seguir** si
-no cabe, imprimiendo las dos salidas (subir el tier o bajar los pools a 2+2). Se hace **antes de
-crear nada**: sobresuscribir un pool no es una lentitud, los últimos procesos en arrancar reciben
-`too many clients already` y su trabajo falla.
+`--max-instances=1` **es obligatorio**, no una elección de coste: con más instancias el producto no
+cabe. Los pools desplegados son `DB_POOL_SIZE=2` y `CHECKPOINTER_POOL_SIZE=1`, y se pasan
+explícitamente en `--set-env-vars` (los defectos de la aplicación, 4 y 3, darían 7 × 4 + 2 = 30).
 
-La medición **real** (`SHOW max_connections`) es el paso 9, y es **no fatal**: necesita una conexión
-desde dentro de la VPC (o el Cloud SQL Auth Proxy), que la máquina del operador normalmente no
-tiene. Si no puede medir, avisa y sigue — pero después de crear Cloud SQL, así que no es la puerta:
-la puerta es el paso 0.
+El **paso 0** comprueba el aritmético contra `TAA_POOLER_MAX_CONNECTIONS` (14 por defecto) con
+`scripts/check_pool_budget.py` y **se niega a seguir** si no cabe, diciendo cuánto puede sumar cada
+proceso. Se hace **antes de crear nada**: el pooler no espera, la conexión 15 es un fallo inmediato
+en el arranque, no una lentitud.
 
 ---
 
@@ -111,6 +112,36 @@ Y hay que exportar la lista de usuarios autorizados, o el despliegue **se niega 
 ```bash
 export TAA_ALLOWED_USER_IDS=123456789    # tu id numérico de Telegram, separados por comas si hay varios
 ```
+
+### Supabase: lo que ya está hecho y lo que hay que saber
+
+El proyecto de Supabase **ya está provisionado y migrado**, y estas son sus propiedades (medidas,
+no supuestas):
+
+- pooler **Supavisor en modo sesión, puerto 5432** (`aws-0-eu-west-1.pooler.supabase.com`), IPv4 —
+  Cloud Run no tiene salida IPv6, así que el host directo no se puede usar;
+- PostgreSQL **17.11**, pgvector **0.8.2** (por tanto `hnsw.iterative_scan` existe);
+- **TLS obligatorio**: la DSN lleva `sslmode=require`;
+- rol de aplicación **`taa_app`** (`LOGIN`, no superusuario, sin `createdb` ni `createrole`), dueño
+  de las tablas de la aplicación y con `USAGE`+`CREATE` en `public`;
+- `vector` está instalado en el esquema **`extensions`**, no en `public`.
+
+En un proyecto Supabase **nuevo**, esas dos últimas cosas no vienen así. Hay que ejecutar, como
+administrador del proyecto:
+
+```sql
+grant usage on schema extensions to taa_app;
+alter database postgres set search_path = public, extensions;
+```
+
+y **reconectar** después (el `search_path` de base de datos se aplica a las conexiones nuevas). Sin
+esto el despliegue no falla al arrancar: falla en el primer embedding, con un `type "vector" does not
+exist` que no dice nada de la causa. Por eso `scripts/check_database.py` lo comprueba antes de crear
+nada.
+
+**Plan y copias:** en el plan **gratuito** el proyecto **se pausa** por inactividad y **no tiene
+copias de seguridad**. Para un asistente que debe responder a cualquier hora, y para tener un camino
+de restauración, la recomendación es el **plan Pro** (copias diarias).
 
 ---
 
@@ -145,7 +176,7 @@ bash scripts/deploy.sh --dump-env               # el entorno exacto de cada comp
 
 | # | Paso del script | Recurso | Coste |
 |---|---|---|---|
-| 0 | comprobaciones previas: intérprete, ficheros de secreto, `TAA_ALLOWED_USER_IDS`, **validación de la aplicación** y **aritmético de conexiones** | ninguno | sin coste |
+| 0 | comprobaciones previas: intérprete, ficheros de secreto, `TAA_ALLOWED_USER_IDS`, **validación de la aplicación**, **aritmético de conexiones** y **conectividad + esquema de Supabase** | ninguno | sin coste |
 | 1 | `gcloud services enable …` | habilita las APIs | gratis; habilita lo facturable de después |
 | 2 | `docker build` | la imagen, en local | gratis |
 | 3 | `scripts/audit_image.py --self-test` + `--image` | auditoría de secretos | sin coste |
@@ -153,16 +184,17 @@ bash scripts/deploy.sh --dump-env               # el entorno exacto de cada comp
 | 5 | `iam service-accounts create` ×2 | `taa-prod-runtime`, `taa-prod-scheduler` | gratis |
 | 6 | `secrets create` ×4 + `versions add` + resolver versión | 4 secretos | pendiente de confirmar |
 | 7 | `storage buckets create` + binding | bucket privado | pendiente de confirmar |
-| 8 | `sql instances create` (+ database, user, password) | Cloud SQL 17 | **el dominante**; pendiente de confirmar |
-| 9 | `check_pool_budget.py --database-sync-url-file` | medición real de `max_connections` (no fatal) | gratis |
-| 10 | `add-iam-policy-binding` (cloudsql, aiplatform, secretos, jobs) | IAM mínimo | gratis |
-| 11 | `run deploy taa-prod-api` | Cloud Run Service | pendiente de confirmar |
-| 12 | `run jobs create` ×3 | los tres jobs | pendiente de confirmar |
-| 13 | `scheduler jobs create http` ×3 | los tres disparadores | 0 (nivel gratuito) |
-| 14 | `logging metrics create` | métrica de errores | gratis hasta la franquicia |
-| 15 | `migrate.py upgrade head` | esquema y tablas del checkpointer | sin coste adicional |
-| 16 | resuelve la URL y ejecuta `set_webhook.py --set` | registro del webhook | gratis |
-| 17 | `set_webhook.py --info` + `curl /readyz` | comprobación de (a) y (d) | gratis |
+| 8 | `add-iam-policy-binding` (aiplatform, secretos, jobs) | IAM mínimo | gratis |
+| 9 | `run deploy taa-prod-api` (con `--max-instances=1`) | Cloud Run Service | pendiente de confirmar |
+| 10 | `run jobs create` ×3 | los tres jobs | pendiente de confirmar |
+| 11 | `scheduler jobs create http` ×3 | los tres disparadores | 0 (nivel gratuito) |
+| 12 | `logging metrics create` | métrica de errores | gratis hasta la franquicia |
+| 13 | `migrate.py upgrade head` | esquema y tablas del checkpointer | sin coste adicional |
+| 14 | resuelve la URL y ejecuta `set_webhook.py --set` | registro del webhook | gratis |
+| 15 | `set_webhook.py --info` + `curl /readyz` | comprobación de (a) y (d) | gratis |
+
+Cloud SQL **no aparece**: la base de datos es Supabase y ya está provisionada, así que el
+despliegue no crea una instancia. El paso 0 comprueba su conectividad y su esquema.
 
 La salida completa, comando por comando, está en el informe de la fase.
 
@@ -177,7 +209,7 @@ La salida completa, comando por comando, está en el informe de la fase.
 ~/.taa/secrets/telegram-bot-token        # el token de @BotFather
 ~/.taa/secrets/telegram-webhook-secret   # 1-256 caracteres de [A-Za-z0-9_-]
 ~/.taa/secrets/ollama-api-key            # la clave de Ollama Cloud
-~/.taa/secrets/database-url              # la DSN del socket de Cloud SQL
+~/.taa/secrets/database-url              # la DSN de Supabase (pooler, TLS)
 ```
 
 **Cuatro ficheros, no cinco.** Un solo secreto sirve para `DATABASE_URL` y `DATABASE_SYNC_URL`
@@ -191,41 +223,29 @@ autorizado, y no lo montaba nadie:
 gcloud secrets delete taa-prod-checkpoint-url --project telegram-assistant-esteban
 ```
 
-### La contraseña de Cloud SQL
+### La DSN de Supabase
 
-El paso 8 la fija con `--prompt-for-password`, que la lee del terminal y no la pone nunca en argv.
-Si vas a necesitarla otra vez (para reconstruir la DSN, por ejemplo), guárdala tú antes de
-escribirla, en un fichero de modo 600 que **tú** creas:
+El fichero `database-url` contiene la DSN del **pooler**, con el rol de aplicación y TLS:
+
+```
+postgresql+psycopg://taa_app.<project-ref>:<PASSWORD>@aws-0-eu-west-1.pooler.supabase.com:5432/postgres?sslmode=require
+```
+
+`sslmode=require` **no es opcional** y el host es el del **pooler** (no el directo): Cloud Run no
+tiene salida IPv6, y el host directo de Supabase es IPv6. Escríbela en un fichero de modo 600 sin
+que la contraseña entre en el historial:
 
 ```bash
 umask 077
-read -r -s -p 'contraseña de Cloud SQL para el usuario taa: ' SQL_PASSWORD; echo
-printf '%s' "$SQL_PASSWORD" > ~/.taa/sql-password
+read -r -s -p 'contraseña del rol taa_app: ' SQL_PASSWORD; echo
+printf 'postgresql+psycopg://taa_app.<project-ref>:%s@aws-0-eu-west-1.pooler.supabase.com:5432/postgres?sslmode=require' \
+  "$SQL_PASSWORD" > ~/.taa/secrets/database-url
 unset SQL_PASSWORD
 ```
 
-La DSN del socket tiene esta forma (confirmada localmente: SQLAlchemy la analiza y psycopg recibe
-`host=/cloudsql/…`, ver Apéndice B.5 de PLAN.md):
-
-```
-postgresql+psycopg://taa:<PASSWORD>@/taa?host=/cloudsql/telegram-assistant-esteban:europe-west1:taa-prod-pg
-```
-
-Créala sin que la contraseña entre en el historial:
-
-```bash
-umask 077
-python - <<'PY' > ~/.taa/secrets/database-url
-import pathlib
-password = pathlib.Path.home().joinpath(".taa/sql-password").read_text().strip()
-print(
-    "postgresql+psycopg://taa:%s@/taa?host=/cloudsql/"
-    "telegram-assistant-esteban:europe-west1:taa-prod-pg" % password
-)
-PY
-```
-
-El mismo valor que guardaste en `~/.taa/sql-password` es el que hay que teclear en ese prompt.
+Ese mismo valor es el que hay que tener a mano para `scripts/migrate.py` (§5). El pooler se abre en
+**modo sesión**; el modo transacción no sirve para este proyecto (el checkpointer y el
+`SET LOCAL hnsw.iterative_scan` necesitan una sesión de verdad).
 
 ### Rotación
 
@@ -250,18 +270,13 @@ gcloud run services update taa-prod-api \
 Nunca automáticas al arrancar en producción (`MIGRATIONS_AUTORUN=false`): un arranque de la
 aplicación no puede ser lo que cambia el esquema (PLAN.md §11.6).
 
-**Esto es el paso 15 de `scripts/deploy.sh`**, no un apunte suelto: sin él `/readyz` responde 503 y
-no hay tablas. Necesita acceso a Cloud SQL, y desde la máquina del operador eso significa el Cloud
-SQL Auth Proxy en marcha apuntando a la instancia:
+**Esto es el paso 13 de `scripts/deploy.sh`**, no un apunte suelto: sin él `/readyz` responde 503 y
+no hay tablas. La base de datos es Supabase y se alcanza por **TCP con TLS** desde cualquier sitio
+que tenga salida a internet, así que no hay proxy que montar:
 
 ```bash
-cloud-sql-proxy telegram-assistant-esteban:europe-west1:taa-prod-pg --port 5432 &
-
-# La DSN local (TCP al proxy), en un fichero de modo 600 — nunca escrita en la línea de comandos.
-umask 077
-printf 'postgresql+psycopg://taa:%s@127.0.0.1:5432/taa' "$(cat ~/.taa/sql-password)" \
-  > ~/.taa/secrets/database-url-local
-export DATABASE_SYNC_URL="$(cat ~/.taa/secrets/database-url-local)"
+# La DSN ya está en el fichero del §4; se exporta solo para este comando, sin pasar por argv.
+export DATABASE_SYNC_URL="$(cat ~/.taa/secrets/database-url)"
 
 python scripts/migrate.py current                       # dónde estamos
 python scripts/migrate.py upgrade head                  # aplicar
@@ -272,9 +287,12 @@ Ese `export` es **local y transitorio**: `migrate.py` lee su configuración del 
 de "un secreto nunca viaja como argumento" se cumple igual — el valor no pasa por `argv`, ni por el
 historial, ni por `ps`.
 
-La alternativa sin proxy es ejecutar el mismo comando **dentro de la VPC** (un Cloud Run Job de una
-sola vez con la misma imagen, `--command=python --args=-m,…`), que es lo que el plan §11.6 deja
-abierto: la decisión depende de si prefieres montar el proxy o crear un job efímero.
+**Ojo con el pooler mientras migras:** `migrate.py` abre una conexión, y el límite de Supavisor en
+modo sesión es 14. No lances migraciones y el servicio a la vez en un proyecto pequeño; si el
+pooler responde `EMAXCONNSESSION`, cierra sesiones y reintenta.
+
+La alternativa es ejecutar el mismo comando **dentro de Cloud Run** (un Cloud Run Job de una sola
+vez con la misma imagen, `--command=python --args=-m,…`), que es lo que el plan §11.6 deja abierto.
 
 `bootstrap_db.py` es idempotente y termina verificando: extensión `vector` ≥ 0,8, índice HNSW y
 exactamente una fila activa en `embedding_models`.
@@ -361,17 +379,20 @@ gcloud run jobs update taa-prod-job-reminders \
 ### Esquema — una migración destructiva no se "deshace"
 
 Las migraciones son hacia delante en la práctica. `scripts/migrate.py downgrade` **se niega** en
-producción sin `--i-have-a-backup`, y el camino honesto es restaurar la copia anterior:
+producción sin `--i-have-a-backup`, y el camino honesto es restaurar una copia.
 
-```bash
-gcloud sql backups list --instance=taa-prod-pg --project telegram-assistant-esteban
-gcloud sql backups restore <BACKUP_ID> --restore-instance=taa-prod-pg \
-  --project telegram-assistant-esteban
-```
+**No hay copias de Cloud SQL porque no hay Cloud SQL.** La restauración depende del plan de Supabase:
 
-**Antes de cualquier migración destructiva: toma una copia.** Cloud SQL las hace solo, pero la
-política de retención del MVP no se ha decidido (PLAN.md §13.7); hasta entonces, la copia manual es
-la única garantía, y una restauración pierde todo lo escrito desde la copia.
+- **Plan Pro**: Supabase hace **copias diarias** y se restauran desde el panel del proyecto
+  (*Database → Backups*). Es el camino de reversión documentado, y la razón principal por la que el
+  plan gratuito no basta para producción.
+- **Plan gratuito**: **no hay copias**. La única reversión es haber exportado el esquema y los datos
+  a mano (`pg_dump` a través del pooler, en modo sesión) antes de migrar. `migrate.py downgrade`
+  sigue negándose sin `--i-have-a-backup` porque esa bandera afirma algo que en este plan es falso.
+
+**Antes de cualquier migración destructiva: confirma que hay una copia.** Una restauración pierde
+todo lo escrito desde la copia; el `--i-have-a-backup` de `migrate.py` es una promesa del operador,
+no una comprobación.
 
 ### Webhook
 
@@ -388,18 +409,14 @@ o se registra la URL anterior con `--set --url`.
 El script no borra nada. Si hay que desmontar el despliegue, cada `create` tiene su `delete`, y
 **todos** llevan el proyecto explícito (lo comprueba
 `tests/unit/test_deploy_artifacts.py` sobre los bloques de código de este documento, para que nadie
-que copie y pegue se vaya al proyecto equivocado). **Cloud SQL es el único que sigue costando
-mientras exista**, así que es el primero en la lista si se quiere parar el gasto:
+que copie y pegue se vaya al proyecto equivocado). **La base de datos (Supabase) no está en esta lista**: no la crea el despliegue y
+desmontarla es un acto aparte (borrar el proyecto desde el panel de Supabase). Lo que sí queda aquí
+es todo lo que el despliegue crea en Google Cloud:
 
-La lista es **completa**: cada `create` de los pasos 4 a 14 tiene aquí su `delete`. Cloud SQL va
-primero porque es el único que sigue costando mientras exista.
+La lista es **completa para lo que el despliegue crea** (pasos 4–12): servicio, jobs,
+disparadores, bucket, secretos, imagen, cuentas de servicio, métrica y los bindings del paso 8.
 
 ```bash
-# Cloud SQL y sus datos — lo primero si se quiere parar el gasto
-gcloud sql users delete taa --instance=taa-prod-pg --project telegram-assistant-esteban
-gcloud sql databases delete taa --instance=taa-prod-pg --project telegram-assistant-esteban
-gcloud sql instances delete taa-prod-pg --project telegram-assistant-esteban
-
 # Service, jobs y schedules
 gcloud run services delete taa-prod-api --region=europe-west1 --project telegram-assistant-esteban
 gcloud run jobs delete taa-prod-job-reminders --region=europe-west1 --project telegram-assistant-esteban
@@ -427,14 +444,11 @@ gcloud iam service-accounts delete taa-prod-scheduler@telegram-assistant-esteban
 # Métrica de logs
 gcloud logging metrics delete taa-prod-errors --project telegram-assistant-esteban
 
-# Los bindings del paso 10 también se retiran: borrar el servicio o la cuenta de servicio NO
+# Los bindings del paso 8 también se retiran: borrar el servicio o la cuenta de servicio NO
 # limpia las políticas, y quedarían sobre un proyecto sin nada que las use.
 gcloud storage buckets remove-iam-policy-binding gs://taa-prod-documents \
   --member=serviceAccount:taa-prod-runtime@telegram-assistant-esteban.iam.gserviceaccount.com \
   --role=roles/storage.objectAdmin --project telegram-assistant-esteban
-gcloud projects remove-iam-policy-binding telegram-assistant-esteban \
-  --member=serviceAccount:taa-prod-runtime@telegram-assistant-esteban.iam.gserviceaccount.com \
-  --role=roles/cloudsql.client --project telegram-assistant-esteban
 gcloud projects remove-iam-policy-binding telegram-assistant-esteban \
   --member=serviceAccount:taa-prod-runtime@telegram-assistant-esteban.iam.gserviceaccount.com \
   --role=roles/aiplatform.user --project telegram-assistant-esteban
