@@ -182,5 +182,7 @@ despachador, y el límite de **14 conexiones** del pooler con `max-instances=1`.
 - **El "no hay evidencia" del modelo es una tasa medida, no una garantía**: 5/5 en la pregunta que
   recupera pasajes que no responden; en la totalmente ajena, 0/5 de consultas y 2–3/5 de fórmula de
   "no encuentro" (nunca cita ni inventa).
-- **La reversión no se ha ejercitado** (documentada, no ejecutada).
+- **La reversión de código se ejercitó** el 2026-10-18 (`00002` y vuelta a `00003`). El hallazgo fue
+  que `00002`, anterior al arreglo de `/health`, pierde esa ruta y solo conserva `/readyz` y el
+  webhook. La restauración del esquema no se ha ejercitado: el plan gratuito no tiene copias.
 - **El plan gratuito de Supabase se pausa y no tiene copias** (Pro recomendado).

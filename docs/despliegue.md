@@ -26,9 +26,10 @@ no es una convención que haya que recordar.
 > "already exists" con el que moría la primera versión del script). `--from-step N` reanuda a
 > mitad si algo falla.
 >
-> Los criterios (a), (d) y (e) siguen **pendientes**: hacen falta `TELEGRAM_BOT_TOKEN`,
-> `TELEGRAM_WEBHOOK_SECRET` y `TELEGRAM_ALLOWED_USER_IDS`, que son del usuario. (b) y (c) están
-> demostrados en local y se dice cómo. Ver §10 al final.
+> Los criterios de aceptación están casi todos demostrados: (a) y (c) en local, (d) contra el
+> servicio desplegado y (e) con el simulacro de reversión del §8 (el camino de código; la
+> restauración del esquema sigue dependiendo de una copia). (b) está demostrado por mitades: el
+> código es determinista y la mitad del modelo es una tasa medida. Ver `docs/informe-final.md`.
 
 ---
 
@@ -380,6 +381,27 @@ gcloud run jobs update taa-prod-job-reminders \
   --image=europe-west1-docker.pkg.dev/telegram-assistant-esteban/taa-prod-images/taa-prod-app:<TAG-ANTERIOR> \
   --region=europe-west1 --project telegram-assistant-esteban
 ```
+
+#### Simulacro ejercitado el 2026-10-18
+
+Se hizo el ciclo completo: 100 % del tráfico a `taa-prod-api-00002-g7q`, comprobaciones, y vuelta a
+`taa-prod-api-00003-k2s`. Resultados reales:
+
+| Paso | Comprobación | Resultado |
+|---|---|---|
+| Bajada a `00002` | `status.traffic` | 100 % `00002`, instantáneo |
+| `GET /readyz` en `00002` | base de datos + modelo activo | **200** `{"status":"ready"}` |
+| `POST /telegram/webhook` sin secreto en `00002` | el handler está vivo | **403**, cuerpo vacío |
+| Vuelta a `00003` | `status.traffic` | 100 % `00003` |
+| `GET /health` y `GET /readyz` en `00003` | liveness y readiness | **200** y **200** |
+| `set_webhook.py --info` | webhook tras el simulacro | `pending_update_count: 0`, sin `last_error_message` |
+
+**Hallazgo del simulacro:** `00002` es **anterior** al arreglo que añadió `/health`, así que en esa
+revisión `GET /health` devuelve **404** (y `/healthz` sigue interceptado por el frontend de Google).
+La revisión sí sirve: `/readyz` responde 200 y el webhook atiende, pero **pierde el alias de
+liveness**. Para una reversión real, apuntar a una revisión **posterior al arreglo** (`00003` o más)
+o usar `/readyz` como comprobación de vida. Volver a `00002` restaura el servicio, no la ruta de
+salud.
 
 ### Esquema — una migración destructiva no se "deshace"
 

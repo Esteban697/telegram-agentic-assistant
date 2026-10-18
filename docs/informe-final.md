@@ -26,7 +26,9 @@ Evidencia de extremo a extremo, producida **por el usuario** contra el sistema d
 - `/start` → `200` y `update handled`;
 - un mensaje normal → `turn prepared` → `model turn complete` → respuesta, ~**1,6 s**;
 - **un recordatorio creado y entregado** (Scheduler → Cloud Run Job → despachador → Telegram). Eso
-  cierra empíricamente el Apéndice B.6 del plan, que hasta ahora era el único externo sin verificar.
+  cierra empíricamente el Apéndice B.6 del plan, que hasta ahora era el único externo sin verificar;
+- **un simulacro de reversión**: 100 % del tráfico a la revisión anterior y vuelta a la actual, con
+  `/readyz` en 200 y el webhook sin errores (el caveat de `/health` está en §7 y en el runbook).
 
 Infraestructura: Cloud Run (servicio + 3 jobs), 3 schedulers habilitados, 4 secretos con versión
 fijada, webhook registrado sin `last_error_message`, Supabase (PostgreSQL 17.11 + pgvector 0.8.2).
@@ -210,6 +212,9 @@ lo dice con el comando exacto. No hay ningún salto silencioso.
 - Webhook registrado; `getWebhookInfo` sin `last_error_message`.
 - `/start` → 200, `update handled`; mensaje normal → respuesta en ~1,6 s.
 - **Recordatorio creado y entregado** de extremo a extremo.
+- **Simulacro de reversión (2026-10-18):** 100 % del tráfico a `00002` y vuelta a `00003`;
+  `/readyz` 200 en ambas, webhook 403 sin secreto y `getWebhookInfo` sin `last_error_message` al
+  terminar. El detalle y el caveat de `/health` están en `docs/despliegue.md` §8.
 
 ### 4.3 Criterios de aceptación de la Fase 4 (RAG)
 
@@ -257,7 +262,7 @@ Los 15 elementos, uno a uno. **Verificado** = hay una ejecución o una prueba co
 | 11 | Aprobaciones específicas, caducables, auditables e idempotentes | **Verificado** | CAS atómico, TTL, hash y revisión de argumentos, siete causas de cero filas con su mensaje; `test_phase3_approvals`; el camino de nivel 2 **no** se ejercitó en vivo (ver §7) |
 | 12 | No hay automatización de reservas ficticia | **Verificado** | `submit_reservation` es una interfaz que responde `CapabilityUnavailable`; las pruebas exigen que no se afirme disponibilidad sin proveedor |
 | 13 | Los jobs no dependen de procesos en memoria | **Verificado** | Tres jobs de una sola pasada, disparados por Scheduler; **un recordatorio entregado en vivo** |
-| 14 | Instrucciones de despliegue, webhook, migraciones, operación y reversión | **Verificado** (reversión documentada, **no ejercitada**) | `docs/despliegue.md` + `docs/operacion.md`; la vuelta a una revisión anterior está escrita y **nunca se ha ejecutado** (ver §7) |
+| 14 | Instrucciones de despliegue, webhook, migraciones, operación y reversión | **Verificado** (reversión de código **ejercitada** el 2026-10-18; restauración de esquema no) | `docs/despliegue.md` §8 + `docs/operacion.md`; simulacro completo a `00002` y vuelta a `00003`, con `/readyz` 200, webhook sin errores y `pending_update_count: 0`; la restauración desde Supabase **no** se ha ejercitado (no hay copia en el plan gratuito) |
 | 15 | Limitaciones y pasos manuales documentados | **Verificado** | §7 de este informe, el README y el runbook (secretos, allow-list, plan de Supabase, B.6…) |
 
 ---
@@ -293,9 +298,14 @@ presenten como resueltos (spec §16).
    consulta los documentos (0/5) y usa la fórmula de "no encuentro" en **2–3 de 5** ejecuciones
    (las demás son una negativa genérica, sin citar y sin inventar). Está registrado como número en
    `PLAN.md`.
-3. **La reversión (criterio (e) de la Fase 5) está documentada y nunca se ha ejercitado.** El comando
-   (`gcloud run services update-traffic … --to-revisions PREV=100`) está escrito y es correcto por
-   construcción, pero **no se ha ejecutado**; lo mismo vale para la restauración desde Supabase.
+3. **La reversión de código (criterio (e) de la Fase 5) se ejercitó el 2026-10-18.** El tráfico pasó
+   al 100 % a `taa-prod-api-00002-g7q`; `/readyz` respondió 200 y el webhook rechazó una petición sin
+   secreto con 403. Después volvió al 100 % a `00003`, con `/health` y `/readyz` en 200 y el webhook
+   sin errores. El simulacro encontró un caveat real: `00002` es **anterior** al arreglo que añadió
+   `/health`, así que en esa revisión esa ruta devuelve 404 (sigue sirviendo `/readyz` y el webhook).
+   Una reversión real debe apuntar a `00003` o posterior, o usar `/readyz`. **La restauración del
+   esquema desde una copia de Supabase sigue sin ejercitarse**, porque el plan gratuito no tiene
+   copias.
 4. **El plan gratuito de Supabase se pausa tras 7 días de inactividad y no tiene copias de
    seguridad.** El proyecto está hoy en el plan gratuito. Para un asistente que debe responder a
    cualquier hora, y para tener un camino de restauración, se recomienda el **plan Pro**; hasta
