@@ -711,6 +711,17 @@ run "desplegar el servicio" "facturable (pendiente de confirmar)" \
     --set-secrets="$(common_secrets_payload)" \
     --project "$PROJECT"
 
+# Un simulacro de reversión (docs/despliegue.md §8) deja `spec.traffic` fijado a una revisión.
+# `gcloud run deploy` respeta ese pin: crea la revisión nueva, pero sigue sirviendo la anterior y
+# Cloud Run retira la nueva. Ocurrió el 2026-10-18: el despliegue salió con código 0, `/health`
+# pasó (la revisión vieja estaba sana) y el bot seguía con la imagen anterior. Desplegar tiene que
+# significar servir lo que se acaba de construir, así que el pin se limpia explícitamente.
+run "asegurar que el tráfico sirve la revisión recién desplegada" "gratis" \
+  gcloud run services update-traffic "$SERVICE" \
+    --to-latest \
+    --region="$REGION" \
+    --project "$PROJECT"
+
 # ============================================================================================ #
 step 10 "Los tres Cloud Run Jobs" "facturable por ejecución; fracciones de céntimo"
 # ============================================================================================ #
@@ -861,6 +872,20 @@ run "liveness del servicio (/health: el frontend de Cloud Run intercepta las rut
   curl -fsS "${SERVICE_URL}/health"
 run "readiness del servicio" "gratis" \
   curl -fsS "${SERVICE_URL}/readyz"
+
+# Las comprobaciones anteriores prueban la URL, no la revisión que la sirve. Un pin de tráfico
+# (por ejemplo, tras un simulacro de reversión) haría que `/health` pasara con la imagen vieja.
+if (( APPROVED )) && (( ! STEP_SKIPPED )); then
+  SERVING_REVISION="$(gcloud run services describe "$SERVICE" \
+    --region="$REGION" --format='value(status.traffic[0].revisionName)' --project "$PROJECT")"
+  READY_REVISION="$(gcloud run services describe "$SERVICE" \
+    --region="$REGION" --format='value(status.latestReadyRevisionName)' --project "$PROJECT")"
+  if [[ "$SERVING_REVISION" != "$READY_REVISION" ]]; then
+    fail "el servicio sirve ${SERVING_REVISION}, pero la última revisión lista es ${READY_REVISION}"
+  fi
+  note "ok: la revisión que sirve es la última lista (${SERVING_REVISION})"
+fi
+
 note "y una prueba manual: enviar /start desde la cuenta autorizada."
 
 # ============================================================================================ #

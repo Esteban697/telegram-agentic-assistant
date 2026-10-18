@@ -389,7 +389,9 @@ Dos reglas que se comprueban con pruebas, no por convención:
 **Estado desplegado:** servicio `taa-prod-api` en Cloud Run
 (`https://taa-prod-api-hzlxaxcstq-ew.a.run.app`, escala a cero, `max-instances=1`), tres Cloud Run
 Jobs, tres schedulers habilitados, cuatro secretos con versión fijada y el webhook registrado.
-Base de datos en Supabase (PostgreSQL 17.11 + pgvector 0.8.2) y embeddings en Vertex AI.
+Base de datos en Supabase (PostgreSQL 17.11 + pgvector 0.8.2) y embeddings en Vertex AI. El script
+limpia cualquier pin de tráfico que haya dejado una reversión y comprueba que la revisión que sirve
+es la última lista.
 
 - Incidentes y recuperación: [`docs/operacion.md`](docs/operacion.md).
 - Seguridad y política de aprobación: [`docs/seguridad.md`](docs/seguridad.md).

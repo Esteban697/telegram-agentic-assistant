@@ -341,6 +341,12 @@ presenten como resueltos (spec §16).
     (`POST /api/web_search`, la misma `OLLAMA_API_KEY` del chat; 5 resultados por defecto, extractos
     acotados, sin caché ni reintento oculto). Las herramientas de restaurantes siguen siendo
     interfaces que responden `CapabilityUnavailable`; no se ha inventado ninguna API.
+11. **Una reversión deja el tráfico fijado.** El simulacro del 2026-10-18 dejó `spec.traffic`
+    apuntando a `00003`; el despliegue siguiente creó `00004` pero siguió sirviendo `00003`, y
+    Cloud Run retiró la revisión nueva. `/health` no lo detectó porque la revisión vieja estaba
+    sana. Se corrigió en `scripts/deploy.sh`: tras desplegar ejecuta `update-traffic --to-latest` y
+    comprueba que la revisión que sirve es la última lista (`tests/unit/test_deploy_artifacts.py`).
+    El servicio se movió a `00004` a mano el mismo día.
 
 ---
 

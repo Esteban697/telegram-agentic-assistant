@@ -403,6 +403,14 @@ liveness**. Para una reversión real, apuntar a una revisión **posterior al arr
 o usar `/readyz` como comprobación de vida. Volver a `00002` restaura el servicio, no la ruta de
 salud.
 
+**Consecuencia operativa del simulacro:** `update-traffic` deja `spec.traffic` **fijado** a la
+revisión elegida. Un `gcloud run deploy` posterior respeta ese pin: crea la revisión nueva pero
+sigue sirviendo la anterior, y Cloud Run retira la nueva. Ocurrió el 2026-10-18 y `/health` no lo
+detectó, porque la revisión vieja estaba sana. `scripts/deploy.sh` ahora ejecuta
+`gcloud run services update-traffic … --to-latest` tras desplegar y comprueba que la revisión que
+sirve es la última lista. Si se revierte a mano, hay que mover el tráfico explícitamente en el
+siguiente despliegue.
+
 ### Esquema — una migración destructiva no se "deshace"
 
 Las migraciones son hacia delante en la práctica. `scripts/migrate.py downgrade` **se niega** en

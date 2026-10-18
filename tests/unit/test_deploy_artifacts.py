@@ -1663,6 +1663,24 @@ def test_one_instance_because_the_pooler_allows_no_more() -> None:
     assert "--max-instances=3" not in plan, "three instances could not fit the pooler"
 
 
+def test_a_pinned_traffic_configuration_is_cleared_by_a_deploy() -> None:
+    """A rollback pins `spec.traffic`; `gcloud run deploy` respects the pin and serves the old image.
+
+    Observed on 2026-10-18: the deploy created a new revision, kept serving the previous one, and
+    `/health` still passed because the old revision was healthy. The script must clear the pin and
+    compare the serving revision with the latest ready one.
+    """
+
+    script = DEPLOY.read_text(encoding="utf-8")
+    assert "update-traffic" in script
+    assert "--to-latest" in script
+    assert "status.latestReadyRevisionName" in script
+    assert "status.traffic[0].revisionName" in script
+
+    plan = run_deploy(extra_env={"TAA_ALLOWED_USER_IDS": "42"}).stdout
+    assert "--to-latest" in plan
+
+
 def test_the_deployed_pools_are_the_ones_the_gate_checks() -> None:
     """The gate's numbers must be the environment the containers actually get.
 
