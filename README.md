@@ -1,15 +1,17 @@
 # Asistente personal en Telegram
 
 Asistente personal que se usa desde un bot privado de Telegram y responde con un modelo
-alojado en Ollama. Este repositorio contiene la **Fase 1** del plan de implementación
-(`PLAN.md`): conversación por webhook, autorización por lista de usuarios, comandos básicos y
-un contenedor reproducible. Las fases posteriores (persistencia, LangGraph con herramientas y
-aprobaciones, RAG documental y despliegue en Google Cloud) se añaden por fases.
+alojado en Ollama. Este repositorio contiene el proyecto completo (`PLAN.md`, Fases 1–6):
+conversación por webhook, autorización por lista de usuarios, persistencia en PostgreSQL,
+LangGraph con herramientas y aprobaciones, RAG documental con citas, y el despliegue en Google
+Cloud con secretos, jobs y observabilidad.
 
-> **Estado: Fase 1, solo local.** El almacenamiento es en memoria
-> (`STORE_BACKEND=memory`) y el servicio está pensado para ejecutarse en una sola instancia.
-> Esa combinación es un **error de arranque** en `APP_ENV=production`, así que esta fase no
-> se puede desplegar por accidente. La persistencia en PostgreSQL llega en la Fase 2.
+> **Estado: desplegado (Fase 6).** El servicio y los tres jobs están en Cloud Run, con la base de
+> datos en Supabase y los embeddings en Vertex AI. Para el desarrollo local sigue habiendo un modo
+> **solo local** (`STORE_BACKEND=memory`, almacenes en memoria) que es un error de arranque en
+> `APP_ENV=production` y por tanto no se puede desplegar por accidente. Los informes están en
+> `docs/informe-final.md` (resultados y pendientes), `docs/despliegue.md` (runbook),
+> `docs/operacion.md` (incidentes) y `docs/seguridad.md` (seguridad y aprobaciones).
 
 ---
 
@@ -294,12 +296,11 @@ Dos reglas que no son convenciones, sino tests:
   `scripts/lib/redact.sh` sustituye por `<redacted>` cualquier valor conocido o con forma de
   credencial. Hay una prueba con un centinela, y otra que demuestra que la prueba puede fallar.
 
-**Estado**: las APIs están habilitadas y ya existen (creados a mano, con aprobación) el repositorio
-de imágenes, las dos cuentas de servicio, el bucket y la imagen publicada. **No** hay todavía
-instancia de Cloud SQL, servicio, jobs ni schedules: los criterios (a), (d) y (e) siguen pendientes
-de las credenciales del usuario — `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET` y
-`TAA_ALLOWED_USER_IDS`, que sin él no despliega nada (la aplicación no arranca sin lista de
-autorizados). (b) y (c) están demostrados en local — ver `docs/despliegue.md` §10.
+**Estado: desplegado y operativo.** Servicio `taa-prod-api` en Cloud Run (escala a cero,
+`max-instances=1`), tres Cloud Run Jobs, tres schedulers habilitados, cuatro secretos con versión
+fijada y el webhook registrado sin `last_error_message`. La base de datos es **Supabase**
+(PostgreSQL 17.11 + pgvector 0.8.2). El detalle, con las pruebas ejecutadas y lo que queda
+pendiente, está en **`docs/informe-final.md`**.
 
 ## Limitaciones conocidas de la Fase 1
 

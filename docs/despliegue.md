@@ -12,13 +12,14 @@ cada comando de este documento lleva `--project telegram-assistant-esteban`, y p
 `CLOUDSDK_CORE_PROJECT`. Lo comprueba `tests/unit/test_deploy_artifacts.py`, que recorre el script:
 no es una convención que haya que recordar.
 
-> **Estado actual del proyecto (2026-10-18).** Ya existen, creados **a mano y con aprobación**: las
-> APIs habilitadas, el repositorio `taa-prod-images`, las dos cuentas de servicio, el bucket
-> `taa-prod-documents` con su binding, y la imagen publicada. **La base de datos ya está
-> provisionada y migrada en Supabase** (PostgreSQL 17.11 + pgvector 0.8.2, alembic `0007`,
-> 12 tablas de aplicación y 4 del checkpointer). **No** existe todavía ningún servicio de Cloud Run,
-> ningún job ni ningún schedule. **Cloud SQL ya no forma parte del despliegue**: la decisión de
-> 2026-10-18 lo sustituyó por Supabase.
+> **Estado actual del proyecto (2026-10-18, Fase 6).** **Desplegado y operativo**: el servicio
+> `taa-prod-api` en `https://taa-prod-api-hzlxaxcstq-ew.a.run.app`, los tres Cloud Run Jobs, los tres
+> schedulers habilitados, los cuatro secretos con versión fijada y el webhook registrado. La base de
+> datos es **Supabase** (PostgreSQL 17.11 + pgvector 0.8.2, alembic `0007`), ya provisionada y
+> migrada. **Cloud SQL no forma parte del despliegue**: la decisión de 2026-10-18 lo sustituyó por
+> Supabase. El estado real de cada criterio de aceptación, con sus pruebas, está en
+> `docs/informe-final.md`; los incidentes, en `docs/operacion.md`; la seguridad, en
+> `docs/seguridad.md`.
 >
 > Este runbook y `scripts/deploy.sh` son **idempotentes**: cada creación va precedida de su
 > comprobación, así que volver a ejecutarlos sobre lo que ya existe no hace nada (y no produce el
