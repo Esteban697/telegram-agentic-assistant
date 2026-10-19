@@ -74,14 +74,14 @@ AR_REPO="${PREFIX}-images"
 IMAGE="${REGION}-docker.pkg.dev/${PROJECT}/${AR_REPO}/${PREFIX}-app"
 IMAGE_TAG="${TAA_IMAGE_TAG:-$(date -u +%Y%m%d%H%M%S)}"
 
-# Cuatro secretos, no cinco: `DATABASE_SYNC_URL` y `DATABASE_URL` montan **el mismo** secreto
+# Cinco secretos, aunque `DATABASE_SYNC_URL` y `DATABASE_URL` montan **el mismo** secreto
 # (la DSN es la misma cadena; el driver `postgresql+psycopg` sirve para las dos), así que no hay
-# un secreto "de checkpointer" que nadie lea. El que había se eliminó: estaba creado, versionado y
-# autorizado, y no lo montaba ningún componente.
+# un secreto "de checkpointer" que nadie lea. El quinto es el JSON de OAuth de Google Calendar.
 SECRET_BOT_TOKEN="${PREFIX}-telegram-bot-token"
 SECRET_WEBHOOK="${PREFIX}-telegram-webhook-secret"
 SECRET_OLLAMA="${PREFIX}-ollama-api-key"
 SECRET_DATABASE_URL="${PREFIX}-database-url"
+SECRET_GOOGLE_OAUTH="${PREFIX}-google-oauth-credentials"
 
 # Directorio con los ficheros de valores (modo 600). El script solo usa las **rutas**: ver la
 # regla 4. Ver `docs/despliegue.md` §Secretos para cómo se crean.
@@ -99,6 +99,7 @@ VERSION_BOT_TOKEN="$SECRET_VERSION_DEFAULT"
 VERSION_WEBHOOK="$SECRET_VERSION_DEFAULT"
 VERSION_OLLAMA="$SECRET_VERSION_DEFAULT"
 VERSION_DATABASE_URL="$SECRET_VERSION_DEFAULT"
+VERSION_GOOGLE_OAUTH="$SECRET_VERSION_DEFAULT"
 
 # **La base de datos es Supabase, no Cloud SQL** (decisión del 2026-10-18). El límite que manda
 # no es el `max_connections` del servidor (60) sino el del **pooler Supavisor en modo sesión: 14
@@ -343,6 +344,10 @@ COMMON_ENV=(
   # 7 x 4 + 2 = 30 conexiones contra un pooler de 14.
   "DB_POOL_SIZE=${DB_POOL_SIZE}"
   "CHECKPOINTER_POOL_SIZE=${CHECKPOINTER_POOL_SIZE}"
+  # Calendar is enabled only when the OAuth credentials secret is present; step 0 requires the
+  # file, so a deploy cannot silently ship the integration disabled.
+  "GOOGLE_CALENDAR_ENABLED=true"
+  "GOOGLE_CALENDAR_ID=primary"
 )
 
 common_env_payload() {
@@ -356,7 +361,8 @@ common_secrets() {
     "TELEGRAM_WEBHOOK_SECRET=${SECRET_WEBHOOK}:${VERSION_WEBHOOK}" \
     "OLLAMA_API_KEY=${SECRET_OLLAMA}:${VERSION_OLLAMA}" \
     "DATABASE_URL=${SECRET_DATABASE_URL}:${VERSION_DATABASE_URL}" \
-    "DATABASE_SYNC_URL=${SECRET_DATABASE_URL}:${VERSION_DATABASE_URL}"
+    "DATABASE_SYNC_URL=${SECRET_DATABASE_URL}:${VERSION_DATABASE_URL}" \
+    "GOOGLE_OAUTH_CREDENTIALS=${SECRET_GOOGLE_OAUTH}:${VERSION_GOOGLE_OAUTH}"
 }
 
 common_secrets_payload() {
@@ -447,6 +453,7 @@ note ""
 note "Ficheros de secreto esperados en ${SECRETS_DIR} (modo 600):"
 declare -a SECRET_FILES_NEEDED=(
   "telegram-bot-token" "telegram-webhook-secret" "ollama-api-key" "database-url"
+  "google-oauth-credentials"
 )
 for file in "${SECRET_FILES_NEEDED[@]}"; do
   if [[ -r "${SECRETS_DIR}/${file}" ]]; then
@@ -500,7 +507,7 @@ step 1 "Habilitar las APIs necesarias" \
      "gratis por sí mismo; habilita productos facturables de los pasos siguientes"
 # ============================================================================================ #
 note "APIs: run, sqladmin, secretmanager, artifactregistry, cloudscheduler, storage, logging,"
-note "monitoring y aiplatform (Vertex ya está habilitada; habilitar es idempotente)."
+note "monitoring, aiplatform y calendar-json (Vertex ya está habilitada; habilitar es idempotente)."
 run "habilitar APIs (idempotente, no crea ningún recurso facturable)" "gratis" \
   gcloud services enable \
     run.googleapis.com \
@@ -512,6 +519,7 @@ run "habilitar APIs (idempotente, no crea ningún recurso facturable)" "gratis" 
     logging.googleapis.com \
     monitoring.googleapis.com \
     aiplatform.googleapis.com \
+    calendar-json.googleapis.com \
     --project "$PROJECT"
 
 # ============================================================================================ #
@@ -566,12 +574,12 @@ run_ensure "crear la cuenta de servicio de Scheduler (si no existe)" "gratis" \
     --project "$PROJECT"
 
 # ============================================================================================ #
-step 6 "Secret Manager: cuatro secretos y su versión" \
+step 6 "Secret Manager: cinco secretos y su versión" \
      "facturable: céntimos/mes por secreto y por operación de acceso (pendiente de confirmar)"
 # ============================================================================================ #
 note "Los valores NO se pasan como argumento: gcloud los lee del fichero (--data-file)."
 note "Un solo secreto sirve para DATABASE_URL y DATABASE_SYNC_URL: la DSN es la misma cadena."
-for secret in "$SECRET_BOT_TOKEN" "$SECRET_WEBHOOK" "$SECRET_OLLAMA" "$SECRET_DATABASE_URL"; do
+for secret in "$SECRET_BOT_TOKEN" "$SECRET_WEBHOOK" "$SECRET_OLLAMA" "$SECRET_DATABASE_URL" "$SECRET_GOOGLE_OAUTH"; do
   run_ensure "crear el secreto ${secret} (si no existe)" "pendiente de confirmar" \
     "gcloud secrets describe ${secret}" secret_exists \
     gcloud secrets create "$secret" \
@@ -584,8 +592,9 @@ declare -A SECRET_FILES=(
   ["$SECRET_WEBHOOK"]="${SECRETS_DIR}/telegram-webhook-secret"
   ["$SECRET_OLLAMA"]="${SECRETS_DIR}/ollama-api-key"
   ["$SECRET_DATABASE_URL"]="${SECRETS_DIR}/database-url"
+  ["$SECRET_GOOGLE_OAUTH"]="${SECRETS_DIR}/google-oauth-credentials"
 )
-for secret in "$SECRET_BOT_TOKEN" "$SECRET_WEBHOOK" "$SECRET_OLLAMA" "$SECRET_DATABASE_URL"; do
+for secret in "$SECRET_BOT_TOKEN" "$SECRET_WEBHOOK" "$SECRET_OLLAMA" "$SECRET_DATABASE_URL" "$SECRET_GOOGLE_OAUTH"; do
   # `versions add` es aditivo y por tanto idempotente en el sentido que importa: añade una versión
   # nueva y las anteriores siguen existiendo. Reejecutarlo es seguro; lo que **no** se hace es
   # montar `latest`, porque una versión se congela al arrancar la instancia.
@@ -604,7 +613,7 @@ done
 # hacer — y el servicio y los tres jobs quedan montados sobre la versión **antigua** mientras el
 # despliegue informa de éxito. Es una lectura gratis y los pasos 11-13 necesitan el número.
 declare -A SECRET_VERSIONS=()
-for secret in "$SECRET_BOT_TOKEN" "$SECRET_WEBHOOK" "$SECRET_OLLAMA" "$SECRET_DATABASE_URL"; do
+for secret in "$SECRET_BOT_TOKEN" "$SECRET_WEBHOOK" "$SECRET_OLLAMA" "$SECRET_DATABASE_URL" "$SECRET_GOOGLE_OAUTH"; do
   if [[ -n "${TAA_SECRET_VERSION:-}" ]]; then
     SECRET_VERSIONS["$secret"]="$TAA_SECRET_VERSION"
     continue
@@ -629,7 +638,8 @@ VERSION_BOT_TOKEN="${SECRET_VERSIONS[$SECRET_BOT_TOKEN]:-$SECRET_VERSION_DEFAULT
 VERSION_WEBHOOK="${SECRET_VERSIONS[$SECRET_WEBHOOK]:-$SECRET_VERSION_DEFAULT}"
 VERSION_OLLAMA="${SECRET_VERSIONS[$SECRET_OLLAMA]:-$SECRET_VERSION_DEFAULT}"
 VERSION_DATABASE_URL="${SECRET_VERSIONS[$SECRET_DATABASE_URL]:-$SECRET_VERSION_DEFAULT}"
-note "versiones fijadas: bot-token:${VERSION_BOT_TOKEN} webhook:${VERSION_WEBHOOK} ollama:${VERSION_OLLAMA} database-url:${VERSION_DATABASE_URL}"
+VERSION_GOOGLE_OAUTH="${SECRET_VERSIONS[$SECRET_GOOGLE_OAUTH]:-$SECRET_VERSION_DEFAULT}"
+note "versiones fijadas: bot-token:${VERSION_BOT_TOKEN} webhook:${VERSION_WEBHOOK} ollama:${VERSION_OLLAMA} database-url:${VERSION_DATABASE_URL} google-oauth:${VERSION_GOOGLE_OAUTH}"
 
 # ============================================================================================ #
 step 7 "Bucket privado de documentos" \
@@ -672,7 +682,7 @@ run "runtime: usuario de Vertex AI (embeddings)" "gratis" \
     --role="roles/aiplatform.user" \
     --condition=None \
     --project "$PROJECT"
-for secret in "$SECRET_BOT_TOKEN" "$SECRET_WEBHOOK" "$SECRET_OLLAMA" "$SECRET_DATABASE_URL"; do
+for secret in "$SECRET_BOT_TOKEN" "$SECRET_WEBHOOK" "$SECRET_OLLAMA" "$SECRET_DATABASE_URL" "$SECRET_GOOGLE_OAUTH"; do
   run "runtime: leer el secreto ${secret}" "gratis" \
     gcloud secrets add-iam-policy-binding "$secret" \
       --member="serviceAccount:${RUNTIME_SA_EMAIL}" \

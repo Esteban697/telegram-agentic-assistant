@@ -123,6 +123,10 @@ La defensa es estructural, porque las instrucciones del prompt no son una fronte
    instrucciones contenidas en ellos y citar la fuente; el proveedor devuelve título, URL y
    extracto, y el recorte (`WEB_SEARCH_MAX_*`) limita cuánto texto entra de golpe. La API key viaja
    en `Authorization`, nunca en la URL, y ni la consulta ni los resultados se registran en los logs.
+9. **Los eventos del calendario son datos no confiables.** Títulos, descripciones, nombres y
+   correos de invitados se tratan como información, nunca como instrucciones. Las escrituras se
+   preparan y solo se ejecutan tras aprobación; el prompt ordena ignorar y reportar órdenes
+   contenidas en un evento.
 
 ## 7. Gestión de secretos
 
@@ -140,6 +144,13 @@ La defensa es estructural, porque las instrucciones del prompt no son una fronte
 - **La cuenta de servicio por defecto de Compute no tiene roles.** Se le retiró el `roles/editor`
   heredado el 2026-10-18 y se comprobó que no conserva ninguna concesión; ningún recurso la usa
   (servicio y jobs corren con `taa-prod-runtime`).
+- **Google Calendar usa OAuth del usuario, no una cuenta de servicio.** El refresh token vive en
+  el secreto `taa-prod-google-oauth-credentials` (versión fijada, montado como
+  `GOOGLE_OAUTH_CREDENTIALS`); el runtime solo tiene `secretAccessor` (lectura) y **no**
+  `secretVersionManager`, así que no puede escribir ni rotar el secreto. Los access tokens se
+  cachean en memoria, se refrescan con un lock 60 s antes de caducar y nunca se registran. Los
+  scopes son `calendar.events` y `calendar.events.freebusy`: no hay acceso a compartición, ajustes
+  ni otros calendarios salvo el configurado.
 - **Logs sin secretos.** La redacción es por clave y por forma (bearer, token de Telegram, hex largo,
   base64, cabecera PEM); los errores del proveedor nunca llevan la URL con el token.
 

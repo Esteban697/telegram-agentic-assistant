@@ -61,6 +61,28 @@ contienen tokens, claves, documentos, embeddings ni el contenido de los mensajes
   garantía de que el webhook contesta. No registrar la consulta ni los resultados: son contenido
   del usuario y datos de terceros.
 
+## 2.2 Google Calendar: timeout, cuota, autenticación o evento cambiado
+
+- **Síntoma.** El asistente dice que no puede consultar o modificar el calendario. Logs:
+  `google access token refreshed` (normal), o errores con `error_code: google_timeout`,
+  `google_unavailable`, `google_rate_limited`, `google_auth`, `calendar_event_not_found` o
+  `calendar_event_changed`. En una escritura aprobada, el estado puede quedar **`unknown`** si el
+  timeout es ambiguo.
+- **Qué ocurre.** El proveedor (`app/integrations/google_calendar.py`) refresca el access token y
+  llama a la Calendar API. Los errores **definitivos** (400, 401/403, 404, cuota, evento cambiado)
+  devuelven `ToolResult.failure`; los **ambiguos** (timeout, transporte, 5xx) se propagan y el
+  handler marca la aprobación como `unknown`, sin reintento automático.
+- **Respuesta.**
+  - `google_auth`: el refresh token se revocó o caducó. Vuelve a ejecutar
+    `scripts/google_auth.py` y despliega.
+  - `google_rate_limited`: espera; Google Calendar tiene cuotas por usuario y por proyecto.
+  - `google_timeout`/`google_unavailable`: comprueba el estado de Google; no reintentes la escritura
+    desde la base de datos.
+  - `calendar_event_changed`: el evento cambió entre la lectura y la aprobación; vuelve a leerlo y
+    prepara una acción nueva.
+- **Regla.** No aumentar reintentos ocultos ni convertir `unknown` en `failed`. No registrar
+  títulos, descripciones, correos de invitados ni tokens.
+
 ## 3. Telegram: límite de tasa (429)
 
 - **Síntoma.** Un mensaje de respuesta no se entrega. Logs: `telegram rate limited` con

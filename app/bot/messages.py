@@ -173,6 +173,25 @@ CATALOGUE: Final[dict[str, str]] = {
     "error.capability_unavailable": (
         "Todavía no hay ningún proveedor configurado para esa consulta."
     ),
+    "error.calendar_unavailable": (
+        "No puedo contactar con Google Calendar ahora mismo. Inténtalo en un momento."
+    ),
+    "error.google_auth": (
+        "No puedo autenticarme con Google; hay que volver a autorizar el acceso al calendario."
+    ),
+    "error.calendar_bad_request": (
+        "Google Calendar ha rechazado la petición; revisa los datos del evento."
+    ),
+    "error.calendar_conflict": (
+        "Ese evento ya existe en el calendario; consúltalo antes de volver a crearlo."
+    ),
+    "error.calendar_event_not_found": "No encuentro ese evento en el calendario.",
+    "error.calendar_event_changed": (
+        "El evento ha cambiado desde que lo leí; vuelve a consultarlo antes de modificarlo."
+    ),
+    "error.calendar_limit": (
+        "La petición supera el límite de eventos, días o invitados; reduce el rango."
+    ),
     "error.reservation_not_supported": (
         "No hay ninguna integración de reservas, así que no puedo completarla."
     ),

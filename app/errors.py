@@ -172,11 +172,90 @@ class OllamaUnsupportedModel(OllamaError):
     message_key = "error.model_unavailable"
 
 
+# --------------------------------------------------------------------------- #
+# Google Calendar (user OAuth)
+# --------------------------------------------------------------------------- #
+class GoogleError(AssistantError):
+    """Base class for Google API failures behind the user's OAuth refresh token."""
+
+    code = "google_error"
+    message_key = "error.calendar_unavailable"
+
+
+class GoogleAuthError(GoogleError):
+    """The refresh token was rejected or revoked; the user must re-authorize."""
+
+    code = "google_auth"
+    message_key = "error.google_auth"
+
+
+class GoogleTimeout(GoogleError):
+    """The Calendar API did not answer in time. Ambiguous for writes."""
+
+    code = "google_timeout"
+    message_key = "error.timeout"
+
+
+class GoogleUnavailable(GoogleError):
+    """Transport failure or 5xx. Ambiguous for writes."""
+
+    code = "google_unavailable"
+
+
+class GoogleRateLimited(GoogleError):
+    """429, or a 403 whose reason is a quota/rate limit. The write did not happen."""
+
+    code = "google_rate_limited"
+    message_key = "error.rate_limited"
+
+
+class GoogleBadRequest(GoogleError):
+    """A definite 4xx (bad event fields, unknown calendar, forbidden)."""
+
+    code = "google_bad_request"
+    message_key = "error.calendar_bad_request"
+
+
+class GoogleConflict(GoogleError):
+    """The supplied event id already exists (409); the caller reconciles by reading it."""
+
+    code = "google_conflict"
+    message_key = "error.calendar_conflict"
+
+
+class GoogleBadResponse(GoogleError):
+    """A 2xx whose body is not the documented shape. Ambiguous for writes."""
+
+    code = "google_bad_response"
+
+
+class CalendarEventNotFound(GoogleError):
+    code = "calendar_event_not_found"
+    message_key = "error.calendar_event_not_found"
+
+
+class CalendarEventChanged(GoogleError):
+    """The remote event no longer matches what the user approved."""
+
+    code = "calendar_event_changed"
+    message_key = "error.calendar_event_changed"
+
+
 __all__ = [
     "AssistantError",
     "BudgetExceeded",
+    "CalendarEventChanged",
+    "CalendarEventNotFound",
     "CapabilityUnavailable",
     "ConfigError",
+    "GoogleAuthError",
+    "GoogleBadRequest",
+    "GoogleBadResponse",
+    "GoogleConflict",
+    "GoogleError",
+    "GoogleRateLimited",
+    "GoogleTimeout",
+    "GoogleUnavailable",
     "OllamaBadResponse",
     "OllamaError",
     "OllamaRateLimited",

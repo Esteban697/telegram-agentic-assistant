@@ -18,6 +18,9 @@ operación, seguridad y el informe final están en [`docs/`](docs/).
 - **Búsqueda web.** Consulta datos que cambian —precios, noticias, horarios, disponibilidad— con
   la API de búsqueda de Ollama Cloud y responde citando el título y la URL de la fuente. Los
   resultados se tratan como datos no confiables y se recortan antes de entrar en el contexto.
+- **Calendario de Google.** Lee la agenda, busca huecos libres y prepara eventos con invitados,
+  lugar y enlace de Meet. Crear, mover o cancelar un evento exige aprobación explícita; la lectura
+  es directa. Usa OAuth 2.0 con un refresh token guardado en Secret Manager.
 - **Preferencias explícitas.** Guarda lo que le pidas recordar y lo consulta después. Solo guarda
   lo que se le pide: no convierte la conversación entera en memoria.
 - **Recordatorios.** Con fecha, hora y zona horaria IANA. Se entregan mediante un job programado;
@@ -104,6 +107,24 @@ chat; cada consulta cuenta en la cuenta de Ollama. Devuelve hasta 10 resultados 
 título, URL y un extracto acotado. Responde citando título y URL, y si no hay resultados o el
 proveedor falla, lo dice en vez de rellenar con conocimiento general presentado como actual.
 
+### Calendario
+
+- `¿Qué tengo hoy?` / `¿Qué tengo esta semana?`
+- `Encuéntrame un hueco de 45 minutos mañana por la tarde.`
+- `Resume mi agenda del jueves y dime si hay solapamientos.`
+- `Agenda una reunión con Ana el jueves a las 10:00, 30 minutos, con Meet.`
+- `Muévela a las 11:00.` / `Cancela la del viernes.`
+
+Para fechas relativas el asistente consulta primero la hora real; no supone el día. Leer la agenda
+y buscar huecos no requiere aprobación. Crear, mover o cancelar un evento sí: se prepara la acción,
+se muestra una vista previa con los argumentos exactos (título, hora, invitados, lugar y Meet) y
+solo se ejecuta al pulsar **Aprobar**. Antes de modificar o cancelar, el asistente lee el evento y
+verifica que su título y hora siguen siendo los que viste; si cambió, no lo toca.
+
+Los invitados reciben la invitación o la cancelación por correo cuando el evento tiene asistentes.
+La integración es de **un solo calendario** (`GOOGLE_CALENDAR_ID`, por defecto `primary`); no hay
+RSVP, eventos recurrentes ni cambios de compartición en esta entrega.
+
 ### Aprobaciones
 
 - `Reserva una mesa para dos el viernes a las 21:00 en Casa Pepe.`
@@ -149,8 +170,14 @@ Telegram ──HTTPS──▶ app/api/telegram_webhook.py
                       │                           work_items y checkpoints del grafo
                       ├──▶ Cloud Storage          originales de los documentos
                       ├──▶ Vertex AI              embeddings
-                      └──▶ Ollama Cloud           chat y búsqueda web
+                      ├──▶ Ollama Cloud           chat y búsqueda web
+                      └──▶ Google Calendar        eventos (OAuth del usuario)
 ```
+
+La integración de calendario usa OAuth 2.0 de aplicación instalada: el refresh token vive en
+Secret Manager (`GOOGLE_OAUTH_CREDENTIALS`) y los access tokens solo en memoria. Los scopes son
+`calendar.events` y `calendar.events.freebusy`; no se piden permisos de compartición ni de
+configuración del calendario.
 
 - **Un binario, cuatro comandos**: `uvicorn app.main:app` para el servicio y
   `python -m app.jobs.dispatch_reminders`, `-m app.jobs.process_documents` y
@@ -173,6 +200,10 @@ Telegram ──HTTPS──▶ app/api/telegram_webhook.py
 - Para hablar con el modelo real: `OLLAMA_API_KEY`.
 - Para embeddings y documentos en producción: un proyecto de Google Cloud con Vertex AI y un
   bucket de Cloud Storage. Sin credenciales se puede usar `EMBED_PROVIDER=stub` en pruebas.
+- Para el calendario: un **cliente OAuth 2.0 de tipo Desktop** en ese proyecto, la Calendar API
+  habilitada y `uv run python scripts/google_auth.py --client-file <json>` ejecutado una vez. El consent
+  screen debe publicarse **In production** (sin verificar vale para tu propia cuenta); en
+  **Testing** Google caduca el refresh token a los 7 días.
 
 ## Puesta en marcha local
 
@@ -235,6 +266,7 @@ sin consumidor.
 | Telegram | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`, `TELEGRAM_ALLOWED_USER_IDS`, `DEV_ALLOW_ANY_USER`, `TELEGRAM_API_BASE_URL`, `MAX_MESSAGE_CHARS`, `MAX_WEBHOOK_BODY_BYTES` |
 | Modelo | `OLLAMA_BASE_URL`, `OLLAMA_API_KEY`, `LLM_MODEL`, `LLM_TIMEOUT_SECONDS`, `LLM_MAX_RETRIES`, `LLM_THINK`, `REQUEST_BUDGET_SECONDS`, `RATE_LIMIT_PER_MINUTE` |
 | Búsqueda web | `WEB_SEARCH_PROVIDER`, `WEB_SEARCH_BASE_URL`, `WEB_SEARCH_MAX_RESULTS`, `WEB_SEARCH_TIMEOUT_SECONDS`, `WEB_SEARCH_MAX_CONTENT_CHARS`, `WEB_SEARCH_MAX_TOTAL_CHARS` |
+| Calendario | `GOOGLE_CALENDAR_ENABLED`, `GOOGLE_CALENDAR_ID`, `GOOGLE_OAUTH_CREDENTIALS`, `GOOGLE_CALENDAR_TIMEOUT_SECONDS`, `GOOGLE_CALENDAR_MAX_RESULTS`, `GOOGLE_CALENDAR_MAX_RANGE_DAYS`, `GOOGLE_CALENDAR_MAX_ATTENDEES`, `GOOGLE_CALENDAR_WORKDAY_START_HOUR`, `GOOGLE_CALENDAR_WORKDAY_END_HOUR`, `GOOGLE_CALENDAR_DEFAULT_DURATION_MINUTES` |
 | Persistencia | `STORE_BACKEND`, `DATABASE_URL`, `DATABASE_SYNC_URL`, `DB_POOL_SIZE`, `CHECKPOINTER_POOL_SIZE`, `MIGRATIONS_AUTORUN`, `DEFAULT_TIMEZONE` |
 | Embeddings y documentos | `EMBED_PROVIDER`, `EMBED_MODEL`, `EMBED_DIM`, `EMBED_TIMEOUT_SECONDS`, `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_REGION`, `GCS_BUCKET`, `MAX_UPLOAD_MB`, `MAX_PDF_PAGES`, `MAX_INGEST_SECONDS`, `INGEST_INLINE_BUDGET_SECONDS`, `DOCUMENT_JOB_BATCH_SIZE`, `RAG_*` |
 | Recordatorios | `REMINDER_BATCH_SIZE`, `REMINDER_MAX_ATTEMPTS`, `DISPATCHER_LEASE_SECONDS` |
@@ -378,6 +410,25 @@ bash scripts/deploy.sh                          # imprime todos los comandos; no
 bash scripts/deploy.sh --yes-i-have-approval    # ejecuta, tras aprobar el coste
 ```
 
+### Configurar el calendario (una vez)
+
+1. Habilita **Google Calendar API** en el proyecto `telegram-assistant-esteban`.
+2. Configura el **OAuth consent screen** (External) con los scopes
+   `https://www.googleapis.com/auth/calendar.events` y
+   `https://www.googleapis.com/auth/calendar.events.freebusy`, y publícalo **In production**
+   (sin verificar; en Testing el refresh token caduca a los 7 días). La pantalla mostrará el aviso
+   de aplicación no verificada; continúa con tu cuenta.
+3. Crea un **cliente OAuth de tipo Desktop** y descarga el JSON.
+4. Autoriza una vez en local:
+
+   ```bash
+   uv run python scripts/google_auth.py --client-file ~/Downloads/client_secret_....json
+   ```
+
+   Escribe `~/.taa/secrets/google-oauth-credentials` (modo 600) sin imprimir el refresh token.
+5. Despliega: el script crea el secreto `taa-prod-google-oauth-credentials`, lo monta como
+   `GOOGLE_OAUTH_CREDENTIALS`, habilita la Calendar API y pone `GOOGLE_CALENDAR_ENABLED=true`.
+
 Dos reglas que se comprueban con pruebas, no por convención:
 
 - **Todos los comandos llevan `--project telegram-assistant-esteban`**, porque el proyecto por
@@ -388,7 +439,7 @@ Dos reglas que se comprueban con pruebas, no por convención:
 
 **Estado desplegado:** servicio `taa-prod-api` en Cloud Run
 (`https://taa-prod-api-hzlxaxcstq-ew.a.run.app`, escala a cero, `max-instances=1`), tres Cloud Run
-Jobs, tres schedulers habilitados, cuatro secretos con versión fijada y el webhook registrado.
+Jobs, tres schedulers habilitados, cinco secretos con versión fijada y el webhook registrado.
 Base de datos en Supabase (PostgreSQL 17.11 + pgvector 0.8.2) y embeddings en Vertex AI. El script
 limpia cualquier pin de tráfico que haya dejado una reversión y comprueba que la revisión que sirve
 es la última lista.
@@ -410,6 +461,10 @@ es la última lista.
 - Los resultados de la búsqueda web son datos no confiables: el prompt ordena ignorar instrucciones
   contenidas en ellos y citar la fuente. La API key va en la cabecera, nunca en la URL, y los
   resultados no se registran en los logs.
+- El calendario usa OAuth 2.0 con PKCE; el refresh token vive en Secret Manager y los access tokens
+  solo en memoria. Los scopes son `calendar.events` y `calendar.events.freebusy` (sin
+  compartición ni configuración del calendario), y los títulos, descripciones y correos de los
+  eventos se tratan como datos no confiables.
 - Los secretos viven en Secret Manager (versión fijada, nunca `latest`) y nunca se pasan por
   `argv`. No hay claves de cuenta de servicio: Cloud Run usa su identidad.
 - Los logs son JSON y no contienen tokens, DSN, mensajes, documentos ni embeddings.
@@ -418,10 +473,19 @@ es la última lista.
 
 - **Un solo usuario.** Hay aislamiento por propietario y está probado, pero la autorización es una
   lista; el sistema no está pensado para múltiples inquilinos.
-- **Sin integraciones de reservas, correo o calendario.** `search_restaurants`,
+- **Sin integraciones de reservas ni correo.** `search_restaurants`,
   `check_restaurant_availability` y `submit_reservation` existen como interfaces y responden
-  `CapabilityUnavailable` mientras no haya proveedor. La búsqueda web sí está integrada; no hay
-  `web_fetch` ni scraping de la página completa, solo los extractos que devuelve la búsqueda.
+  `CapabilityUnavailable` mientras no haya proveedor. La búsqueda web y el calendario sí están
+  integrados; no hay `web_fetch` ni scraping de la página completa, solo los extractos que devuelve
+  la búsqueda.
+- **Calendario: un solo calendario y sin operaciones avanzadas.** No hay RSVP, eventos recurrentes,
+  movimiento entre calendarios ni cambios de compartición. Los invitados reciben correos reales
+  cuando se crea, mueve o cancela un evento con asistentes; la vista previa los muestra antes de
+  aprobar.
+- **El refresh token de Google puede caducar o revocarse.** Si la autorización se revoca, hay que
+  volver a ejecutar `scripts/google_auth.py` y desplegar; el asistente responde con un error de
+  autenticación, no con datos inventados. Publicar el consent screen en producción evita la
+  caducidad de 7 días del modo Testing.
 - **La búsqueda web depende de Ollama Cloud.** Cada consulta cuenta en la cuenta de Ollama y la
   documentación no publica cuotas ni precios; si el proveedor falla o limita, la herramienta
   devuelve un error y el asistente lo dice. No hay caché ni reintento oculto.
@@ -465,13 +529,14 @@ app/
   bot/                  cliente de la Bot API, handlers, teclados y catálogo de textos en español
   agent/                grafo LangGraph, estado, prompts y políticas
   llm/                  puertos, cliente de Ollama y proveedores de embeddings
+  integrations/         adaptadores externos: Google Calendar (OAuth y REST)
   storage/              modelos, repositorios, motores, checkpointer, GCS y almacenes en memoria
   services/             conversación, aprobaciones, ingesta, recordatorios y cola de trabajo
-  tools/                herramientas de memoria, tareas, documentos, restaurantes y búsqueda web
+  tools/                memoria, tareas, documentos, restaurantes, búsqueda web, calendario y reloj
   jobs/                 tres jobs de una sola pasada
 migrations/             revisiones de Alembic (0001..0007)
 docs/                   despliegue, operación, seguridad e informe final
 scripts/                despliegue, webhook, auditoría de imagen, presupuesto de conexiones,
-                        migraciones, bootstrap, sonda del modelo y base de datos local
+                        migraciones, bootstrap, sonda del modelo, OAuth de Google y base de datos local
 tests/unit/  tests/integration/  tests/evals/  tests/live/
 ```

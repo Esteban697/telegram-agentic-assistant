@@ -110,10 +110,18 @@ RESERVATION_ARGS = {
 class Phase3:
     """Real database, real registry, real approval service, scripted model."""
 
-    def __init__(self, *, script: list[ChatResult], delay: float = 0.0, **overrides: Any) -> None:
+    def __init__(
+        self,
+        *,
+        script: list[ChatResult],
+        delay: float = 0.0,
+        extra_specs: list[Any] | None = None,
+        **overrides: Any,
+    ) -> None:
         self.settings: Settings = make_db_settings(**overrides)
         self.script = script
         self.delay = delay
+        self.extra_specs = list(extra_specs or [])
 
     async def __aenter__(self) -> "Phase3":
         truncate_all(self.settings)
@@ -133,6 +141,7 @@ class Phase3:
                 *memory_specs(self.memory),
                 *task_specs(self.tasks),
                 *restaurant_specs(self.restaurants),
+                *self.extra_specs,
             ],
             sessions=self.database.sessions,
         )
@@ -188,8 +197,8 @@ class Phase3:
 
     async def action_rows(self) -> list[dict[str, Any]]:
         return await self.sql(
-            "SELECT action_id, state, args_revision, args_hash, attempts, result_json, error "
-            "FROM pending_actions ORDER BY created_at"
+            "SELECT action_id, state, args_revision, args_hash, attempts, result_json, error, "
+            "preview_text FROM pending_actions ORDER BY created_at"
         )
 
     async def callback_for(self, action_id: str, *, approve: bool = True, revision: int = 1) -> str:

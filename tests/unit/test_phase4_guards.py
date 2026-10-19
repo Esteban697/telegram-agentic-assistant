@@ -159,6 +159,10 @@ def _all_tool_specs():  # noqa: ANN202 - a list of ToolSpec
 
     from app.tools.documents import DocumentTools
     from app.tools.documents import specs as document_specs
+    from app.tools.calendar import CalendarTools
+    from app.tools.calendar import specs as calendar_specs
+    from app.tools.clock import ClockTool
+    from app.tools.clock import specs as clock_specs
     from app.tools.memory import MemoryTools
     from app.tools.memory import specs as memory_specs
     from app.tools.restaurants import RestaurantTools
@@ -174,6 +178,8 @@ def _all_tool_specs():  # noqa: ANN202 - a list of ToolSpec
         *web_specs(WebSearchTool()),
         *restaurant_specs(RestaurantTools()),
         *document_specs(DocumentTools(sessions=None, embeddings=None, min_score=0.1)),
+        *clock_specs(ClockTool()),
+        *calendar_specs(CalendarTools(provider=None)),
     ]
     assert len(tools) >= 10, "precondition: the tool surface must not shrink silently"
     return tools

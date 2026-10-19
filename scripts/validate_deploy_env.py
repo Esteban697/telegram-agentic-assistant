@@ -21,6 +21,7 @@ Exit codes: 0 = every component validates, 1 = at least one does not, 2 = could 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import pathlib
 import subprocess
@@ -51,6 +52,21 @@ PLACEHOLDER_VALUES: dict[str, str] = {
     "DATABASE_URL": (
         "postgresql+psycopg://taa_app.placeholder:placeholder"
         "@aws-0-eu-west-1.pooler.supabase.com:5432/postgres?sslmode=require"
+    ),
+    # The calendar is enabled in the deployed environment, so the JSON must parse and carry the
+    # three required fields. Plain words, not credential-shaped values: the image audit scans
+    # this file too.
+    "GOOGLE_OAUTH_CREDENTIALS": json.dumps(
+        {
+            "client_id": "placeholder-client-id",
+            "client_secret": "placeholder-client-secret",
+            "refresh_token": "placeholder-refresh-token",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "scopes": [
+                "https://www.googleapis.com/auth/calendar.events",
+                "https://www.googleapis.com/auth/calendar.events.freebusy",
+            ],
+        }
     ),
 }
 PLACEHOLDER_VALUES["DATABASE_SYNC_URL"] = PLACEHOLDER_VALUES["DATABASE_URL"]

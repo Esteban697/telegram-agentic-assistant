@@ -14,6 +14,7 @@ Two rules from the plan drive the design here:
 
 from __future__ import annotations
 
+import json
 import re
 import zoneinfo
 from typing import Annotated, Any, Literal
@@ -90,6 +91,22 @@ class Settings(BaseSettings):
     web_search_timeout_seconds: float = Field(default=10.0, gt=0)
     web_search_max_content_chars: int = Field(default=2000, ge=100)
     web_search_max_total_chars: int = Field(default=8000, ge=500)
+
+    # --- Google Calendar ---------------------------------------------------- #
+    # Disabled by default: without OAuth credentials the tools are not registered at all.
+    # When enabled in production, the credentials secret and a non-empty calendar id are
+    # required by `problems()`. The credentials are one JSON document:
+    #   {"client_id", "client_secret", "refresh_token", "token_uri", "scopes"}
+    google_calendar_enabled: bool = False
+    google_calendar_id: str = "primary"
+    google_oauth_credentials: SecretStr = SecretStr("")
+    google_calendar_timeout_seconds: float = Field(default=10.0, gt=0)
+    google_calendar_max_results: int = Field(default=50, ge=1, le=250)
+    google_calendar_max_range_days: int = Field(default=90, ge=1, le=366)
+    google_calendar_max_attendees: int = Field(default=20, ge=0, le=100)
+    google_calendar_workday_start_hour: int = Field(default=9, ge=0, le=23)
+    google_calendar_workday_end_hour: int = Field(default=18, ge=1, le=24)
+    google_calendar_default_duration_minutes: int = Field(default=60, ge=1, le=1440)
 
     # --- Budget and limits ------------------------------------------------- #
     request_budget_seconds: float = Field(default=45.0, gt=0)
@@ -293,6 +310,40 @@ class Settings(BaseSettings):
                 "WEB_SEARCH_BASE_URL must use https:// outside development "
                 f"(got {self.web_search_base_url!r})"
             )
+
+        if self.google_calendar_enabled:
+            if not self.google_calendar_id.strip():
+                found.append("GOOGLE_CALENDAR_ID must not be empty when the calendar is enabled")
+            raw_credentials = self.google_oauth_credentials.get_secret_value()
+            if not raw_credentials:
+                found.append(
+                    "GOOGLE_CALENDAR_ENABLED=true requires GOOGLE_OAUTH_CREDENTIALS "
+                    "(the combined client/refresh-token JSON)"
+                )
+            else:
+                try:
+                    parsed = json.loads(raw_credentials)
+                except (TypeError, ValueError):
+                    parsed = None
+                    found.append("GOOGLE_OAUTH_CREDENTIALS is not valid JSON")
+                if isinstance(parsed, dict):
+                    missing = [
+                        key
+                        for key in ("client_id", "client_secret", "refresh_token")
+                        if not str(parsed.get(key) or "").strip()
+                    ]
+                    if missing:
+                        found.append(
+                            "GOOGLE_OAUTH_CREDENTIALS is missing required field(s): "
+                            + ", ".join(missing)
+                        )
+                elif parsed is not None:
+                    found.append("GOOGLE_OAUTH_CREDENTIALS must be a JSON object")
+            if self.google_calendar_workday_start_hour >= self.google_calendar_workday_end_hour:
+                found.append(
+                    "GOOGLE_CALENDAR_WORKDAY_START_HOUR must be smaller than "
+                    "GOOGLE_CALENDAR_WORKDAY_END_HOUR"
+                )
 
         if self.default_timezone:
             try:

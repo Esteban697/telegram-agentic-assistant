@@ -34,6 +34,7 @@ from app.bot.handlers import TelegramHandlers
 from app.errors import AssistantError
 from app.bot.telegram_client import TelegramClient
 from app.config import Settings, load_settings
+from app.integrations.google_calendar import build_calendar_provider
 from app.llm.embeddings import build_embedding_provider
 from app.llm.ollama_client import OllamaChatClient
 from app.llm.protocols import ChatModel
@@ -52,6 +53,10 @@ from app.storage.postgres import Database, build_database, use_compatible_event_
 from app.storage.stores import build_stores
 from app.tools.documents import DocumentTools
 from app.tools.documents import specs as document_specs
+from app.tools.calendar import CalendarTools
+from app.tools.calendar import specs as calendar_specs
+from app.tools.clock import ClockTool
+from app.tools.clock import specs as clock_specs
 from app.tools.memory import MemoryTools
 from app.tools.memory import specs as memory_specs
 from app.tools.registry import ToolRegistry
@@ -202,6 +207,26 @@ def create_app(
                 max_total_chars=resolved.web_search_max_total_chars,
             )
 
+        # --- Google Calendar ------------------------------------------------------------ #
+        # Registered only when enabled: a disabled integration should not offer tools that
+        # always answer CapabilityUnavailable. The clock tool is always available.
+        calendar_provider = None
+        calendar_tools = None
+        if resolved.google_calendar_enabled:
+            calendar_provider = build_calendar_provider(resolved)
+            if calendar_provider is not None:
+                calendar_tools = CalendarTools(
+                    provider=calendar_provider,
+                    calendar_id=resolved.google_calendar_id,
+                    default_timezone=resolved.default_timezone,
+                    max_results=resolved.google_calendar_max_results,
+                    max_range_days=resolved.google_calendar_max_range_days,
+                    max_attendees=resolved.google_calendar_max_attendees,
+                    workday_start_hour=resolved.google_calendar_workday_start_hour,
+                    workday_end_hour=resolved.google_calendar_workday_end_hour,
+                    default_duration_minutes=resolved.google_calendar_default_duration_minutes,
+                )
+
         registry: ToolRegistry | None = None
         approvals: ApprovalService | None = None
         work_queue: WorkQueue | None = None
@@ -218,6 +243,12 @@ def create_app(
                     *web_specs(WebSearchTool(provider=web_provider)),
                     *restaurant_specs(RestaurantTools()),
                     *document_specs(document_tools),
+                    *clock_specs(ClockTool(timezone=resolved.default_timezone)),
+                    *(
+                        calendar_specs(calendar_tools)
+                        if calendar_tools is not None
+                        else []
+                    ),
                 ],
                 sessions=active_database.sessions,
                 stale_seconds=resolved.stale_invocation_seconds,
@@ -322,6 +353,8 @@ def create_app(
                 await telegram.aclose()
             if web_provider is not None:
                 await web_provider.aclose()
+            if calendar_provider is not None:
+                await calendar_provider.aclose()
             if owns_checkpointer and getattr(app.state, "checkpointer", None) is not None:
                 await app.state.checkpointer.aclose()
             if owns_database and active_database is not None:

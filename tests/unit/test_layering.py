@@ -18,6 +18,7 @@ APP_DIR = Path(__file__).resolve().parents[2] / "app"
 
 _PACKAGE_LAYERS = {
     "policy": 0,
+    "integrations": 1,
     "llm": 1,
     "storage": 2,
     "services": 3,

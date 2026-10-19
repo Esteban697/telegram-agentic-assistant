@@ -293,6 +293,7 @@ def secrets_dir(tmp_path: pathlib.Path) -> pathlib.Path:
         "ollama-api-key",
         "database-url",
         "checkpoint-url",
+        "google-oauth-credentials",
     ):
         (directory / name).write_text("SENTINEL-DO-NOT-PRINT-" + name + "\n", encoding="utf-8")
     return directory
@@ -614,7 +615,7 @@ def test_the_runbook_teardown_can_actually_run() -> None:
             f"the teardown does not retire {role}"
         )
     assert text.count("remove-iam-policy-binding") >= 4, (
-        "the project binding, the four secrets and the three jobs all need a teardown"
+        "the project binding, the secret loop and the job loop all need a teardown"
     )
 
 
@@ -768,6 +769,7 @@ EXPECTED_SECRETS = {
     # synchronously for Alembic and asynchronously for the app.
     "DATABASE_URL",
     "DATABASE_SYNC_URL",
+    "GOOGLE_OAUTH_CREDENTIALS",
 }
 
 
@@ -1194,8 +1196,8 @@ def test_resuming_resolves_the_secret_version_instead_of_pinning_one(
         ["--from-step", "8"], secrets_dir=secrets_dir, extra_env={"TAA_ALLOWED_USER_IDS": "42"}
     ).stdout
 
-    assert version_resolution_count(plan) == 4, (
-        "each of the four secrets must be resolved exactly once: "
+    assert version_resolution_count(plan) == 5, (
+        "each of the five secrets must be resolved exactly once: "
         f"{version_resolution_count(plan)} lookups found"
     )
     assert "resolver la versión activa" in plan

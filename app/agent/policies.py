@@ -60,11 +60,16 @@ def preview_text_for(tool_name: str, arguments: dict[str, Any]) -> str:
     """A frozen, human-readable summary of exactly what would run.
 
     It is stored with the action (`preview_text`) and shown on the button, so the user approves
-    a concrete description rather than a category.
+    a concrete description rather than a category. It is capped below Telegram's 4096-character
+    message limit: a calendar description may be long, and a rejected approval prompt would be
+    worse than a truncated one.
     """
 
     rendered = ", ".join(f"{key}={value!r}" for key, value in sorted(arguments.items()))
-    return f"{tool_name}({rendered})"
+    text = f"{tool_name}({rendered})"
+    if len(text) > 3000:
+        text = text[:2999] + "…"
+    return text
 
 
 async def prepare_approval(

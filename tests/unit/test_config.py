@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import ast
+import json
 from pathlib import Path
 
 import pytest
+from pydantic import SecretStr
 
 from app.config import Settings
 from app.errors import ConfigError
@@ -260,6 +262,62 @@ def test_secret_values_are_not_rendered() -> None:
     settings = make_settings()
     assert "test-token-not-a-real-secret" not in repr(settings)
     assert settings.bot_token == "test-token-not-a-real-secret"
+
+
+CALENDAR_CREDENTIALS = json.dumps(
+    {
+        "client_id": "id",
+        "client_secret": "secret",
+        "refresh_token": "refresh",
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "scopes": ["https://www.googleapis.com/auth/calendar.events"],
+    }
+)
+
+
+def test_calendar_enabled_with_credentials_is_valid() -> None:
+    settings = make_settings(
+        google_calendar_enabled=True,
+        google_oauth_credentials=CALENDAR_CREDENTIALS,
+    )
+    assert settings.problems() == []
+
+
+def test_calendar_enabled_requires_credentials() -> None:
+    broken = make_settings().model_copy(
+        update={"google_calendar_enabled": True, "google_oauth_credentials": SecretStr("")}
+    )
+    assert any("GOOGLE_OAUTH_CREDENTIALS" in item for item in broken.problems())
+
+
+def test_calendar_credentials_must_be_json_and_complete() -> None:
+    broken = make_settings().model_copy(
+        update={
+            "google_calendar_enabled": True,
+            "google_oauth_credentials": SecretStr("not json"),
+        }
+    )
+    assert any("not valid JSON" in item for item in broken.problems())
+
+    incomplete = make_settings().model_copy(
+        update={
+            "google_calendar_enabled": True,
+            "google_oauth_credentials": SecretStr(json.dumps({"client_id": "id"})),
+        }
+    )
+    assert any("missing required field" in item for item in incomplete.problems())
+
+
+def test_calendar_workday_must_have_a_positive_window() -> None:
+    broken = make_settings().model_copy(
+        update={
+            "google_calendar_enabled": True,
+            "google_oauth_credentials": SecretStr(CALENDAR_CREDENTIALS),
+            "google_calendar_workday_start_hour": 18,
+            "google_calendar_workday_end_hour": 9,
+        }
+    )
+    assert any("WORKDAY_START_HOUR" in item for item in broken.problems())
 
 
 # --------------------------------------------------------------------------- #

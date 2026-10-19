@@ -18,8 +18,9 @@ coste / IAM / límites / datos personales de la Fase 6.
 
 El asistente está **desplegado y funcionando** en `https://taa-prod-api-hzlxaxcstq-ew.a.run.app`:
 un bot privado de Telegram que conversa a través de Ollama Cloud, busca en la web datos actuales,
-guarda preferencias y recordatorios en PostgreSQL, indexa documentos y responde con la página de la
-que saca cada dato, y prepara acciones externas que solo se ejecutan con una aprobación explícita.
+consulta y modifica Google Calendar con aprobación, guarda preferencias y recordatorios en
+PostgreSQL, indexa documentos y responde con la página de la que saca cada dato, y prepara acciones
+externas que solo se ejecutan con una aprobación explícita.
 
 Evidencia de extremo a extremo, producida **por el usuario** contra el sistema desplegado:
 
@@ -30,7 +31,12 @@ Evidencia de extremo a extremo, producida **por el usuario** contra el sistema d
 - **un simulacro de reversión**: 100 % del tráfico a la revisión anterior y vuelta a la actual, con
   `/readyz` en 200 y el webhook sin errores (el caveat de `/health` está en §7 y en el runbook).
 
-Infraestructura: Cloud Run (servicio + 3 jobs), 3 schedulers habilitados, 4 secretos con versión
+**Google Calendar** está implementado y cubierto por pruebas unitarias y de integración, pero
+**todavía no está desplegado**: el siguiente `deploy.sh` exige el JSON de OAuth en
+`~/.taa/secrets/google-oauth-credentials`, que el usuario debe generar una vez con
+`scripts/google_auth.py` tras crear el cliente Desktop y publicar el consent screen.
+
+Infraestructura: Cloud Run (servicio + 3 jobs), 3 schedulers habilitados, 5 secretos con versión
 fijada, webhook registrado sin `last_error_message`, Supabase (PostgreSQL 17.11 + pgvector 0.8.2).
 
 ---
@@ -54,7 +60,8 @@ Telegram ──HTTPS──▶ app/api/telegram_webhook.py
   memorias, tareas, documentos y chunks, aprobaciones, ledger de herramientas, `work_items` y los
   checkpoints de LangGraph.
 - **Vertex AI** (`gemini-embedding-001`, 768 dimensiones) para embeddings; **Ollama Cloud** para el
-  modelo de chat y la búsqueda web; **Cloud Storage** para los originales.
+  modelo de chat y la búsqueda web; **Cloud Storage** para los originales; **Google Calendar** vía
+  OAuth 2.0 del usuario para la agenda y los eventos.
 
 ---
 
@@ -91,6 +98,9 @@ primera línea del docstring de cada módulo, abreviada.
 | `app/llm/errors.py` | Taxonomía de errores de proveedor (referencia, no segunda definición). |
 | `app/llm/ollama_client.py` | Cliente HTTP de Ollama aislado (timeout, reintentos acotados, sin URLs del token en errores). |
 | `app/llm/web_search.py` | Proveedor de búsqueda web de Ollama Cloud (request acotado, resultados recortados, sin reintentos ocultos). |
+| `app/integrations/google_calendar.py` | OAuth de usuario (refresh cacheado con lock) y cliente REST de Calendar. |
+| `app/tools/calendar.py` | Herramientas de calendario: lecturas de nivel 0 y escrituras de nivel 2 con aprobación. |
+| `app/tools/clock.py` | `get_current_datetime` para resolver fechas relativas. |
 | `app/llm/protocols.py` | Puertos del LLM (`ChatModel`, `EmbeddingProvider`) — capa 0. |
 | `app/policy/approval.py` | Máquina de estados de aprobación como funciones puras. |
 | `app/policy/authz.py` | Parseo de la allow-list, extracción de identidad, denegación por defecto. |
@@ -140,6 +150,7 @@ primera línea del docstring de cada módulo, abreviada.
 | `check_database.py` | Conectividad, pgvector ≥ 0.8, `vector` resoluble desde el rol y rol sin privilegios. |
 | `audit_image.py` | Audita la imagen por capas en busca de secretos; `--self-test` prueba el detector. |
 | `set_webhook.py` | Registra, consulta y da de baja el webhook sin imprimir nunca el token. |
+| `google_auth.py` | Autoriza Google Calendar una vez (loopback + PKCE) y escribe el JSON de credenciales sin imprimir el refresh token. |
 | `migrate.py` | Envoltorio de Alembic con comprobación previa y bloqueo de `downgrade` en producción. |
 | `bootstrap_db.py` | Esquema desde una base vacía + tablas del checkpointer + verificación. |
 | `run_local_db.sh` | Contenedor local `pgvector/pgvector:pg17` para desarrollo y pruebas. |
@@ -157,6 +168,10 @@ primera línea del docstring de cada módulo, abreviada.
 | `tests/unit/test_messages.py`, `test_readme.py` | Catálogo en español (única fuente), y que el README no miente sobre el código. |
 | `tests/unit/test_ollama_client.py`, `test_verify_ollama_probe.py`, `test_telegram_client.py` | Clientes y sonda, sin red real. |
 | `tests/unit/test_web_search_provider.py` | Búsqueda web: request, recorte, deduplicación, errores tipados y que no se registren consulta ni resultados. |
+| `tests/unit/test_google_calendar_provider.py` | Calendar: refresh cacheado, formas de request, errores, deduplicación y redacción. |
+| `tests/unit/test_calendar_tools.py` | Calendario: niveles, cuerpos, idempotencia, DST, huecos libres y reloj. |
+| `tests/unit/test_google_auth_script.py` | Helper de OAuth: PKCE y parsing del cliente Desktop. |
+| `tests/integration/test_calendar_approvals.py` | Escritura de calendario preparada, ejecutada una vez, timeout → `unknown`. |
 | `tests/unit/test_phase2_units.py`, `test_stores.py` | Persistencia: firmas congeladas y almacenes. |
 | `tests/unit/test_phase4_guards.py`, `test_phase4_review_fixes.py`, `test_review_hardening.py` | Guardas de la Fase 4 (ingesta, citas, delimitador, plazos). |
 | `tests/unit/test_deploy_artifacts.py` | El contrato del despliegue: `--project`, secretos nunca impresos, aritmético, idempotencia, `--from-step`, ejecución accidental, aislamiento de las pruebas. |
@@ -191,15 +206,16 @@ primera línea del docstring de cada módulo, abreviada.
 
 ## 4. Pruebas ejecutadas y resultados reales
 
-### 4.1 Matriz (ejecutada el 2026-10-18)
+### 4.1 Matriz (ejecutada el 2026-10-19)
 
 | Suite | Comando | Resultado real |
 |---|---|---|
-| Unitaria, sin credenciales, sin BD, sin red | `pytest -m "not integration and not live and not eval"` | **448 pasan** |
-| Integración contra PostgreSQL | `pytest -m integration` | **130 pasan, 1 se salta** |
+| Unitaria, sin credenciales, sin BD, sin red | `pytest -m "not integration and not live and not eval"` | **494 pasan** |
+| Integración contra PostgreSQL | `pytest -m integration` | **134 pasan, 1 se salta** |
 | Evaluaciones deterministas | `pytest -m "eval and not live"` | **23 pasan** |
 | Vertex real | `GOOGLE_CLOUD_PROJECT=telegram-assistant-esteban GOOGLE_CLOUD_REGION=europe-west1 RUN_LIVE_TESTS=1 pytest -m "live and not eval"` | **2 pasan** |
 | Agente sobre Ollama Cloud (incluye búsqueda web) | `RUN_LIVE_TESTS=1 pytest -m "eval and live"` | **8 en total: 7 pasan; 1 (nivel 2) falló y pasó al repetirla sola** |
+| Google Calendar real | `GOOGLE_CALENDAR_TEST_ID=... RUN_LIVE_TESTS=1 pytest -m "live and not eval" tests/live/test_google_calendar.py` | **no ejecutada**: requiere OAuth del usuario y un calendario de prueba |
 
 En la primera pasada de las evaluaciones del agente, `test_agent_prepares_a_level2_action_without_performing_it`
 falló porque el modelo no preparó la acción; al repetirla sola pasó. Es la estocasticidad del
@@ -258,11 +274,11 @@ Los 15 elementos, uno a uno. **Verificado** = hay una ejecución o una prueba co
 
 | # | Elemento | Estado | Evidencia / dependencia |
 |---|---|---|---|
-| 1 | Se puede ejecutar localmente siguiendo el README | **Verificado** | README (setup, `uv sync`, `.env`, `docker`/`uvicorn`) + la suite unitaria corre en una máquina limpia sin credenciales (448) |
+| 1 | Se puede ejecutar localmente siguiendo el README | **Verificado** | README (setup, `uv sync`, `.env`, `docker`/`uvicorn`) + la suite unitaria corre en una máquina limpia sin credenciales (494) |
 | 2 | `.env.example` sin secretos reales | **Verificado** | `.env.example` versionado con valores vacíos; `test_env_example_contains_no_real_looking_secret` |
 | 3 | Migraciones desde una base vacía | **Verificado** | `0001`…`0007` aplicadas al proyecto Supabase nuevo (17.11) y al contenedor local; `scripts/bootstrap_db.py` verifica tablas, `vector` ≥ 0.8, HNSW y una fila activa |
-| 4 | Las pruebas unitarias pasan | **Verificado** | 448 pasan, sin credenciales, sin BD, sin red |
-| 5 | Integración implementada y dependencias documentadas | **Verificado** | 130 pasan, 1 se salta; README documenta el contenedor y `TEST_DATABASE_URL` |
+| 4 | Las pruebas unitarias pasan | **Verificado** | 494 pasan, sin credenciales, sin BD, sin red |
+| 5 | Integración implementada y dependencias documentadas | **Verificado** | 134 pasan, 1 se salta; README documenta el contenedor y `TEST_DATABASE_URL` |
 | 6 | Telegram limitado a usuarios autorizados | **Verificado** | Allow-list + denegación por defecto; `test_authz`, `test_webhook_secret`; en producción una lista vacía **impide arrancar**; desplegado con `TELEGRAM_ALLOWED_USER_IDS` |
 | 7 | El LLM se puede cambiar por configuración | **Verificado** | `LLM_MODEL`; `test_model_name_is_never_hard_coded_outside_configuration`; sonda A10 documentada |
 | 8 | El estado de LangGraph es persistente | **Verificado** | `AsyncPostgresSaver` sobre la DSN; pruebas de reanudación en `test_phase2_db`; el servicio desplegado lo usa |
@@ -280,7 +296,7 @@ Los 15 elementos, uno a uno. **Verificado** = hay una ejecución o una prueba co
 
 | # | Entregable | Dónde | Estado |
 |---|---|---|---|
-| 1 | Código fuente funcional y tipado | `app/` (57 módulos, incluidos los `__init__`), con tipos en las fronteras de datos | Entregado |
+| 1 | Código fuente funcional y tipado | `app/` (61 módulos, incluidos los `__init__`), con tipos en las fronteras de datos | Entregado |
 | 2 | `pyproject.toml` con dependencias fijadas y comandos | `pyproject.toml` (pins exactos) + `uv.lock`; comandos de prueba en el README | Entregado |
 | 3 | `Dockerfile` y `.dockerignore` | Imagen multi-etapa, base por digest, no-root; `.dockerignore` con patrones `**/` | Entregado |
 | 4 | Migraciones de base de datos | `migrations/versions/0001`…`0007`; `alembic.ini` | Entregado y aplicado |
@@ -339,9 +355,17 @@ presenten como resueltos (spec §16).
    escrito en el plan (recall por página < 0,8 en consultas con un token literal raro).
 10. **Integraciones externas.** La búsqueda web está integrada con Ollama Cloud
     (`POST /api/web_search`, la misma `OLLAMA_API_KEY` del chat; 5 resultados por defecto, extractos
-    acotados, sin caché ni reintento oculto). Las herramientas de restaurantes siguen siendo
+    acotados, sin caché ni reintento oculto). Google Calendar está integrado con OAuth 2.0 de
+    aplicación instalada, scopes `calendar.events` + `calendar.events.freebusy`, lecturas de nivel 0
+    y escrituras de nivel 2 con aprobación. Las herramientas de restaurantes siguen siendo
     interfaces que responden `CapabilityUnavailable`; no se ha inventado ninguna API.
-11. **Una reversión deja el tráfico fijado.** El simulacro del 2026-10-18 dejó `spec.traffic`
+11. **Calendario: alcance limitado y OAuth que puede caducar.** Un solo calendario
+    (`GOOGLE_CALENDAR_ID`, por defecto `primary`), sin RSVP, recurrentes, movimiento entre
+    calendarios ni cambios de compartición. Los invitados reciben correos reales al crear, mover o
+    cancelar; la vista previa los muestra. Si el refresh token se revoca o caduca, hay que reejecutar
+    `scripts/google_auth.py` y desplegar. La prueba **live** de Calendar no se ha ejecutado todavía:
+    requiere el OAuth del usuario y un calendario de prueba (`GOOGLE_CALENDAR_TEST_ID`).
+12. **Una reversión deja el tráfico fijado.** El simulacro del 2026-10-18 dejó `spec.traffic`
     apuntando a `00003`; el despliegue siguiente creó `00004` pero siguió sirviendo `00003`, y
     Cloud Run retiró la revisión nueva. `/health` no lo detectó porque la revisión vieja estaba
     sana. Se corrigió en `scripts/deploy.sh`: tras desplegar ejecuta `update-traffic --to-latest` y
@@ -388,6 +412,7 @@ de confirmar** (spec §1.4; PLAN.md §12).
 | Cloud Logging | gratis hasta la franquicia | 0–bajo |
 | Supabase | **plan gratuito** hoy | **se pausa tras 7 días de inactividad y no tiene backups**; **Pro recomendado** (pendiente de confirmar su precio) |
 | Vertex AI (embeddings) | por uso, cuenta del usuario | **pendiente de confirmar** |
+| Google Calendar API | sin coste directo; cuotas estándar de la API | gratis para este uso |
 | Ollama Cloud | por token (chat) y por consulta (búsqueda web), cuenta del usuario | **pendiente de confirmar** |
 | Telegram Bot API | gratis | — |
 
@@ -397,7 +422,7 @@ de confirmar** (spec §1.4; PLAN.md §12).
 |---|---|---|---|
 | Runtime SA (`taa-prod-runtime`) | `roles/aiplatform.user` | proyecto | es lo mínimo para llamar a Vertex; sin él, todo embedding recibe 403 |
 | Runtime SA | `roles/storage.objectAdmin` | **solo el bucket** | acotado a `taa-prod-documents`; no `storage.admin` |
-| Runtime SA | `roles/secretmanager.secretAccessor` | **por secreto** (los 4) | lectura de exactamente los cuatro; sin `secretVersionManager` (rotar es un acto de despliegue) |
+| Runtime SA | `roles/secretmanager.secretAccessor` | **por secreto** (los 5) | lectura de exactamente los cinco; sin `secretVersionManager` (rotar es un acto de despliegue) |
 | Scheduler SA (`taa-prod-scheduler`) | `roles/run.invoker` | **por job** (los 3) | lo mínimo para disparar un job |
 | Humano (`operator@example.com`) | `roles/owner` | proyecto | es el dueño del proyecto y quien despliega; **no** es la identidad de ejecución |
 
@@ -433,6 +458,7 @@ servicio siguió respondiendo `/health` y `/readyz` con 200 después del cambio.
 | Despacho de recordatorios | lease 900 s, máx. 5 intentos | se reconcilia como `unknown`; nunca se reenvía solo |
 | Contexto RAG | top_k 5, 6000 caracteres | fragmentos, nunca documentos completos |
 | Búsqueda web | 5 resultados (máx. 10), 2000 caracteres por resultado, 8000 en total, timeout 10 s | los extractos no desplazan el contexto del turno; cada consulta cuenta en la cuenta de Ollama |
+| Calendario | 50 eventos, 90 días de rango, 20 invitados, 4.000 caracteres de descripción, timeout 10 s | por encima se pide reducir el rango; los eventos son externos y las escrituras exigen aprobación |
 
 ### 9.4 Datos personales: qué se guarda, cuánto y cómo se borra
 
@@ -445,6 +471,8 @@ servicio siguió respondiendo `/health` y `/readyz` con 200 después del cambio.
 | Documentos y fragmentos | GCS + `documents` + `document_chunks` (con embeddings) | RAG | borrado por etapas y **verificado** (fragmentos, objeto y fila) |
 | Aprobaciones y ledger de herramientas | `pending_actions`, `tool_invocations` | auditoría y no-duplicación | retención manual |
 | Consultas de búsqueda web | se envían a Ollama Cloud; **no** se persisten ni se registran | responder con datos actuales | no almacenadas; el proveedor aplica su propia política |
+| Eventos, invitados y descripciones de Calendar | se leen de Google bajo demanda; los argumentos de una escritura aprobada quedan en `pending_actions` (`args_json`, `preview_text`) y el resultado en `result_json` | agenda y reuniones | con la fila de la acción o borrando el evento; nunca en logs |
+| Refresh token de Google | Secret Manager (`taa-prod-google-oauth-credentials`) | acceso al calendario | revocar el acceso en Google y borrar/rotar el secreto |
 | Logs | Cloud Logging | operación | **sin contenido** por defecto (solo ids, herramienta, duración, estado, puntuaciones) |
 
 **Retención:** no hay purga automática. La decisión de retención sigue **abierta** (PLAN.md §13.7):
@@ -459,7 +487,7 @@ mensajes, documentos, embeddings ni secretos; `LOG_CONTENT_DEBUG=false` es el va
 
 ```bash
 # Suite sin credenciales, sin base de datos y sin red
-uv run pytest -m "not integration and not live and not eval"          # 448
+uv run pytest -m "not integration and not live and not eval"          # 494
 
 # Integración contra el contenedor local
 bash scripts/run_local_db.sh

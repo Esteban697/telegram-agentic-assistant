@@ -14,7 +14,7 @@ no es una convención que haya que recordar.
 
 > **Estado actual del proyecto (2026-10-18, Fase 6).** **Desplegado y operativo**: el servicio
 > `taa-prod-api` en `https://taa-prod-api-hzlxaxcstq-ew.a.run.app`, los tres Cloud Run Jobs, los tres
-> schedulers habilitados, los cuatro secretos con versión fijada y el webhook registrado. La base de
+> schedulers habilitados, los cinco secretos con versión fijada y el webhook registrado. La base de
 > datos es **Supabase** (PostgreSQL 17.11 + pgvector 0.8.2, alembic `0007`), ya provisionada y
 > migrada. **Cloud SQL no forma parte del despliegue**: la decisión de 2026-10-18 lo sustituyó por
 > Supabase. El estado real de cada criterio de aceptación, con sus pruebas, está en
@@ -49,7 +49,7 @@ recursos son céntimos o cero a este volumen.
 | Cloud Scheduler ×3 | `<job>-tick` | 3 jobs/mes dentro del nivel gratuito | 0 con estas cadencias |
 | Artifact Registry | `taa-prod-images` | Sí, por GB almacenado | pendiente de confirmar |
 | Cloud Storage | `taa-prod-documents` | Sí, por GB y operaciones | pendiente de confirmar |
-| Secret Manager | 4 secretos | Sí, por versión y por acceso | pendiente de confirmar |
+| Secret Manager | 5 secretos | Sí, por versión y por acceso | pendiente de confirmar |
 | Cloud Logging / métricas | `taa-prod-errors` | Gratis hasta la franquicia | 0–bajo |
 | Vertex AI (embeddings) | — | Sí, por llamada | pendiente de confirmar |
 | Ollama Cloud | — | Sí, por token (cuenta del usuario) | pendiente de confirmar |
@@ -184,7 +184,7 @@ bash scripts/deploy.sh --dump-env               # el entorno exacto de cada comp
 | 3 | `scripts/audit_image.py --self-test` + `--image` | auditoría de secretos | sin coste |
 | 4 | `artifacts repositories create` + `docker push` | Artifact Registry + imagen | **primera creación facturable**; pendiente de confirmar |
 | 5 | `iam service-accounts create` ×2 | `taa-prod-runtime`, `taa-prod-scheduler` | gratis |
-| 6 | `secrets create` ×4 + `versions add` + resolver versión | 4 secretos | pendiente de confirmar |
+| 6 | `secrets create` ×5 + `versions add` + resolver versión | 5 secretos | pendiente de confirmar |
 | 7 | `storage buckets create` + binding | bucket privado | pendiente de confirmar |
 | 8 | `add-iam-policy-binding` (aiplatform, secretos, jobs) | IAM mínimo | gratis |
 | 9 | `run deploy taa-prod-api` (con `--max-instances=1`) | Cloud Run Service | pendiente de confirmar |
@@ -212,11 +212,13 @@ La salida completa, comando por comando, está en el informe de la fase.
 ~/.taa/secrets/telegram-webhook-secret   # 1-256 caracteres de [A-Za-z0-9_-]
 ~/.taa/secrets/ollama-api-key            # la clave de Ollama Cloud
 ~/.taa/secrets/database-url              # la DSN de Supabase (pooler, TLS)
+~/.taa/secrets/google-oauth-credentials  # JSON de OAuth de Google Calendar (lo crea google_auth.py)
 ```
 
-**Cuatro ficheros, no cinco.** Un solo secreto sirve para `DATABASE_URL` y `DATABASE_SYNC_URL`
-(la DSN es la misma cadena, y `postgresql+psycopg` vale para el motor async y para Alembic). La
-primera versión de este documento pedía además un `checkpoint-url`: se eliminó porque no lo leía
+**Cinco ficheros.** Un solo secreto sirve para `DATABASE_URL` y `DATABASE_SYNC_URL` (la DSN es la
+misma cadena, y `postgresql+psycopg` vale para el motor async y para Alembic). El quinto es el JSON
+de OAuth de Google Calendar: `client_id`, `client_secret`, `refresh_token`, `token_uri` y `scopes`.
+La primera versión de este documento pedía además un `checkpoint-url`: se eliminó porque no lo leía
 ningún componente — el checkpointer usa la misma DSN (`app/storage/checkpointing.py`). Si tu
 proyecto llegó a tener el secreto `taa-prod-checkpoint-url`, bórralo; estaba creado, versionado y
 autorizado, y no lo montaba nadie:
@@ -248,6 +250,32 @@ unset SQL_PASSWORD
 Ese mismo valor es el que hay que tener a mano para `scripts/migrate.py` (§5). El pooler se abre en
 **modo sesión**; el modo transacción no sirve para este proyecto (el checkpointer y el
 `SET LOCAL hnsw.iterative_scan` necesitan una sesión de verdad).
+
+### Google Calendar (OAuth)
+
+La integración usa OAuth 2.0 de **aplicación instalada** con un refresh token. Pasos, una sola vez:
+
+1. Habilita `calendar-json.googleapis.com` (el `deploy.sh` lo hace en el paso 1).
+2. En **APIs & Services → OAuth consent screen**, configura una app **External** con los scopes
+   `https://www.googleapis.com/auth/calendar.events` y
+   `https://www.googleapis.com/auth/calendar.events.freebusy`, y publícala **In production**.
+   En **Testing** Google caduca el refresh token a los **7 días**; en producción sin verificar
+   aparece el aviso de app no verificada y se continúa con la cuenta del propietario.
+3. Crea un **cliente OAuth de tipo Desktop** y descarga el JSON.
+4. Ejecuta, en la máquina del operador:
+
+   ```bash
+   uv run python scripts/google_auth.py --client-file ~/Downloads/client_secret_....json
+   ```
+
+   Abre el navegador, recibe el redirect en `127.0.0.1`, intercambia el código con PKCE y escribe
+   `~/.taa/secrets/google-oauth-credentials` (modo 600). **No imprime** el refresh token.
+5. Despliega: `deploy.sh` crea `taa-prod-google-oauth-credentials`, lo monta como
+   `GOOGLE_OAUTH_CREDENTIALS`, añade el binding `secretAccessor` al runtime y pone
+   `GOOGLE_CALENDAR_ENABLED=true`. Si el fichero no existe, el paso 0 se niega a desplegar.
+
+Para revocar el acceso, hazlo desde la cuenta de Google; después vuelve a ejecutar el paso 4 y
+despliega. El runtime **no puede escribir** secretos: la rotación es un acto de despliegue.
 
 ### Rotación
 
@@ -470,6 +498,7 @@ gcloud secrets delete taa-prod-telegram-bot-token --project telegram-assistant-e
 gcloud secrets delete taa-prod-telegram-webhook-secret --project telegram-assistant-esteban
 gcloud secrets delete taa-prod-ollama-api-key --project telegram-assistant-esteban
 gcloud secrets delete taa-prod-database-url --project telegram-assistant-esteban
+gcloud secrets delete taa-prod-google-oauth-credentials --project telegram-assistant-esteban
 
 # Imagen y cuentas de servicio (el repositorio se lleva todas las etiquetas de la imagen)
 gcloud artifacts repositories delete taa-prod-images --location=europe-west1 --project telegram-assistant-esteban
@@ -488,7 +517,8 @@ gcloud projects remove-iam-policy-binding telegram-assistant-esteban \
   --member=serviceAccount:taa-prod-runtime@telegram-assistant-esteban.iam.gserviceaccount.com \
   --role=roles/aiplatform.user --project telegram-assistant-esteban
 for secret in taa-prod-telegram-bot-token taa-prod-telegram-webhook-secret \
-              taa-prod-ollama-api-key taa-prod-database-url; do
+              taa-prod-ollama-api-key taa-prod-database-url \
+              taa-prod-google-oauth-credentials; do
   gcloud secrets remove-iam-policy-binding "$secret" \
     --member=serviceAccount:taa-prod-runtime@telegram-assistant-esteban.iam.gserviceaccount.com \
     --role=roles/secretmanager.secretAccessor --project telegram-assistant-esteban
