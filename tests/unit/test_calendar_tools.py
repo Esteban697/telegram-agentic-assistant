@@ -51,8 +51,11 @@ class FakeProvider:
         self.updated: list[dict[str, Any]] = []
         self.deleted: list[dict[str, Any]] = []
         self.sent: list[str] = []
+        self.listed: list[dict[str, Any]] = []
+        self.freebusy_args: list[dict[str, Any]] = []
 
-    async def list_events(self, **_kwargs: Any) -> list[dict[str, Any]]:
+    async def list_events(self, **kwargs: Any) -> list[dict[str, Any]]:
+        self.listed.append(kwargs)
         return self.events
 
     async def get_event(self, _event_id: str) -> dict[str, Any]:
@@ -82,7 +85,8 @@ class FakeProvider:
         self.deleted.append({"event_id": event_id})
         self.sent.append(send_updates)
 
-    async def free_busy(self, **_kwargs: Any) -> list[dict[str, Any]]:
+    async def free_busy(self, **kwargs: Any) -> list[dict[str, Any]]:
+        self.freebusy_args.append(kwargs)
         return self.busy
 
 
@@ -123,6 +127,36 @@ async def test_create_event_builds_the_body_and_deterministic_id() -> None:
     assert body["attendees"] == [{"email": "ana@example.com"}]
     assert body["conferenceData"]["createRequest"]["requestId"].startswith("taa-")
     assert provider.sent == ["all"]
+
+
+async def test_create_event_with_day_expression_uses_the_server_resolver() -> None:
+    provider = FakeProvider()
+    tools = CalendarTools(
+        provider=provider,
+        default_timezone="Europe/Madrid",
+        now=lambda: datetime(2026, 10, 19, 12, 0, tzinfo=UTC),
+    )
+
+    result = await tools.create_event(
+        user_id=1,
+        args=CreateEventArgs(
+            summary="Reunión",
+            day_expression="tomorrow",
+            start_time="10:00",
+            duration_minutes=30,
+        ),
+        context={"action_id": "abc"},
+    )
+
+    assert result.ok is True
+    body = provider.created[0]
+    assert body["start"]["dateTime"] == "2026-10-20T08:00:00Z"
+    assert body["end"]["dateTime"] == "2026-10-20T08:30:00Z"
+
+
+def test_day_expression_for_create_requires_a_time() -> None:
+    with pytest.raises(ValidationError):
+        CreateEventArgs(summary="A", day_expression="tomorrow")
 
 
 async def test_create_event_without_action_id_uses_a_content_hash() -> None:
@@ -332,6 +366,95 @@ async def test_missing_provider_is_capability_unavailable() -> None:
 
     assert result.ok is False
     assert result.error_code == "CapabilityUnavailable"
+
+
+async def test_list_events_accepts_a_date_only_range() -> None:
+    provider = FakeProvider()
+    tools = CalendarTools(provider=provider, default_timezone="Europe/Madrid")
+
+    result = await tools.list_events(
+        user_id=1,
+        args=ListEventsArgs(start_local="2026-10-24", end_local="2026-10-24"),
+    )
+
+    assert result.ok is True
+    sent = provider.listed[0]
+    # Madrid is UTC+2 on 24 October: the day runs 2026-10-23T22:00Z..2026-10-24T22:00Z.
+    assert sent["time_min"].isoformat() == "2026-10-23T22:00:00+00:00"
+    assert sent["time_max"].isoformat() == "2026-10-24T22:00:00+00:00"
+    assert result.data["range"]["start_date"] == "2026-10-24"
+    assert result.data["range"]["start_weekday"] == "Saturday"
+
+
+async def test_find_free_slots_accepts_a_date_only_range() -> None:
+    provider = FakeProvider()
+    tools = CalendarTools(provider=provider, default_timezone="Europe/Madrid")
+
+    result = await tools.find_free_slots(
+        user_id=1,
+        args=FreeSlotsArgs(start_local="2026-10-24", end_local="2026-10-24", duration_minutes=60),
+    )
+
+    assert result.ok is True
+    assert provider.freebusy_args[0]["time_min"].isoformat() == "2026-10-23T22:00:00+00:00"
+
+
+async def test_day_expression_this_saturday_resolves_in_code() -> None:
+    provider = FakeProvider()
+    tools = CalendarTools(
+        provider=provider,
+        default_timezone="Europe/Madrid",
+        now=lambda: datetime(2026, 10, 19, 12, 0, tzinfo=UTC),
+    )
+
+    result = await tools.list_events(
+        user_id=1,
+        args=ListEventsArgs(day_expression="this_saturday"),
+    )
+
+    assert result.ok is True
+    assert provider.listed[0]["time_min"].isoformat() == "2026-10-23T22:00:00+00:00"
+    assert provider.listed[0]["time_max"].isoformat() == "2026-10-24T22:00:00+00:00"
+    assert result.data["range"]["start_date"] == "2026-10-24"
+    assert result.data["range"]["start_weekday"] == "Saturday"
+
+
+async def test_day_expression_tomorrow_and_next_week() -> None:
+    provider = FakeProvider()
+    tools = CalendarTools(
+        provider=provider,
+        default_timezone="Europe/Madrid",
+        now=lambda: datetime(2026, 10, 19, 12, 0, tzinfo=UTC),
+    )
+
+    tomorrow = await tools.list_events(user_id=1, args=ListEventsArgs(day_expression="tomorrow"))
+    assert tomorrow.data["range"]["start_date"] == "2026-10-20"
+
+    next_week = await tools.list_events(user_id=1, args=ListEventsArgs(day_expression="next_week"))
+    assert next_week.data["range"]["start_date"] == "2026-10-26"
+    assert next_week.data["range"]["end_date"] == "2026-11-02"
+
+
+async def test_unknown_day_expression_is_a_typed_failure() -> None:
+    provider = FakeProvider()
+    tools = CalendarTools(provider=provider, default_timezone="Europe/Madrid")
+
+    result = await tools.list_events(
+        user_id=1,
+        args=ListEventsArgs(day_expression="whenever"),
+    )
+
+    assert result.ok is False
+    assert result.error_code == "invalid_local_time"
+
+
+def test_day_expression_and_explicit_dates_are_mutually_exclusive() -> None:
+    with pytest.raises(ValidationError):
+        ListEventsArgs(
+            day_expression="this_saturday",
+            start_local="2026-10-24",
+            end_local="2026-10-24",
+        )
 
 
 def test_the_approval_preview_is_capped_below_telegrams_limit() -> None:

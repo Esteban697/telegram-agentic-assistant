@@ -26,6 +26,7 @@ import json
 import os
 import pathlib
 import secrets
+import socketserver
 import sys
 import threading
 import urllib.parse
@@ -68,6 +69,19 @@ def _client_from_file(path: pathlib.Path) -> dict[str, str]:
     }
 
 
+class _LoopbackServer(http.server.HTTPServer):
+    """`HTTPServer.server_bind` calls `socket.getfqdn`, which can block on DNS.
+
+    The loopback listener only needs the bound port, so skip the reverse lookup.
+    """
+
+    def server_bind(self) -> None:
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = str(host)
+        self.server_port = port
+
+
 class _CallbackHandler(http.server.BaseHTTPRequestHandler):
     server_version = "taa-oauth/1.0"
 
@@ -103,8 +117,7 @@ def _wait_for_callback(
     server: http.server.HTTPServer, *, state: str, timeout: float
 ) -> tuple[str, int]:
     result: dict[str, str] = {"state": state, "code": "", "error": ""}
-    server.result = result  # type: ignore[attr-defined]
-    server.timeout = timeout
+    server.result = result  # type: ignore[attr-defined]    server.timeout = timeout
     thread = threading.Thread(target=server.handle_request, daemon=True)
     thread.start()
     thread.join(timeout + 1)
@@ -163,7 +176,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Bind the real listener first so the URL carries the actual ephemeral port. Reusing a
     # probe-then-rebind was racy on Windows.
-    server = http.server.HTTPServer(("127.0.0.1", args.port), _CallbackHandler)
+    server = _LoopbackServer(("127.0.0.1", args.port), _CallbackHandler)
     port = server.server_address[1]
     redirect_uri = f"http://127.0.0.1:{port}"
 

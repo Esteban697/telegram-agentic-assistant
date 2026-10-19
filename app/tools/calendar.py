@@ -15,9 +15,10 @@ from __future__ import annotations
 
 import hashlib
 import re
+import unicodedata
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta
-from typing import Any
+from datetime import UTC, date, datetime, time, timedelta
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -40,6 +41,7 @@ from app.tools.base import ToolResult
 from app.tools.registry import ToolSpec
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _MAX_DESCRIPTION_CHARS = 4000
 _MAX_LOCATION_CHARS = 500
 _MAX_RETURNED_DESCRIPTION = 1200
@@ -60,11 +62,20 @@ _AMBIGUOUS = (GoogleTimeout, GoogleUnavailable, GoogleBadResponse)
 
 
 class ListEventsArgs(BaseModel):
-    start_local: str = Field(min_length=8, max_length=32)
-    end_local: str = Field(min_length=8, max_length=32)
+    start_local: str | None = Field(default=None, min_length=8, max_length=32)
+    end_local: str | None = Field(default=None, min_length=8, max_length=32)
+    day_expression: str | None = Field(default=None, max_length=40)
     timezone: str | None = Field(default=None, max_length=64)
     query: str | None = Field(default=None, max_length=200)
     max_results: int | None = Field(default=None, ge=1, le=250)
+
+    @model_validator(mode="after")
+    def _range_source(self) -> ListEventsArgs:
+        if self.day_expression and (self.start_local or self.end_local):
+            raise ValueError("use day_expression or start_local/end_local, not both")
+        if not self.day_expression and (self.start_local is None or self.end_local is None):
+            raise ValueError("provide day_expression or both start_local and end_local")
+        return self
 
 
 class GetEventArgs(BaseModel):
@@ -72,11 +83,20 @@ class GetEventArgs(BaseModel):
 
 
 class FreeSlotsArgs(BaseModel):
-    start_local: str = Field(min_length=8, max_length=32)
-    end_local: str = Field(min_length=8, max_length=32)
+    start_local: str | None = Field(default=None, min_length=8, max_length=32)
+    end_local: str | None = Field(default=None, min_length=8, max_length=32)
+    day_expression: str | None = Field(default=None, max_length=40)
     timezone: str | None = Field(default=None, max_length=64)
     duration_minutes: int = Field(default=60, ge=1, le=1440)
     include_weekends: bool = False
+
+    @model_validator(mode="after")
+    def _range_source(self) -> FreeSlotsArgs:
+        if self.day_expression and (self.start_local or self.end_local):
+            raise ValueError("use day_expression or start_local/end_local, not both")
+        if not self.day_expression and (self.start_local is None or self.end_local is None):
+            raise ValueError("provide day_expression or both start_local and end_local")
+        return self
 
 
 def _clean_attendees(value: list[str] | None) -> list[str] | None:
@@ -94,7 +114,9 @@ def _clean_attendees(value: list[str] | None) -> list[str] | None:
 
 class CreateEventArgs(BaseModel):
     summary: str = Field(min_length=1, max_length=200)
-    start_local: str = Field(min_length=8, max_length=32)
+    start_local: str | None = Field(default=None, min_length=8, max_length=32)
+    day_expression: str | None = Field(default=None, max_length=40)
+    start_time: str | None = Field(default=None, max_length=5)
     end_local: str | None = Field(default=None, min_length=8, max_length=32)
     duration_minutes: int | None = Field(default=None, ge=1, le=1440)
     timezone: str | None = Field(default=None, max_length=64)
@@ -109,7 +131,18 @@ class CreateEventArgs(BaseModel):
         return _clean_attendees(value) or []
 
     @model_validator(mode="after")
-    def _one_end(self) -> CreateEventArgs:
+    def _start_source(self) -> CreateEventArgs:
+        if self.day_expression:
+            if self.start_local:
+                raise ValueError("use day_expression + start_time or start_local, not both")
+            if not self.start_time:
+                raise ValueError("day_expression requires start_time (HH:MM)")
+            _parse_clock(self.start_time)
+        else:
+            if not self.start_local:
+                raise ValueError("provide start_local or day_expression + start_time")
+            if self.start_time:
+                raise ValueError("start_time is only valid with day_expression")
         if self.end_local is not None and self.duration_minutes is not None:
             raise ValueError("give end_local or duration_minutes, not both")
         return self
@@ -121,6 +154,8 @@ class UpdateEventArgs(BaseModel):
     expected_start: str = Field(min_length=1, max_length=64)
     summary: str | None = Field(default=None, min_length=1, max_length=200)
     start_local: str | None = Field(default=None, min_length=8, max_length=32)
+    day_expression: str | None = Field(default=None, max_length=40)
+    start_time: str | None = Field(default=None, max_length=5)
     end_local: str | None = Field(default=None, min_length=8, max_length=32)
     duration_minutes: int | None = Field(default=None, ge=1, le=1440)
     timezone: str | None = Field(default=None, max_length=64)
@@ -139,6 +174,8 @@ class UpdateEventArgs(BaseModel):
         changes = (
             self.summary,
             self.start_local,
+            self.day_expression,
+            self.start_time,
             self.end_local,
             self.duration_minutes,
             self.description,
@@ -150,6 +187,14 @@ class UpdateEventArgs(BaseModel):
             raise ValueError("the update has no fields to change")
         if self.end_local is not None and self.duration_minutes is not None:
             raise ValueError("give end_local or duration_minutes, not both")
+        if self.day_expression:
+            if self.start_local:
+                raise ValueError("use day_expression + start_time or start_local, not both")
+            if not self.start_time:
+                raise ValueError("day_expression requires start_time (HH:MM)")
+            _parse_clock(self.start_time)
+        elif self.start_time:
+            raise ValueError("start_time is only valid with day_expression")
         return self
 
 
@@ -172,6 +217,7 @@ class CalendarTools:
     workday_start_hour: int = 9
     workday_end_hour: int = 18
     default_duration_minutes: int = 60
+    now: Callable[[], datetime] | None = None
 
     # ------------------------------------------------------------------ #
     # Reads (level 0)
@@ -182,7 +228,7 @@ class CalendarTools:
         if self.provider is None:
             return _missing_provider()
         try:
-            start, end, zone = self._range(args.start_local, args.end_local, args.timezone)
+            start, end, zone = self._range_for(args)
         except InvalidLocalTime as exc:
             return _invalid_time(exc)
         if end <= start:
@@ -202,7 +248,12 @@ class CalendarTools:
             )
         except GoogleError as exc:
             return _read_failure(exc)
-        return ToolResult.success([_normalize_event(item) for item in events])
+        return ToolResult.success(
+            {
+                "range": _range_info(start, end, zone),
+                "events": [_normalize_event(item) for item in events],
+            }
+        )
 
     async def get_event(
         self, *, user_id: int, args: GetEventArgs, **_: Any
@@ -221,7 +272,7 @@ class CalendarTools:
         if self.provider is None:
             return _missing_provider()
         try:
-            start, end, zone = self._range(args.start_local, args.end_local, args.timezone)
+            start, end, zone = self._range_for(args)
         except InvalidLocalTime as exc:
             return _invalid_time(exc)
         if end <= start:
@@ -251,6 +302,7 @@ class CalendarTools:
         )
         return ToolResult.success(
             {
+                "range": _range_info(start, end, zone),
                 "timezone": zone.key,
                 "duration_minutes": args.duration_minutes,
                 "slots": slots[:_MAX_SLOTS],
@@ -268,10 +320,22 @@ class CalendarTools:
             return _missing_provider()
         zone = args.timezone or self.default_timezone
         try:
-            start_instant = parse_local(args.start_local, zone).due_at_utc
+            if args.day_expression:
+                day, _ = _resolve_expression(args.day_expression, self._now(), load_zone(zone))
+                start_instant = datetime.combine(
+                    day, _parse_clock(args.start_time or ""), tzinfo=load_zone(zone)
+                ).astimezone(UTC)
+            else:
+                start_instant = parse_local(args.start_local or "", zone).due_at_utc
             end_instant = self._end_for_create(args, start_instant, zone)
         except InvalidLocalTime as exc:
             return _invalid_time(exc)
+        except ValueError as exc:
+            return ToolResult.failure(
+                "invalid_clock",
+                message_key="error.calendar_bad_request",
+                detail=str(exc),
+            )
         if end_instant <= start_instant:
             return ToolResult.failure(
                 "invalid_range",
@@ -425,6 +489,27 @@ class CalendarTools:
         end = parse_local(end_local, zone_name).due_at_utc
         return start, end, load_zone(zone_name)
 
+    def _range_for(
+        self, args: ListEventsArgs | FreeSlotsArgs
+    ) -> tuple[datetime, datetime, ZoneInfo]:
+        zone_name = args.timezone or self.default_timezone
+        zone = load_zone(zone_name)
+        if args.day_expression:
+            start_day, end_day = _resolve_expression(
+                args.day_expression, self._now(), zone
+            )
+            start = datetime.combine(start_day, time(0, 0), tzinfo=zone).astimezone(UTC)
+            end = datetime.combine(end_day, time(0, 0), tzinfo=zone).astimezone(UTC)
+            return start, end, zone
+        return self._range(
+            _range_start(args.start_local or ""),
+            _range_end(args.end_local or ""),
+            zone_name,
+        )
+
+    def _now(self) -> datetime:
+        return self.now() if self.now is not None else datetime.now(UTC)
+
     def _end_for_create(
         self, args: CreateEventArgs, start: datetime, zone: str
     ) -> datetime:
@@ -451,6 +536,11 @@ class CalendarTools:
             )
         if args.start_local is not None:
             new_start = parse_local(args.start_local, zone).due_at_utc
+        elif args.day_expression is not None:
+            day, _ = _resolve_expression(args.day_expression, self._now(), load_zone(zone))
+            new_start = datetime.combine(
+                day, _parse_clock(args.start_time or ""), tzinfo=load_zone(zone)
+            ).astimezone(UTC)
         else:
             new_start = existing_start
         if args.end_local is not None:
@@ -469,9 +559,12 @@ def specs(tools: CalendarTools) -> list[ToolSpec]:
         ToolSpec(
             name="list_calendar_events",
             description=(
-                "List the user's calendar events in a local date range. Returns event ids, "
-                "summaries, start/end, attendees and links. Use get_current_datetime first for "
-                "relative dates."
+                "List the user's calendar events. For a relative day, set day_expression to "
+                "'today', 'tomorrow', 'this_saturday', 'next_saturday', 'this_weekend', "
+                "'next_week', 'this_week', etc.; otherwise pass start_local/end_local as "
+                "'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM'. Returns the resolved range (start_date, "
+                "end_date, start_weekday) and the events. Use the returned range in the answer; "
+                "do not compute dates in your head. Call this tool; do not write the call as text."
             ),
             args_model=ListEventsArgs,
             risk_level=RiskLevel.READ,
@@ -492,8 +585,11 @@ def specs(tools: CalendarTools) -> list[ToolSpec]:
         ToolSpec(
             name="find_free_slots",
             description=(
-                "Find free slots of a given duration in a local date range, within working hours. "
-                "Use it before proposing a meeting time."
+                "Find free slots of a given duration, within working hours. For a relative day, "
+                "set day_expression to 'today', 'tomorrow', 'this_saturday', 'next_saturday', "
+                "'this_weekend', etc.; otherwise pass start_local/end_local as 'YYYY-MM-DD' or "
+                "'YYYY-MM-DD HH:MM'. Returns the resolved range and the available slots. Use it "
+                "before proposing a meeting time. Call this tool; do not write the call as text."
             ),
             args_model=FreeSlotsArgs,
             risk_level=RiskLevel.READ,
@@ -503,8 +599,10 @@ def specs(tools: CalendarTools) -> list[ToolSpec]:
         ToolSpec(
             name="create_calendar_event",
             description=(
-                "Prepare a new calendar event. Requires the user's explicit approval before it "
-                "runs; the preview shows title, time, location, attendees and Meet link."
+                "Prepare a new calendar event. For a relative day use day_expression "
+                "('tomorrow', 'this_saturday', ...) plus start_time (HH:MM); otherwise pass "
+                "start_local as 'YYYY-MM-DD HH:MM'. Requires the user's explicit approval before "
+                "it runs; the preview shows title, time, location, attendees and Meet link."
             ),
             args_model=CreateEventArgs,
             risk_level=RiskLevel.EXTERNAL,
@@ -514,8 +612,9 @@ def specs(tools: CalendarTools) -> list[ToolSpec]:
         ToolSpec(
             name="update_calendar_event",
             description=(
-                "Prepare a change to an existing calendar event. Read it first and pass its "
-                "summary/start as expected_*; requires approval."
+                "Prepare a change to an existing calendar event. To reschedule, use "
+                "day_expression + start_time (HH:MM) or start_local ('YYYY-MM-DD HH:MM'). Read "
+                "it first and pass its summary/start as expected_*; requires approval."
             ),
             args_model=UpdateEventArgs,
             risk_level=RiskLevel.EXTERNAL,
@@ -539,6 +638,114 @@ def specs(tools: CalendarTools) -> list[ToolSpec]:
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
+_WEEKDAY_INDEX = {
+    "monday": 0,
+    "tuesday": 1,
+    "wednesday": 2,
+    "thursday": 3,
+    "friday": 4,
+    "saturday": 5,
+    "sunday": 6,
+}
+
+
+def _normalize_expression(text: str) -> str:
+    cleaned = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode().lower()
+    return re.sub(r"[\s-]+", "_", cleaned.strip()).strip("_")
+
+
+def _resolve_expression(expr: str, now: datetime, zone: ZoneInfo) -> tuple[date, date]:
+    """Resolve a relative day in code, so the model never does date arithmetic.
+
+    The returned end is exclusive. Weekday names mean the next occurrence (today included);
+    `next_<weekday>` adds a week.
+    """
+
+    key = _normalize_expression(expr)
+    today = now.astimezone(zone).date()
+    if key in {"today"}:
+        return today, today + timedelta(days=1)
+    if key in {"tomorrow"}:
+        return today + timedelta(days=1), today + timedelta(days=2)
+    if key in {"day_after_tomorrow"}:
+        return today + timedelta(days=2), today + timedelta(days=3)
+    if key in {"yesterday"}:
+        return today - timedelta(days=1), today
+
+    if key in {"this_week", "week"}:
+        end = today + timedelta(days=7 - today.weekday())
+        return today, end
+    if key in {"next_week"}:
+        start = today + timedelta(days=7 - today.weekday())
+        return start, start + timedelta(days=7)
+    if key in {"this_weekend", "weekend"}:
+        saturday = today + timedelta(days=(5 - today.weekday()) % 7)
+        return saturday, saturday + timedelta(days=2)
+    if key in {"next_weekend"}:
+        saturday = today + timedelta(days=(5 - today.weekday()) % 7 + 7)
+        return saturday, saturday + timedelta(days=2)
+
+    prefix_next = key.startswith("next_")
+    base = key
+    for prefix in ("next_", "this_"):
+        if base.startswith(prefix):
+            base = base[len(prefix) :]
+            break
+    if base in _WEEKDAY_INDEX:
+        start = today + timedelta(days=(_WEEKDAY_INDEX[base] - today.weekday()) % 7)
+        if prefix_next:
+            start += timedelta(days=7)
+        return start, start + timedelta(days=1)
+
+    raise InvalidLocalTime(
+        f"unknown day expression: {expr!r}",
+        reason="unknown_expression",
+    )
+
+
+def _parse_clock(text: str) -> time:
+    try:
+        return datetime.strptime(text.strip(), "%H:%M").time()
+    except (TypeError, ValueError) as exc:
+        raise ValueError("time must be HH:MM") from exc
+
+
+def _range_start(text: str) -> str:
+    """A date-only start means local midnight; a date-time is passed through."""
+
+    cleaned = text.strip()
+    return f"{cleaned} 00:00" if _DATE_ONLY_RE.match(cleaned) else cleaned
+
+
+def _range_end(text: str) -> str:
+    """A date-only end is exclusive at the next local midnight.
+
+    "What do I have on Saturday?" arrives as start=2026-10-24, end=2026-10-24; without this the
+    range would be empty. The next midnight is the correct exclusive bound.
+    """
+
+    cleaned = text.strip()
+    if not _DATE_ONLY_RE.match(cleaned):
+        return cleaned
+    day = datetime.strptime(cleaned, "%Y-%m-%d").date()
+    return f"{(day + timedelta(days=1)).isoformat()} 00:00"
+
+
+def _range_info(start: datetime, end: datetime, zone: ZoneInfo) -> dict[str, str]:
+    """The resolved range, so the model quotes it instead of doing date arithmetic."""
+
+    local_start = start.astimezone(zone)
+    local_end = end.astimezone(zone)
+    return {
+        "start_date": local_start.date().isoformat(),
+        "end_date": local_end.date().isoformat(),
+        "start_local": local_start.isoformat(),
+        "end_local": local_end.isoformat(),
+        "start_weekday": local_start.strftime("%A"),
+        "timezone": zone.key,
+    }
+
+
 def _missing_provider() -> ToolResult[Any]:
     return ToolResult.failure(
         "CapabilityUnavailable",
@@ -583,7 +790,10 @@ def _event_id(args: CreateEventArgs, context: dict[str, Any] | None) -> str:
         cleaned = re.sub(r"[^a-v0-9]", "", action_id.lower())
         if cleaned:
             return ("taa" + cleaned)[:_MAX_EVENT_ID_CHARS]
-    payload = f"{args.summary}|{args.start_local}|{args.end_local}|{args.duration_minutes}"
+    payload = (
+        f"{args.summary}|{args.start_local}|{args.day_expression}|{args.start_time}|"
+        f"{args.end_local}|{args.duration_minutes}"
+    )
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
     return f"taa{digest}"
 

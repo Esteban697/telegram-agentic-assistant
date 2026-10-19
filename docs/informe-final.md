@@ -210,7 +210,7 @@ primera línea del docstring de cada módulo, abreviada.
 
 | Suite | Comando | Resultado real |
 |---|---|---|
-| Unitaria, sin credenciales, sin BD, sin red | `pytest -m "not integration and not live and not eval"` | **494 pasan** |
+| Unitaria, sin credenciales, sin BD, sin red | `pytest -m "not integration and not live and not eval"` | **502 pasan** |
 | Integración contra PostgreSQL | `pytest -m integration` | **134 pasan, 1 se salta** |
 | Evaluaciones deterministas | `pytest -m "eval and not live"` | **23 pasan** |
 | Vertex real | `GOOGLE_CLOUD_PROJECT=telegram-assistant-esteban GOOGLE_CLOUD_REGION=europe-west1 RUN_LIVE_TESTS=1 pytest -m "live and not eval"` | **2 pasan** |
@@ -274,10 +274,10 @@ Los 15 elementos, uno a uno. **Verificado** = hay una ejecución o una prueba co
 
 | # | Elemento | Estado | Evidencia / dependencia |
 |---|---|---|---|
-| 1 | Se puede ejecutar localmente siguiendo el README | **Verificado** | README (setup, `uv sync`, `.env`, `docker`/`uvicorn`) + la suite unitaria corre en una máquina limpia sin credenciales (494) |
+| 1 | Se puede ejecutar localmente siguiendo el README | **Verificado** | README (setup, `uv sync`, `.env`, `docker`/`uvicorn`) + la suite unitaria corre en una máquina limpia sin credenciales (502) |
 | 2 | `.env.example` sin secretos reales | **Verificado** | `.env.example` versionado con valores vacíos; `test_env_example_contains_no_real_looking_secret` |
 | 3 | Migraciones desde una base vacía | **Verificado** | `0001`…`0007` aplicadas al proyecto Supabase nuevo (17.11) y al contenedor local; `scripts/bootstrap_db.py` verifica tablas, `vector` ≥ 0.8, HNSW y una fila activa |
-| 4 | Las pruebas unitarias pasan | **Verificado** | 494 pasan, sin credenciales, sin BD, sin red |
+| 4 | Las pruebas unitarias pasan | **Verificado** | 502 pasan, sin credenciales, sin BD, sin red |
 | 5 | Integración implementada y dependencias documentadas | **Verificado** | 134 pasan, 1 se salta; README documenta el contenedor y `TEST_DATABASE_URL` |
 | 6 | Telegram limitado a usuarios autorizados | **Verificado** | Allow-list + denegación por defecto; `test_authz`, `test_webhook_secret`; en producción una lista vacía **impide arrancar**; desplegado con `TELEGRAM_ALLOWED_USER_IDS` |
 | 7 | El LLM se puede cambiar por configuración | **Verificado** | `LLM_MODEL`; `test_model_name_is_never_hard_coded_outside_configuration`; sonda A10 documentada |
@@ -363,8 +363,12 @@ presenten como resueltos (spec §16).
     (`GOOGLE_CALENDAR_ID`, por defecto `primary`), sin RSVP, recurrentes, movimiento entre
     calendarios ni cambios de compartición. Los invitados reciben correos reales al crear, mover o
     cancelar; la vista previa los muestra. Si el refresh token se revoca o caduca, hay que reejecutar
-    `scripts/google_auth.py` y desplegar. La prueba **live** de Calendar no se ha ejecutado todavía:
-    requiere el OAuth del usuario y un calendario de prueba (`GOOGLE_CALENDAR_TEST_ID`).
+    `scripts/google_auth.py` y desplegar. La primera prueba real expuso dos defectos del modelo, no
+    del proveedor: escribió una llamada como texto y calculó mal "este sábado". Se corrigió
+    aceptando rangos de solo fecha, resolviendo días relativos en servidor (`day_expression`) y
+    devolviendo `range.start_date`/`range.start_weekday` para que el modelo cite el resultado en
+    lugar de hacer aritmética. La prueba **live** de Calendar no se ha ejecutado todavía: requiere
+    el OAuth del usuario y un calendario de prueba (`GOOGLE_CALENDAR_TEST_ID`).
 12. **Una reversión deja el tráfico fijado.** El simulacro del 2026-10-18 dejó `spec.traffic`
     apuntando a `00003`; el despliegue siguiente creó `00004` pero siguió sirviendo `00003`, y
     Cloud Run retiró la revisión nueva. `/health` no lo detectó porque la revisión vieja estaba
@@ -487,7 +491,7 @@ mensajes, documentos, embeddings ni secretos; `LOG_CONTENT_DEBUG=false` es el va
 
 ```bash
 # Suite sin credenciales, sin base de datos y sin red
-uv run pytest -m "not integration and not live and not eval"          # 494
+uv run pytest -m "not integration and not live and not eval"          # 502
 
 # Integración contra el contenedor local
 bash scripts/run_local_db.sh
