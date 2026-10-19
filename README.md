@@ -1,13 +1,15 @@
 # Asistente personal en Telegram
 
 Asistente personal privado para Telegram. Un único usuario autorizado conversa con un modelo
-alojado en Ollama Cloud, busca en la web datos actuales, y puede guardar preferencias, crear
+alojado en Ollama Cloud, busca en la web datos actuales, consulta su calendario de Google —agenda,
+huecos libres y eventos, con aprobación para escribir— y puede guardar preferencias, crear
 recordatorios, enviar documentos para preguntar por su contenido y preparar acciones externas que
 solo se ejecutan con aprobación explícita.
 
 Está desplegado en Google Cloud: el servicio y los tres jobs corren en Cloud Run, el estado vive en
-PostgreSQL (Supabase) y los embeddings se calculan con Vertex AI. La documentación de despliegue,
-operación, seguridad y el informe final están en [`docs/`](docs/).
+PostgreSQL (Supabase), los embeddings se calculan con Vertex AI y el calendario usa OAuth de Google
+con el refresh token en Secret Manager. La documentación de despliegue, operación, seguridad y el
+informe final están en [`docs/`](docs/).
 
 ---
 
@@ -109,17 +111,21 @@ proveedor falla, lo dice en vez de rellenar con conocimiento general presentado 
 
 ### Calendario
 
-- `¿Qué tengo hoy?` / `¿Qué tengo esta semana?`
+- `¿Qué tengo hoy?` / `¿Qué tengo este sábado?`
+- `¿Qué tengo esta semana?` / `¿Qué tengo la semana que viene?`
 - `Encuéntrame un hueco de 45 minutos mañana por la tarde.`
 - `Resume mi agenda del jueves y dime si hay solapamientos.`
 - `Agenda una reunión con Ana el jueves a las 10:00, 30 minutos, con Meet.`
 - `Muévela a las 11:00.` / `Cancela la del viernes.`
 
-Para fechas relativas el asistente consulta primero la hora real; no supone el día. Leer la agenda
-y buscar huecos no requiere aprobación. Crear, mover o cancelar un evento sí: se prepara la acción,
-se muestra una vista previa con los argumentos exactos (título, hora, invitados, lugar y Meet) y
-solo se ejecuta al pulsar **Aprobar**. Antes de modificar o cancelar, el asistente lee el evento y
-verifica que su título y hora siguen siendo los que viste; si cambió, no lo toca.
+Para fechas relativas ("hoy", "mañana", "este sábado", "la semana que viene") el asistente pide a
+la herramienta que **resuelva el día en servidor**; no calcula fechas de memoria. Las consultas
+aceptan una fecha suelta (`2026-10-24`), una fecha con hora (`2026-10-24 10:00`) o una expresión
+relativa. Leer la agenda y buscar huecos no requiere aprobación. Crear, mover o cancelar un evento
+sí: se prepara la acción, se muestra una vista previa con los argumentos exactos (título, hora,
+invitados, lugar y Meet) y solo se ejecuta al pulsar **Aprobar**. Antes de modificar o cancelar, el
+asistente lee el evento y verifica que su título y hora siguen siendo los que viste; si cambió, no
+lo toca.
 
 Los invitados reciben la invitación o la cancelación por correo cuando el evento tiene asistentes.
 La integración es de **un solo calendario** (`GOOGLE_CALENDAR_ID`, por defecto `primary`); no hay
@@ -364,6 +370,10 @@ RUN_LIVE_TESTS=1 uv run pytest -m "eval and live"
 # Búsqueda web real: modelo + /api/web_search (cada consulta cuenta en Ollama)
 TEST_DATABASE_URL=postgresql+psycopg://postgres:postgres@127.0.0.1:55432/taa \
 RUN_LIVE_TESTS=1 uv run pytest -m "eval and live" tests/evals/test_web_search_live.py
+
+# Calendario real: OAuth + un calendario de prueba (nunca `primary`)
+GOOGLE_CALENDAR_TEST_ID=<id-del-calendario-de-prueba> \
+RUN_LIVE_TESTS=1 uv run pytest -m "live and not eval" tests/live/test_google_calendar.py
 ```
 
 Los marcadores `integration`, `eval` y `live` están declarados en `pyproject.toml`; las pruebas que
@@ -440,9 +450,10 @@ Dos reglas que se comprueban con pruebas, no por convención:
 **Estado desplegado:** servicio `taa-prod-api` en Cloud Run
 (`https://taa-prod-api-hzlxaxcstq-ew.a.run.app`, escala a cero, `max-instances=1`), tres Cloud Run
 Jobs, tres schedulers habilitados, cinco secretos con versión fijada y el webhook registrado.
-Base de datos en Supabase (PostgreSQL 17.11 + pgvector 0.8.2) y embeddings en Vertex AI. El script
-limpia cualquier pin de tráfico que haya dejado una reversión y comprueba que la revisión que sirve
-es la última lista.
+Base de datos en Supabase (PostgreSQL 17.11 + pgvector 0.8.2), embeddings en Vertex AI y
+**Google Calendar activo** con OAuth (`calendar.events` + `calendar.events.freebusy`) y el
+calendario `primary`. El script limpia cualquier pin de tráfico que haya dejado una reversión y
+comprueba que la revisión que sirve es la última lista.
 
 - Incidentes y recuperación: [`docs/operacion.md`](docs/operacion.md).
 - Seguridad y política de aprobación: [`docs/seguridad.md`](docs/seguridad.md).

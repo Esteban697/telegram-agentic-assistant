@@ -31,10 +31,13 @@ Evidencia de extremo a extremo, producida **por el usuario** contra el sistema d
 - **un simulacro de reversión**: 100 % del tráfico a la revisión anterior y vuelta a la actual, con
   `/readyz` en 200 y el webhook sin errores (el caveat de `/health` está en §7 y en el runbook).
 
-**Google Calendar** está implementado y cubierto por pruebas unitarias y de integración, pero
-**todavía no está desplegado**: el siguiente `deploy.sh` exige el JSON de OAuth en
-`~/.taa/secrets/google-oauth-credentials`, que el usuario debe generar una vez con
-`scripts/google_auth.py` tras crear el cliente Desktop y publicar el consent screen.
+**Google Calendar está desplegado** en la revisión `taa-prod-api-00006-krn`: Calendar API
+habilitada, secreto `taa-prod-google-oauth-credentials` (versión 2) montado como
+`GOOGLE_OAUTH_CREDENTIALS`, `GOOGLE_CALENDAR_ENABLED=true`, calendario `primary`, y lectura real
+verificada. El usuario probó la consulta "¿Qué tengo este sábado en mi calendario?" desde Telegram
+y la respuesta fue correcta. La primera prueba real expuso dos defectos del modelo (escribió una
+llamada como texto y calculó mal la fecha); se corrigieron en `2f69340` resolviendo días relativos
+y rangos en servidor (ver §7.11).
 
 Infraestructura: Cloud Run (servicio + 3 jobs), 3 schedulers habilitados, 5 secretos con versión
 fijada, webhook registrado sin `last_error_message`, Supabase (PostgreSQL 17.11 + pgvector 0.8.2).
@@ -215,7 +218,7 @@ primera línea del docstring de cada módulo, abreviada.
 | Evaluaciones deterministas | `pytest -m "eval and not live"` | **23 pasan** |
 | Vertex real | `GOOGLE_CLOUD_PROJECT=telegram-assistant-esteban GOOGLE_CLOUD_REGION=europe-west1 RUN_LIVE_TESTS=1 pytest -m "live and not eval"` | **2 pasan** |
 | Agente sobre Ollama Cloud (incluye búsqueda web) | `RUN_LIVE_TESTS=1 pytest -m "eval and live"` | **8 en total: 7 pasan; 1 (nivel 2) falló y pasó al repetirla sola** |
-| Google Calendar real | `GOOGLE_CALENDAR_TEST_ID=... RUN_LIVE_TESTS=1 pytest -m "live and not eval" tests/live/test_google_calendar.py` | **no ejecutada**: requiere OAuth del usuario y un calendario de prueba |
+| Google Calendar real | `GOOGLE_CALENDAR_TEST_ID=... RUN_LIVE_TESTS=1 pytest -m "live and not eval" tests/live/test_google_calendar.py` | **no ejecutada** (automatizada): requiere un calendario de prueba; la consulta real desde Telegram sí se verificó |
 
 En la primera pasada de las evaluaciones del agente, `test_agent_prepares_a_level2_action_without_performing_it`
 falló porque el modelo no preparó la acción; al repetirla sola pasó. Es la estocasticidad del
@@ -231,7 +234,11 @@ lo dice con el comando exacto. No hay ningún salto silencioso.
 - Servicio `taa-prod-api` en `https://taa-prod-api-hzlxaxcstq-ew.a.run.app`, con escala a cero y
   `max-instances=1`; `/health` y `/readyz` en verde.
 - Tres Cloud Run Jobs (recordatorios, documentos, reanudación), tres Scheduler habilitados.
-- Cuatro secretos en Secret Manager con **versión fijada numéricamente** (nunca `latest`).
+- Cinco secretos en Secret Manager con **versión fijada numéricamente** (nunca `latest`).
+- **Calendario (revisión `00006-krn`):** `GOOGLE_CALENDAR_ENABLED=true`, calendario `primary`,
+  secreto `taa-prod-google-oauth-credentials:2`, Calendar API habilitada, y lectura real de
+  `list_events`/`freeBusy` verificada. La consulta "¿Qué tengo este sábado?" respondió desde
+  Telegram con los eventos correctos.
 - Webhook registrado; `getWebhookInfo` sin `last_error_message`.
 - `/start` → 200, `update handled`; mensaje normal → respuesta en ~1,6 s.
 - **Recordatorio creado y entregado** de extremo a extremo.
@@ -367,8 +374,9 @@ presenten como resueltos (spec §16).
     del proveedor: escribió una llamada como texto y calculó mal "este sábado". Se corrigió
     aceptando rangos de solo fecha, resolviendo días relativos en servidor (`day_expression`) y
     devolviendo `range.start_date`/`range.start_weekday` para que el modelo cite el resultado en
-    lugar de hacer aritmética. La prueba **live** de Calendar no se ha ejecutado todavía: requiere
-    el OAuth del usuario y un calendario de prueba (`GOOGLE_CALENDAR_TEST_ID`).
+    lugar de hacer aritmética. La prueba **live automatizada** de Calendar no se ha ejecutado
+    todavía (requiere un calendario de prueba, `GOOGLE_CALENDAR_TEST_ID`); la consulta manual del
+    usuario desde Telegram sí pasó.
 12. **Una reversión deja el tráfico fijado.** El simulacro del 2026-10-18 dejó `spec.traffic`
     apuntando a `00003`; el despliegue siguiente creó `00004` pero siguió sirviendo `00003`, y
     Cloud Run retiró la revisión nueva. `/health` no lo detectó porque la revisión vieja estaba
