@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import hashlib
 import re
-import unicodedata
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, Callable
@@ -36,6 +35,7 @@ from app.errors import (
     GoogleUnavailable,
 )
 from app.policy.risk import RiskLevel
+from app.policy.relative_dates import UnknownDayExpression, parse_clock, resolve_day_range
 from app.policy.timezones import InvalidLocalTime, describe_instant, load_zone, parse_local
 from app.tools.base import ToolResult
 from app.tools.registry import ToolSpec
@@ -137,7 +137,7 @@ class CreateEventArgs(BaseModel):
                 raise ValueError("use day_expression + start_time or start_local, not both")
             if not self.start_time:
                 raise ValueError("day_expression requires start_time (HH:MM)")
-            _parse_clock(self.start_time)
+            parse_clock(self.start_time)
         else:
             if not self.start_local:
                 raise ValueError("provide start_local or day_expression + start_time")
@@ -192,7 +192,7 @@ class UpdateEventArgs(BaseModel):
                 raise ValueError("use day_expression + start_time or start_local, not both")
             if not self.start_time:
                 raise ValueError("day_expression requires start_time (HH:MM)")
-            _parse_clock(self.start_time)
+            parse_clock(self.start_time)
         elif self.start_time:
             raise ValueError("start_time is only valid with day_expression")
         return self
@@ -321,9 +321,9 @@ class CalendarTools:
         zone = args.timezone or self.default_timezone
         try:
             if args.day_expression:
-                day, _ = _resolve_expression(args.day_expression, self._now(), load_zone(zone))
+                day, _ = _resolve_day_range(args.day_expression, self._now(), load_zone(zone))
                 start_instant = datetime.combine(
-                    day, _parse_clock(args.start_time or ""), tzinfo=load_zone(zone)
+                    day, parse_clock(args.start_time or ""), tzinfo=load_zone(zone)
                 ).astimezone(UTC)
             else:
                 start_instant = parse_local(args.start_local or "", zone).due_at_utc
@@ -495,7 +495,7 @@ class CalendarTools:
         zone_name = args.timezone or self.default_timezone
         zone = load_zone(zone_name)
         if args.day_expression:
-            start_day, end_day = _resolve_expression(
+            start_day, end_day = _resolve_day_range(
                 args.day_expression, self._now(), zone
             )
             start = datetime.combine(start_day, time(0, 0), tzinfo=zone).astimezone(UTC)
@@ -537,9 +537,9 @@ class CalendarTools:
         if args.start_local is not None:
             new_start = parse_local(args.start_local, zone).due_at_utc
         elif args.day_expression is not None:
-            day, _ = _resolve_expression(args.day_expression, self._now(), load_zone(zone))
+            day, _ = _resolve_day_range(args.day_expression, self._now(), load_zone(zone))
             new_start = datetime.combine(
-                day, _parse_clock(args.start_time or ""), tzinfo=load_zone(zone)
+                day, parse_clock(args.start_time or ""), tzinfo=load_zone(zone)
             ).astimezone(UTC)
         else:
             new_start = existing_start
@@ -638,76 +638,13 @@ def specs(tools: CalendarTools) -> list[ToolSpec]:
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
-_WEEKDAY_INDEX = {
-    "monday": 0,
-    "tuesday": 1,
-    "wednesday": 2,
-    "thursday": 3,
-    "friday": 4,
-    "saturday": 5,
-    "sunday": 6,
-}
-
-
-def _normalize_expression(text: str) -> str:
-    cleaned = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode().lower()
-    return re.sub(r"[\s-]+", "_", cleaned.strip()).strip("_")
-
-
-def _resolve_expression(expr: str, now: datetime, zone: ZoneInfo) -> tuple[date, date]:
-    """Resolve a relative day in code, so the model never does date arithmetic.
-
-    The returned end is exclusive. Weekday names mean the next occurrence (today included);
-    `next_<weekday>` adds a week.
-    """
-
-    key = _normalize_expression(expr)
-    today = now.astimezone(zone).date()
-    if key in {"today"}:
-        return today, today + timedelta(days=1)
-    if key in {"tomorrow"}:
-        return today + timedelta(days=1), today + timedelta(days=2)
-    if key in {"day_after_tomorrow"}:
-        return today + timedelta(days=2), today + timedelta(days=3)
-    if key in {"yesterday"}:
-        return today - timedelta(days=1), today
-
-    if key in {"this_week", "week"}:
-        end = today + timedelta(days=7 - today.weekday())
-        return today, end
-    if key in {"next_week"}:
-        start = today + timedelta(days=7 - today.weekday())
-        return start, start + timedelta(days=7)
-    if key in {"this_weekend", "weekend"}:
-        saturday = today + timedelta(days=(5 - today.weekday()) % 7)
-        return saturday, saturday + timedelta(days=2)
-    if key in {"next_weekend"}:
-        saturday = today + timedelta(days=(5 - today.weekday()) % 7 + 7)
-        return saturday, saturday + timedelta(days=2)
-
-    prefix_next = key.startswith("next_")
-    base = key
-    for prefix in ("next_", "this_"):
-        if base.startswith(prefix):
-            base = base[len(prefix) :]
-            break
-    if base in _WEEKDAY_INDEX:
-        start = today + timedelta(days=(_WEEKDAY_INDEX[base] - today.weekday()) % 7)
-        if prefix_next:
-            start += timedelta(days=7)
-        return start, start + timedelta(days=1)
-
-    raise InvalidLocalTime(
-        f"unknown day expression: {expr!r}",
-        reason="unknown_expression",
-    )
-
-
-def _parse_clock(text: str) -> time:
+def _resolve_day_range(
+    expression: str, now: datetime, zone: ZoneInfo
+) -> tuple[date, date]:
     try:
-        return datetime.strptime(text.strip(), "%H:%M").time()
-    except (TypeError, ValueError) as exc:
-        raise ValueError("time must be HH:MM") from exc
+        return resolve_day_range(expression, now, zone)
+    except UnknownDayExpression as exc:
+        raise InvalidLocalTime(str(exc), reason="unknown_expression") from exc
 
 
 def _range_start(text: str) -> str:

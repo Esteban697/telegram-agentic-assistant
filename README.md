@@ -65,12 +65,15 @@ vez de inventar una respuesta.
 
 ### Recordatorios
 
-- `Recuérdame llamar al dentista el 20 de octubre a las 9:30.`
-- `Ponme un recordatorio para renovar el DNI el 3 de noviembre a las 18:00.`
+- `Recuérdame llamar al dentista mañana a las 9:30.`
+- `Recuérdame renovar el DNI el lunes a las 18:00.`
 - `Recuérdame sacar la basura mañana a las 20:00.`
+- `Ponme un recordatorio para el 3 de noviembre a las 18:00.`
 
 La zona por defecto es `Europe/Madrid` (`DEFAULT_TIMEZONE`); si estás en otra, dila explícitamente
-(`... a las 9:30 hora de Buenos Aires`). Si la fecha es ambigua, pregunta antes de crear nada.
+(`... a las 9:30 hora de Buenos Aires`). Las fechas relativas ("mañana", "el lunes") se resuelven
+**en servidor con la hora real**, no con lo que el modelo crea que es hoy. Si la fecha resultante
+ya pasó, el asistente la rechaza y pide otra en vez de crear un recordatorio vencido.
 
 - `/tasks` — lista los recordatorios con hora local, zona y estado.
 - `Marca como hecho el recordatorio del dentista.`

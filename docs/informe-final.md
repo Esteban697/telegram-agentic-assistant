@@ -213,7 +213,7 @@ primera línea del docstring de cada módulo, abreviada.
 
 | Suite | Comando | Resultado real |
 |---|---|---|
-| Unitaria, sin credenciales, sin BD, sin red | `pytest -m "not integration and not live and not eval"` | **502 pasan** |
+| Unitaria, sin credenciales, sin BD, sin red | `pytest -m "not integration and not live and not eval"` | **512 pasan** |
 | Integración contra PostgreSQL | `pytest -m integration` | **134 pasan, 1 se salta** |
 | Evaluaciones deterministas | `pytest -m "eval and not live"` | **23 pasan** |
 | Vertex real | `GOOGLE_CLOUD_PROJECT=telegram-assistant-esteban GOOGLE_CLOUD_REGION=europe-west1 RUN_LIVE_TESTS=1 pytest -m "live and not eval"` | **2 pasan** |
@@ -281,10 +281,10 @@ Los 15 elementos, uno a uno. **Verificado** = hay una ejecución o una prueba co
 
 | # | Elemento | Estado | Evidencia / dependencia |
 |---|---|---|---|
-| 1 | Se puede ejecutar localmente siguiendo el README | **Verificado** | README (setup, `uv sync`, `.env`, `docker`/`uvicorn`) + la suite unitaria corre en una máquina limpia sin credenciales (502) |
+| 1 | Se puede ejecutar localmente siguiendo el README | **Verificado** | README (setup, `uv sync`, `.env`, `docker`/`uvicorn`) + la suite unitaria corre en una máquina limpia sin credenciales (512) |
 | 2 | `.env.example` sin secretos reales | **Verificado** | `.env.example` versionado con valores vacíos; `test_env_example_contains_no_real_looking_secret` |
 | 3 | Migraciones desde una base vacía | **Verificado** | `0001`…`0007` aplicadas al proyecto Supabase nuevo (17.11) y al contenedor local; `scripts/bootstrap_db.py` verifica tablas, `vector` ≥ 0.8, HNSW y una fila activa |
-| 4 | Las pruebas unitarias pasan | **Verificado** | 502 pasan, sin credenciales, sin BD, sin red |
+| 4 | Las pruebas unitarias pasan | **Verificado** | 512 pasan, sin credenciales, sin BD, sin red |
 | 5 | Integración implementada y dependencias documentadas | **Verificado** | 134 pasan, 1 se salta; README documenta el contenedor y `TEST_DATABASE_URL` |
 | 6 | Telegram limitado a usuarios autorizados | **Verificado** | Allow-list + denegación por defecto; `test_authz`, `test_webhook_secret`; en producción una lista vacía **impide arrancar**; desplegado con `TELEGRAM_ALLOWED_USER_IDS` |
 | 7 | El LLM se puede cambiar por configuración | **Verificado** | `LLM_MODEL`; `test_model_name_is_never_hard_coded_outside_configuration`; sonda A10 documentada |
@@ -383,6 +383,11 @@ presenten como resueltos (spec §16).
     sana. Se corrigió en `scripts/deploy.sh`: tras desplegar ejecuta `update-traffic --to-latest` y
     comprueba que la revisión que sirve es la última lista (`tests/unit/test_deploy_artifacts.py`).
     El servicio se movió a `00004` a mano el mismo día.
+13. **Recordatorios relativos corregidos.** La primera prueba real de "mañana" propuso el día 20
+    (tres días antes). `create_reminder` ahora resuelve `day_expression` + `time` en servidor con
+    la hora real, y **rechaza fechas pasadas** con `error.reminder_in_past` en vez de crear un
+    recordatorio vencido. La prueba real con el modelo creó el recordatorio para el día siguiente a
+    las 09:00 de Madrid, y una fecha pasada devolvió el error tipado.
 
 ---
 
@@ -499,7 +504,7 @@ mensajes, documentos, embeddings ni secretos; `LOG_CONTENT_DEBUG=false` es el va
 
 ```bash
 # Suite sin credenciales, sin base de datos y sin red
-uv run pytest -m "not integration and not live and not eval"          # 502
+uv run pytest -m "not integration and not live and not eval"          # 512
 
 # Integración contra el contenedor local
 bash scripts/run_local_db.sh

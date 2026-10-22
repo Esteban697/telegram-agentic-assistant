@@ -17,13 +17,14 @@ import hashlib
 import uuid
 import zoneinfo
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Any
+from datetime import UTC, datetime
+from typing import Any, Callable
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.policy.timezones import InvalidLocalTime, parse_local
+from app.policy.relative_dates import UnknownDayExpression, parse_clock, resolve_day
+from app.policy.timezones import InvalidLocalTime, ResolvedDue, load_zone, parse_local, resolve_local
 from app.storage import repositories
 from app.policy.risk import RiskLevel
 from app.tools.base import ToolResult
@@ -42,10 +43,21 @@ def creation_key(*, user_id: int, title: str, due_at_utc: datetime) -> str:
 
 class CreateReminderArgs(BaseModel):
     title: str = Field(min_length=1, max_length=200)
-    due_local: str = Field(
+    due_local: str | None = Field(
+        default=None,
         min_length=8,
         max_length=32,
         description="Local due date and time, e.g. '2026-11-03 09:30'",
+    )
+    day_expression: str | None = Field(
+        default=None,
+        max_length=40,
+        description="Relative day: today, tomorrow, this_monday, next_week, ...",
+    )
+    time: str | None = Field(
+        default=None,
+        max_length=5,
+        description="Local time HH:MM, used with day_expression",
     )
     timezone: str | None = Field(
         default=None,
@@ -53,6 +65,21 @@ class CreateReminderArgs(BaseModel):
         description="IANA zone; falls back to the configured DEFAULT_TIMEZONE",
     )
     description: str | None = Field(default=None, max_length=1000)
+
+    @model_validator(mode="after")
+    def _due_source(self) -> CreateReminderArgs:
+        if self.day_expression:
+            if self.due_local:
+                raise ValueError("use day_expression + time or due_local, not both")
+            if not self.time:
+                raise ValueError("day_expression requires time (HH:MM)")
+            parse_clock(self.time)
+        else:
+            if not self.due_local:
+                raise ValueError("provide due_local or day_expression + time")
+            if self.time:
+                raise ValueError("time is only valid with day_expression")
+        return self
 
 
 class ListTasksArgs(BaseModel):
@@ -63,6 +90,23 @@ class TaskIdArgs(BaseModel):
     task_id: uuid.UUID
 
 
+def resolve_reminder_due(
+    args: CreateReminderArgs, *, default_timezone: str, now: datetime
+) -> ResolvedDue:
+    """Resolve the due instant, including server-side relative days.
+
+    Kept pure so the date logic is testable without a database or a model.
+    """
+
+    zone_name = args.timezone or default_timezone
+    if args.day_expression:
+        zone = load_zone(zone_name)
+        day = resolve_day(args.day_expression, now, zone)
+        naive = datetime.combine(day, parse_clock(args.time or ""))
+        return resolve_local(naive, zone_name)
+    return parse_local(args.due_local or "", zone_name)
+
+
 @dataclass
 class TaskTools:
     """Reminders, scoped to one user by construction."""
@@ -70,12 +114,16 @@ class TaskTools:
     sessions: async_sessionmaker[AsyncSession]
     max_attempts: int = 5
     default_timezone: str = "Europe/Madrid"
+    now: Callable[[], datetime] | None = None
 
     async def create_reminder(
         self, *, user_id: int, args: CreateReminderArgs, **_: Any
     ) -> ToolResult[dict[str, Any]]:
+        moment = self.now() if self.now is not None else datetime.now(UTC)
         try:
-            resolved = parse_local(args.due_local, args.timezone or self.default_timezone)
+            resolved = resolve_reminder_due(
+                args, default_timezone=self.default_timezone, now=moment
+            )
         except InvalidLocalTime as exc:
             # A DST edge is a clarification request, not a crash and not a silent shift.
             return ToolResult.failure(
@@ -83,6 +131,20 @@ class TaskTools:
                 message_key="error.invalid_due_time",
                 detail=exc.detail,
                 reason=exc.reason,
+            )
+        except UnknownDayExpression as exc:
+            return ToolResult.failure(
+                "invalid_day_expression",
+                message_key="error.invalid_due_time",
+                detail=str(exc),
+            )
+
+        if resolved.due_at_utc <= moment:
+            # The model used to guess dates; a past reminder would fire immediately or never.
+            return ToolResult.failure(
+                "reminder_in_past",
+                message_key="error.reminder_in_past",
+                detail="the due time is not in the future",
             )
 
         key = creation_key(user_id=user_id, title=args.title, due_at_utc=resolved.due_at_utc)
@@ -164,7 +226,11 @@ def specs(tools: TaskTools) -> list[ToolSpec]:
     return [
         ToolSpec(
             name="create_reminder",
-            description="Create a reminder at a local date and time in a named timezone.",
+            description=(
+                "Create a reminder. For relative days use day_expression ('today', 'tomorrow', "
+                "'this_monday', ...) plus time (HH:MM); otherwise due_local is 'YYYY-MM-DD HH:MM'. "
+                "Dates in the past are refused."
+            ),
             args_model=CreateReminderArgs,
             risk_level=RiskLevel.REVERSIBLE,
             timeout_seconds=10.0,

@@ -130,6 +130,9 @@ CATALOGUE: Final[dict[str, str]] = {
         "Esa hora no existe o es ambigua en la zona horaria indicada (cambio de hora). "
         "Dime otra hora, por favor."
     ),
+    "error.reminder_in_past": (
+        "Esa fecha ya ha pasado; dime una fecha y una hora futuras para el recordatorio."
+    ),
     "error.task_not_found": "No encuentro ese recordatorio.",
     "error.storage_unavailable": (
         "Ahora mismo no puedo acceder a tus datos. Inténtalo de nuevo en unos minutos."
