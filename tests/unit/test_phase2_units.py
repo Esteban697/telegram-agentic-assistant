@@ -69,7 +69,7 @@ def test_the_read_and_write_levels_are_what_the_spec_says() -> None:
 def test_invalid_arguments_are_rejected_with_a_typed_error(raw: dict[str, Any]) -> None:
     with pytest.raises(AssistantError) as excinfo:
         validate_args(SavePreferenceArgs, raw)
-    assert excinfo.value.code == "internal_error"
+    assert excinfo.value.code == "invalid_arguments"
     assert "invalid arguments" in excinfo.value.detail
 
 

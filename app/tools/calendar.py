@@ -71,8 +71,6 @@ class ListEventsArgs(BaseModel):
 
     @model_validator(mode="after")
     def _range_source(self) -> ListEventsArgs:
-        if self.day_expression and (self.start_local or self.end_local):
-            raise ValueError("use day_expression or start_local/end_local, not both")
         if not self.day_expression and (self.start_local is None or self.end_local is None):
             raise ValueError("provide day_expression or both start_local and end_local")
         return self
@@ -92,19 +90,32 @@ class FreeSlotsArgs(BaseModel):
 
     @model_validator(mode="after")
     def _range_source(self) -> FreeSlotsArgs:
-        if self.day_expression and (self.start_local or self.end_local):
-            raise ValueError("use day_expression or start_local/end_local, not both")
         if not self.day_expression and (self.start_local is None or self.end_local is None):
             raise ValueError("provide day_expression or both start_local and end_local")
         return self
 
 
-def _clean_attendees(value: list[str] | None) -> list[str] | None:
+def _clean_attendees(value: Any) -> list[str] | None:
+    """Accept the shapes a model actually produces: strings or `{"email": ...}` objects."""
+
     if value is None:
         return None
+    if isinstance(value, (str, dict)):
+        value = [value]
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("attendees must be a list of emails")
+
     cleaned: list[str] = []
     for raw in value:
-        email = raw.strip().lower()
+        if isinstance(raw, dict):
+            email = raw.get("email") or raw.get("address") or ""
+        else:
+            email = raw
+        if not isinstance(email, str):
+            raise ValueError(f"not an email address: {raw!r}")
+        email = email.strip().lower()
+        if not email:
+            continue
         if not _EMAIL_RE.match(email):
             raise ValueError(f"not an email address: {raw!r}")
         if email not in cleaned:
@@ -125,26 +136,17 @@ class CreateEventArgs(BaseModel):
     attendees: list[str] = Field(default_factory=list, max_length=20)
     add_meet: bool = False
 
-    @field_validator("attendees")
+    @field_validator("attendees", mode="before")
     @classmethod
-    def _attendee_emails(cls, value: list[str]) -> list[str]:
+    def _attendee_emails(cls, value: Any) -> list[str]:
         return _clean_attendees(value) or []
 
     @model_validator(mode="after")
     def _start_source(self) -> CreateEventArgs:
-        if self.day_expression:
-            if self.start_local:
-                raise ValueError("use day_expression + start_time or start_local, not both")
-            if not self.start_time:
-                raise ValueError("day_expression requires start_time (HH:MM)")
+        if self.start_time:
             parse_clock(self.start_time)
-        else:
-            if not self.start_local:
-                raise ValueError("provide start_local or day_expression + start_time")
-            if self.start_time:
-                raise ValueError("start_time is only valid with day_expression")
-        if self.end_local is not None and self.duration_minutes is not None:
-            raise ValueError("give end_local or duration_minutes, not both")
+        if not self.start_local and not (self.day_expression and self.start_time):
+            raise ValueError("provide start_local or day_expression + start_time")
         return self
 
 
@@ -164,9 +166,9 @@ class UpdateEventArgs(BaseModel):
     attendees: list[str] | None = Field(default=None, max_length=20)
     add_meet: bool | None = None
 
-    @field_validator("attendees")
+    @field_validator("attendees", mode="before")
     @classmethod
-    def _attendee_emails(cls, value: list[str] | None) -> list[str] | None:
+    def _attendee_emails(cls, value: Any) -> list[str] | None:
         return _clean_attendees(value)
 
     @model_validator(mode="after")
@@ -185,16 +187,8 @@ class UpdateEventArgs(BaseModel):
         )
         if all(item is None for item in changes):
             raise ValueError("the update has no fields to change")
-        if self.end_local is not None and self.duration_minutes is not None:
-            raise ValueError("give end_local or duration_minutes, not both")
-        if self.day_expression:
-            if self.start_local:
-                raise ValueError("use day_expression + start_time or start_local, not both")
-            if not self.start_time:
-                raise ValueError("day_expression requires start_time (HH:MM)")
+        if self.start_time:
             parse_clock(self.start_time)
-        elif self.start_time:
-            raise ValueError("start_time is only valid with day_expression")
         return self
 
 
@@ -320,13 +314,19 @@ class CalendarTools:
             return _missing_provider()
         zone = args.timezone or self.default_timezone
         try:
-            if args.day_expression:
+            if args.day_expression and args.start_time:
                 day, _ = _resolve_day_range(args.day_expression, self._now(), load_zone(zone))
                 start_instant = datetime.combine(
-                    day, parse_clock(args.start_time or ""), tzinfo=load_zone(zone)
+                    day, parse_clock(args.start_time), tzinfo=load_zone(zone)
                 ).astimezone(UTC)
+            elif args.start_local:
+                start_instant = parse_local(args.start_local, zone).due_at_utc
             else:
-                start_instant = parse_local(args.start_local or "", zone).due_at_utc
+                return ToolResult.failure(
+                    "missing_start",
+                    message_key="error.calendar_bad_request",
+                    detail="no start time was provided",
+                )
             end_instant = self._end_for_create(args, start_instant, zone)
         except InvalidLocalTime as exc:
             return _invalid_time(exc)
@@ -534,13 +534,13 @@ class CalendarTools:
                 "the event has no dateTime; all-day events are not editable here",
                 reason="all_day",
             )
-        if args.start_local is not None:
-            new_start = parse_local(args.start_local, zone).due_at_utc
-        elif args.day_expression is not None:
+        if args.day_expression and args.start_time:
             day, _ = _resolve_day_range(args.day_expression, self._now(), load_zone(zone))
             new_start = datetime.combine(
-                day, parse_clock(args.start_time or ""), tzinfo=load_zone(zone)
+                day, parse_clock(args.start_time), tzinfo=load_zone(zone)
             ).astimezone(UTC)
+        elif args.start_local is not None:
+            new_start = parse_local(args.start_local, zone).due_at_utc
         else:
             new_start = existing_start
         if args.end_local is not None:

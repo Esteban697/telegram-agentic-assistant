@@ -173,6 +173,10 @@ CATALOGUE: Final[dict[str, str]] = {
         "No sé si esa herramienta llegó a ejecutarse. Dímelo y lo reviso antes de reintentar."
     ),
     "error.tool_not_allowed": "Esa acción no está permitida en esta versión.",
+    "error.invalid_arguments": (
+        "La llamada a esa herramienta no tiene los argumentos correctos; la reviso y lo "
+        "intento de nuevo."
+    ),
     "error.capability_unavailable": (
         "Todavía no hay ningún proveedor configurado para esa consulta."
     ),

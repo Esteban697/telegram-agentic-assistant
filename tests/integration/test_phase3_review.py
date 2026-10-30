@@ -315,19 +315,19 @@ async def test_4_without_a_chat_id_the_item_fails_loudly(
 # --------------------------------------------------------------------------- #
 # 6 + 7: validated level-2 arguments, and float-safe re-verification
 # --------------------------------------------------------------------------- #
-async def test_6_invalid_level_two_arguments_are_refused_before_the_prompt() -> None:
+async def test_6_invalid_level_two_arguments_are_reported_to_the_model_not_prompted() -> None:
     bad = {"restaurant": "", "party_size": 99, "local_time": "x", "name": ""}
 
-    async with Phase3(script=[tool_call("submit_reservation", bad), answer()]) as p:
+    async with Phase3(script=[tool_call("submit_reservation", bad), answer("corregido")]) as p:
         outcome = await p.handlers.handle(message_update(1), p.identity())
 
         assert await p.sql("SELECT 1 FROM pending_actions") == [], (
             "an invalid call must not become an approval prompt"
         )
-        assert outcome.status == "failed", f"the turn must fail, got {outcome}"
-        assert p.telegram.sent_texts == [messages.render("approval.in_progress")] or (
-            p.telegram.sent_texts[-1] != messages.render("approval.prompt", preview="x", minutes=30)
-        ), "the user must not be shown an approval prompt for an invalid call"
+        # The graph reports the typed error to the model, which can correct the call; the turn
+        # itself continues instead of failing with the webhook's generic message.
+        assert outcome.status == "processed", f"the turn should continue, got {outcome}"
+        assert p.telegram.sent_texts[-1] == "corregido"
 
 
 async def test_7_float_arguments_survive_the_jsonb_round_trip() -> None:

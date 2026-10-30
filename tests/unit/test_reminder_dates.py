@@ -43,14 +43,15 @@ def test_a_past_reminder_is_refused_before_touching_the_database() -> None:
     assert result.message_key == "error.reminder_in_past"
 
 
-def test_day_expression_requires_a_time_and_is_exclusive_with_due_local() -> None:
+def test_day_expression_requires_a_time_and_wins_over_due_local() -> None:
     with pytest.raises(ValidationError):
         CreateReminderArgs(title="A", day_expression="tomorrow")
 
-    with pytest.raises(ValidationError):
-        CreateReminderArgs(
-            title="A",
-            due_local="2026-10-24 09:00",
-            day_expression="tomorrow",
-            time="09:00",
-        )
+    args = CreateReminderArgs(
+        title="A",
+        due_local="2026-10-25 09:00",
+        day_expression="tomorrow",
+        time="09:00",
+    )
+    resolved = resolve_reminder_due(args, default_timezone="Europe/Madrid", now=NOW)
+    assert resolved.due_at_utc.isoformat() == "2026-10-24T07:00:00+00:00"

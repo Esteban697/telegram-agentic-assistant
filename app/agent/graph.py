@@ -341,16 +341,29 @@ class ChatAgent:
                 # tool, and an unvalidated payload showed the user an approval prompt for a call
                 # that would be rejected at execution.
                 spec = self._registry.get(tool_name)
-                request = await prepare_approval(
-                    self._approvals,
-                    user_id=user_id,
-                    chat_id=chat_id,
-                    tool_name=tool_name,
-                    arguments=arguments,
-                    validator=lambda raw, model=spec.args_model: validate_args(
-                        model, raw
-                    ).model_dump(mode="json"),
-                )
+                try:
+                    request = await prepare_approval(
+                        self._approvals,
+                        user_id=user_id,
+                        chat_id=chat_id,
+                        tool_name=tool_name,
+                        arguments=arguments,
+                        validator=lambda raw, model=spec.args_model: validate_args(
+                            model, raw
+                        ).model_dump(mode="json"),
+                    )
+                except AssistantError as exc:
+                    # A malformed model call is a tool error the model can correct, not an
+                    # unexpected failure of the whole turn (the webhook used to answer "error
+                    # inesperado" for this).
+                    _logger.warning("approval preparation rejected", extra=exc.as_log_fields())
+                    results.append(
+                        {"tool_name": tool_name, "ok": False, "error_code": exc.code}
+                    )
+                    messages.append(
+                        {"role": "tool", "content": f"{tool_name}: error {exc.code}"}
+                    )
+                    continue
                 pending = {
                     "action_id": request.action_id,
                     "action_type": request.action_type,

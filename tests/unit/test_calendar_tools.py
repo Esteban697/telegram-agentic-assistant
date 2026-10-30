@@ -350,6 +350,14 @@ def test_attendee_emails_are_validated_and_deduplicated() -> None:
     )
     assert args.attendees == ["ana@example.com"]
 
+    # The model often sends the API-shaped objects instead of plain strings.
+    objects = CreateEventArgs(
+        summary="A",
+        start_local="2026-01-15 10:00",
+        attendees=[{"email": "Ana@Example.com"}, {"email": "ana@example.com"}],
+    )
+    assert objects.attendees == ["ana@example.com"]
+
     with pytest.raises(ValidationError):
         CreateEventArgs(
             summary="A",
@@ -448,13 +456,37 @@ async def test_unknown_day_expression_is_a_typed_failure() -> None:
     assert result.error_code == "invalid_local_time"
 
 
-def test_day_expression_and_explicit_dates_are_mutually_exclusive() -> None:
-    with pytest.raises(ValidationError):
-        ListEventsArgs(
-            day_expression="this_saturday",
-            start_local="2026-10-24",
-            end_local="2026-10-24",
-        )
+def test_day_expression_wins_over_explicit_dates() -> None:
+    args = ListEventsArgs(
+        day_expression="this_saturday",
+        start_local="2026-10-24",
+        end_local="2026-10-25",
+    )
+    assert args.day_expression == "this_saturday"
+
+
+async def test_create_prefers_day_expression_when_the_model_fills_both() -> None:
+    provider = FakeProvider()
+    tools = CalendarTools(
+        provider=provider,
+        default_timezone="Europe/Madrid",
+        now=lambda: datetime(2026, 10, 19, 12, 0, tzinfo=UTC),
+    )
+
+    result = await tools.create_event(
+        user_id=1,
+        args=CreateEventArgs(
+            summary="A",
+            start_local="2026-10-25 18:00",
+            day_expression="tomorrow",
+            start_time="10:00",
+            duration_minutes=15,
+        ),
+        context={"action_id": "x"},
+    )
+
+    assert result.ok is True
+    assert provider.created[0]["start"]["dateTime"] == "2026-10-20T08:00:00Z"
 
 
 def test_the_approval_preview_is_capped_below_telegrams_limit() -> None:

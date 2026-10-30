@@ -57,6 +57,17 @@ class ConfigError(AssistantError):
     message_key = "error.generic"
 
 
+class InvalidArguments(AssistantError):
+    """A model-supplied tool call did not match the tool's argument schema.
+
+    Typed rather than generic so the graph can report it to the model and let it correct the
+    call, and so the approval handler treats it as a definite failure if it ever surfaces there.
+    """
+
+    code = "invalid_arguments"
+    message_key = "error.invalid_arguments"
+
+
 # --------------------------------------------------------------------------- #
 # Transport / security
 # --------------------------------------------------------------------------- #
@@ -256,6 +267,7 @@ __all__ = [
     "GoogleRateLimited",
     "GoogleTimeout",
     "GoogleUnavailable",
+    "InvalidArguments",
     "OllamaBadResponse",
     "OllamaError",
     "OllamaRateLimited",

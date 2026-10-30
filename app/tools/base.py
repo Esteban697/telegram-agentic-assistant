@@ -12,7 +12,7 @@ from typing import Any, Generic, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
-from app.errors import AssistantError
+from app.errors import InvalidArguments
 
 _logger = logging.getLogger(__name__)
 
@@ -51,7 +51,7 @@ def validate_args(model: type[BaseModel], raw: dict[str, Any]) -> BaseModel:
     try:
         return model.model_validate(raw)
     except ValidationError as exc:
-        raise AssistantError(
+        raise InvalidArguments(
             f"invalid arguments for {model.__name__}",
             context={"validation_errors": len(exc.errors())},
         ) from exc

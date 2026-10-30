@@ -68,17 +68,10 @@ class CreateReminderArgs(BaseModel):
 
     @model_validator(mode="after")
     def _due_source(self) -> CreateReminderArgs:
-        if self.day_expression:
-            if self.due_local:
-                raise ValueError("use day_expression + time or due_local, not both")
-            if not self.time:
-                raise ValueError("day_expression requires time (HH:MM)")
+        if self.time:
             parse_clock(self.time)
-        else:
-            if not self.due_local:
-                raise ValueError("provide due_local or day_expression + time")
-            if self.time:
-                raise ValueError("time is only valid with day_expression")
+        if not self.due_local and not (self.day_expression and self.time):
+            raise ValueError("provide due_local or day_expression + time")
         return self
 
 
@@ -99,10 +92,10 @@ def resolve_reminder_due(
     """
 
     zone_name = args.timezone or default_timezone
-    if args.day_expression:
+    if args.day_expression and args.time:
         zone = load_zone(zone_name)
         day = resolve_day(args.day_expression, now, zone)
-        naive = datetime.combine(day, parse_clock(args.time or ""))
+        naive = datetime.combine(day, parse_clock(args.time))
         return resolve_local(naive, zone_name)
     return parse_local(args.due_local or "", zone_name)
 

@@ -80,6 +80,9 @@ contienen tokens, claves, documentos, embeddings ni el contenido de los mensajes
     desde la base de datos.
   - `calendar_event_changed`: el evento cambió entre la lectura y la aprobación; vuelve a leerlo y
     prepara una acción nueva.
+  - **Argumentos inválidos del modelo:** el grafo devuelve `invalid_arguments` como error de la
+    herramienta y el turno continúa; el modelo puede corregir la llamada. No es un "error
+    inesperado" y no debe reiniciarse el servicio por ello.
 - **Regla.** No aumentar reintentos ocultos ni convertir `unknown` en `failed`. No registrar
   títulos, descripciones, correos de invitados ni tokens.
 
