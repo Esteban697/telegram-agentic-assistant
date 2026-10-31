@@ -64,6 +64,8 @@ def make_settings(**overrides: Any) -> Settings:
         "llm_timeout_seconds": 2.0,
         "llm_max_retries": 1,
         "request_budget_seconds": 10.0,
+        # The test budget is deliberately small; the vision timeout must fit inside it.
+        "vision_timeout_seconds": 5.0,
         "rate_limit_per_minute": 100,
     }
     base.update(overrides)

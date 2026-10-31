@@ -209,6 +209,7 @@ def test_environment_values_flow_through_load_settings(
     monkeypatch.setenv("LLM_TIMEOUT_SECONDS", "2")
     monkeypatch.setenv("LLM_MAX_RETRIES", "0")
     monkeypatch.setenv("REQUEST_BUDGET_SECONDS", "5")
+    monkeypatch.setenv("VISION_TIMEOUT_SECONDS", "3")
 
     from app.config import load_settings
 

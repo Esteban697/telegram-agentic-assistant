@@ -9,6 +9,7 @@ mechanically true rather than aspirational.
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
@@ -21,9 +22,17 @@ class ChatMessage:
 
     role: ChatRole
     content: str
+    # Raw image bytes for a multimodal turn. The provider adapter encodes them as base64;
+    # image turns are handled outside the graph so these bytes never enter a checkpoint.
+    images: tuple[bytes, ...] = ()
 
-    def as_dict(self) -> dict[str, str]:
-        return {"role": self.role, "content": self.content}
+    def as_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {"role": self.role, "content": self.content}
+        if self.images:
+            payload["images"] = [
+                base64.b64encode(image).decode("ascii") for image in self.images
+            ]
+        return payload
 
 
 @dataclass(frozen=True, slots=True)

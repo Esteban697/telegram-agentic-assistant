@@ -52,9 +52,15 @@ CATALOGUE: Final[dict[str, str]] = {
     ),
     "callback.not_available": "Esa opción todavía no está disponible.",
     "unsupported.content": (
-        "No he podido leer eso. Envíame un mensaje de texto o un documento en PDF o texto "
-        "plano y te respondo sobre su contenido."
+        "No he podido leer eso. Envíame un mensaje de texto, una imagen (JPEG, PNG o WebP) o un "
+        "documento en PDF o texto plano y te respondo sobre su contenido."
     ),
+    "images.unavailable": (
+        "No puedo analizar imágenes ahora mismo. Inténtalo de nuevo en un momento."
+    ),
+    "images.unsupported": "Solo puedo leer imágenes JPEG, PNG o WebP.",
+    "images.too_large": "La imagen supera el límite de {max_mb} MB.",
+    "images.unreadable": "No he podido leer la imagen; prueba con otra o pregúntame en texto.",
     # --- Tasks / reminders -------------------------------------------------- #
     "tasks.empty": "No tienes recordatorios pendientes.",
     "tasks.header": "Tus recordatorios:",

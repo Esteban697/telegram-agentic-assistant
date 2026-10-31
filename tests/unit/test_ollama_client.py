@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+
 import httpx
 import pytest
 
@@ -247,6 +249,20 @@ async def test_a_retryable_status_recovers_without_reporting_an_error() -> None:
     result = await client.chat([ChatMessage(role="user", content="x")])
     assert result.content == "ya"
     assert len(seen) == 2
+
+
+async def test_images_are_base64_encoded_in_the_message() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=chat_response(content="rojo"))
+
+    client, stub = _client(handler)
+    image = b"\x89PNG\r\n\x1a\nfake-image-bytes"
+    await client.chat(
+        [ChatMessage(role="user", content="¿De qué color es?", images=(image,))]
+    )
+
+    body = stub.chat_bodies[0]
+    assert body["messages"][0]["images"] == [base64.b64encode(image).decode("ascii")]
 
 
 # --------------------------------------------------------------------------- #

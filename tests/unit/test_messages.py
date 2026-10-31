@@ -91,6 +91,7 @@ _ALLOWED_PLACEHOLDERS = frozenset(
         "name",
         "chunks",
         "pages",
+        "max_mb",
     }
 )
 

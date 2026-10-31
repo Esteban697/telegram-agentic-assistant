@@ -18,9 +18,10 @@ coste / IAM / límites / datos personales de la Fase 6.
 
 El asistente está **desplegado y funcionando** en `https://taa-prod-api-hzlxaxcstq-ew.a.run.app`:
 un bot privado de Telegram que conversa a través de Ollama Cloud, busca en la web datos actuales,
-consulta y modifica Google Calendar con aprobación, guarda preferencias y recordatorios en
-PostgreSQL, indexa documentos y responde con la página de la que saca cada dato, y prepara acciones
-externas que solo se ejecutan con una aprobación explícita.
+consulta y modifica Google Calendar con aprobación, responde sobre imágenes con el modelo
+multimodal `gemma4:31b`, guarda preferencias y recordatorios en PostgreSQL, indexa documentos y
+responde con la página de la que saca cada dato, y prepara acciones externas que solo se ejecutan
+con una aprobación explícita.
 
 Evidencia de extremo a extremo, producida **por el usuario** contra el sistema desplegado:
 
@@ -63,8 +64,9 @@ Telegram ──HTTPS──▶ app/api/telegram_webhook.py
   memorias, tareas, documentos y chunks, aprobaciones, ledger de herramientas, `work_items` y los
   checkpoints de LangGraph.
 - **Vertex AI** (`gemini-embedding-001`, 768 dimensiones) para embeddings; **Ollama Cloud** para el
-  modelo de chat y la búsqueda web; **Cloud Storage** para los originales; **Google Calendar** vía
-  OAuth 2.0 del usuario para la agenda y los eventos.
+  modelo de chat, la búsqueda web y la visión (`gemma4:31b`, solo en turnos con imagen); **Cloud
+  Storage** para los originales; **Google Calendar** vía OAuth 2.0 del usuario para la agenda y los
+  eventos.
 
 ---
 
@@ -213,12 +215,13 @@ primera línea del docstring de cada módulo, abreviada.
 
 | Suite | Comando | Resultado real |
 |---|---|---|
-| Unitaria, sin credenciales, sin BD, sin red | `pytest -m "not integration and not live and not eval"` | **513 pasan** |
-| Integración contra PostgreSQL | `pytest -m integration` | **134 pasan, 1 se salta** |
+| Unitaria, sin credenciales, sin BD, sin red | `pytest -m "not integration and not live and not eval"` | **519 pasan** |
+| Integración contra PostgreSQL | `pytest -m integration` | **135 pasan, 1 se salta** |
 | Evaluaciones deterministas | `pytest -m "eval and not live"` | **23 pasan** |
 | Vertex real | `GOOGLE_CLOUD_PROJECT=telegram-assistant-esteban GOOGLE_CLOUD_REGION=europe-west1 RUN_LIVE_TESTS=1 pytest -m "live and not eval"` | **2 pasan** |
 | Agente sobre Ollama Cloud (incluye búsqueda web) | `RUN_LIVE_TESTS=1 pytest -m "eval and live"` | **8 en total: 7 pasan; 1 (nivel 2) falló y pasó al repetirla sola** |
 | Google Calendar real | `GOOGLE_CALENDAR_TEST_ID=... RUN_LIVE_TESTS=1 pytest -m "live and not eval" tests/live/test_google_calendar.py` | **no ejecutada** (automatizada): requiere un calendario de prueba; la consulta real desde Telegram sí se verificó |
+| Visión real (Ollama Cloud) | `RUN_LIVE_TESTS=1 pytest -m "live and not eval" tests/live/test_vision.py` | **1 pasa** (`gemma4:31b` describe una imagen generada) |
 
 En la primera pasada de las evaluaciones del agente, `test_agent_prepares_a_level2_action_without_performing_it`
 falló porque el modelo no preparó la acción; al repetirla sola pasó. Es la estocasticidad del
@@ -281,11 +284,11 @@ Los 15 elementos, uno a uno. **Verificado** = hay una ejecución o una prueba co
 
 | # | Elemento | Estado | Evidencia / dependencia |
 |---|---|---|---|
-| 1 | Se puede ejecutar localmente siguiendo el README | **Verificado** | README (setup, `uv sync`, `.env`, `docker`/`uvicorn`) + la suite unitaria corre en una máquina limpia sin credenciales (513) |
+| 1 | Se puede ejecutar localmente siguiendo el README | **Verificado** | README (setup, `uv sync`, `.env`, `docker`/`uvicorn`) + la suite unitaria corre en una máquina limpia sin credenciales (519) |
 | 2 | `.env.example` sin secretos reales | **Verificado** | `.env.example` versionado con valores vacíos; `test_env_example_contains_no_real_looking_secret` |
 | 3 | Migraciones desde una base vacía | **Verificado** | `0001`…`0007` aplicadas al proyecto Supabase nuevo (17.11) y al contenedor local; `scripts/bootstrap_db.py` verifica tablas, `vector` ≥ 0.8, HNSW y una fila activa |
-| 4 | Las pruebas unitarias pasan | **Verificado** | 513 pasan, sin credenciales, sin BD, sin red |
-| 5 | Integración implementada y dependencias documentadas | **Verificado** | 134 pasan, 1 se salta; README documenta el contenedor y `TEST_DATABASE_URL` |
+| 4 | Las pruebas unitarias pasan | **Verificado** | 519 pasan, sin credenciales, sin BD, sin red |
+| 5 | Integración implementada y dependencias documentadas | **Verificado** | 135 pasan, 1 se salta; README documenta el contenedor y `TEST_DATABASE_URL` |
 | 6 | Telegram limitado a usuarios autorizados | **Verificado** | Allow-list + denegación por defecto; `test_authz`, `test_webhook_secret`; en producción una lista vacía **impide arrancar**; desplegado con `TELEGRAM_ALLOWED_USER_IDS` |
 | 7 | El LLM se puede cambiar por configuración | **Verificado** | `LLM_MODEL`; `test_model_name_is_never_hard_coded_outside_configuration`; sonda A10 documentada |
 | 8 | El estado de LangGraph es persistente | **Verificado** | `AsyncPostgresSaver` sobre la DSN; pruebas de reanudación en `test_phase2_db`; el servicio desplegado lo usa |
@@ -393,6 +396,11 @@ presenten como resueltos (spec §16).
     un `invalid_arguments` de nivel 2 se devuelve al modelo como error de herramienta y el turno
     continúa, en vez de llegar al catch-all del webhook. Verificado con el modelo real: prepara la
     aprobación con `attendee@example.com`.
+15. **Imágenes: primer corte sin persistencia ni herramientas.** `gemma4:31b` (Ollama Cloud)
+    responde a imagen + pie de foto; se aceptan JPEG/PNG/WebP, hasta 10 MB y 30 s de inferencia.
+    La imagen no se guarda ni se registra en logs; una pregunta de seguimiento exige reenviarla; el
+    turno con imagen no usa herramientas, así que no crea recordatorios ni eventos desde una foto.
+    Verificado con una imagen generada y el modelo real (`tests/live/test_vision.py`).
 
 ---
 
@@ -481,6 +489,7 @@ servicio siguió respondiendo `/health` y `/readyz` con 200 después del cambio.
 | Contexto RAG | top_k 5, 6000 caracteres | fragmentos, nunca documentos completos |
 | Búsqueda web | 5 resultados (máx. 10), 2000 caracteres por resultado, 8000 en total, timeout 10 s | los extractos no desplazan el contexto del turno; cada consulta cuenta en la cuenta de Ollama |
 | Calendario | 50 eventos, 90 días de rango, 20 invitados, 4.000 caracteres de descripción, timeout 10 s | por encima se pide reducir el rango; los eventos son externos y las escrituras exigen aprobación |
+| Imágenes | JPEG/PNG/WebP, 10 MB, timeout 30 s, modelo `gemma4:31b` de Ollama Cloud | la imagen no se guarda; el turno no usa herramientas |
 
 ### 9.4 Datos personales: qué se guarda, cuánto y cómo se borra
 
@@ -493,6 +502,7 @@ servicio siguió respondiendo `/health` y `/readyz` con 200 después del cambio.
 | Documentos y fragmentos | GCS + `documents` + `document_chunks` (con embeddings) | RAG | borrado por etapas y **verificado** (fragmentos, objeto y fila) |
 | Aprobaciones y ledger de herramientas | `pending_actions`, `tool_invocations` | auditoría y no-duplicación | retención manual |
 | Consultas de búsqueda web | se envían a Ollama Cloud; **no** se persisten ni se registran | responder con datos actuales | no almacenadas; el proveedor aplica su propia política |
+| Imágenes enviadas | se descargan de Telegram y se envían al modelo multimodal; **no** se persisten ni se registran | responder preguntas sobre la imagen | no almacenadas; para un seguimiento hay que reenviarla |
 | Eventos, invitados y descripciones de Calendar | se leen de Google bajo demanda; los argumentos de una escritura aprobada quedan en `pending_actions` (`args_json`, `preview_text`) y el resultado en `result_json` | agenda y reuniones | con la fila de la acción o borrando el evento; nunca en logs |
 | Refresh token de Google | Secret Manager (`taa-prod-google-oauth-credentials`) | acceso al calendario | revocar el acceso en Google y borrar/rotar el secreto |
 | Logs | Cloud Logging | operación | **sin contenido** por defecto (solo ids, herramienta, duración, estado, puntuaciones) |
@@ -509,7 +519,7 @@ mensajes, documentos, embeddings ni secretos; `LOG_CONTENT_DEBUG=false` es el va
 
 ```bash
 # Suite sin credenciales, sin base de datos y sin red
-uv run pytest -m "not integration and not live and not eval"          # 513
+uv run pytest -m "not integration and not live and not eval"          # 519
 
 # Integración contra el contenedor local
 bash scripts/run_local_db.sh
@@ -523,7 +533,10 @@ TEST_DATABASE_URL=postgresql+psycopg://postgres:postgres@127.0.0.1:55432/taa \
 # Proveedor real de embeddings y modelo real (facturables)
 GOOGLE_CLOUD_PROJECT=telegram-assistant-esteban GOOGLE_CLOUD_REGION=europe-west1 \
   RUN_LIVE_TESTS=1 uv run pytest -m "live and not eval"                # 2
-RUN_LIVE_TESTS=1 uv run pytest -m "eval and live"                      # 7
+RUN_LIVE_TESTS=1 uv run pytest -m "eval and live"                      # 8
+
+# Visión real con el modelo multimodal de Ollama Cloud
+RUN_LIVE_TESTS=1 uv run pytest -m "live and not eval" tests/live/test_vision.py  # 1
 
 # Despliegue (imprime primero; ejecuta solo con aprobación)
 bash scripts/deploy.sh

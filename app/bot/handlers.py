@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.agent.graph import ChatAgent
+from app.agent.prompts import DEFAULT_IMAGE_QUESTION, VISION_SYSTEM_PROMPT
 from app.bot import messages
 from app.bot.keyboards import (
     approval_keyboard,
@@ -36,7 +37,7 @@ from app.policy.approval import ActionState
 from app.bot.telegram_client import TelegramClient
 from app.config import Settings
 from app.errors import AssistantError
-from app.llm.protocols import ChatMessage
+from app.llm.protocols import ChatMessage, ChatModel
 from app.policy.authz import TelegramIdentity
 from app.services.conversation import ConversationService
 from app.storage.stores import (
@@ -87,6 +88,7 @@ class TelegramHandlers:
         registry: ToolRegistry | None = None,
         ingestion: Any | None = None,
         document_tools: Any | None = None,
+        vision_model: ChatModel | None = None,
     ) -> None:
         self._settings = settings
         self._telegram = telegram
@@ -99,6 +101,7 @@ class TelegramHandlers:
         self._registry = registry
         self._ingestion = ingestion
         self._documents = document_tools
+        self._vision = vision_model
 
     # ------------------------------------------------------------------ #
     # Entry point
@@ -124,11 +127,29 @@ class TelegramHandlers:
     ) -> HandlerOutcome:
         message = update.get("message") or {}
 
+        # Images are their own path: they are answered by the multimodal cloud model and never
+        # enter the tool graph, so the image bytes cannot land in a checkpoint.
+        photo = _largest_photo(message.get("photo"))
+        if photo is not None:
+            return await self._handle_image(
+                identity,
+                photo,
+                caption=_text_of(message) or "",
+                update_id=update.get("update_id"),
+            )
+
         # **The document branch comes first.** `_text_of` returns `caption` when there is no
         # `text`, so a PDF sent with a caption ("aquí tienes el contrato") took the text branch
         # and the file was silently ignored — documented Telegram behaviour, not an edge case.
         document = message.get("document")
         if isinstance(document, dict):
+            if str(document.get("mime_type") or "").startswith("image/"):
+                return await self._handle_image(
+                    identity,
+                    document,
+                    caption=_text_of(message) or "",
+                    update_id=update.get("update_id"),
+                )
             if self._ingestion is not None:
                 return await self._ingest_document(identity, document)
             await self._reply(identity.chat_id, messages.render("documents.unavailable"))
@@ -286,6 +307,116 @@ class TelegramHandlers:
             # Closed unconditionally (Phase 3 review): a path that skipped this left the row
             # `pending` for ever, and every later message in that chat was then declined as busy.
             # `answered` distinguishes a real reply from an escape.
+            if owns_turn:
+                await self._close_turn(prepared, failed=not answered)
+
+    async def _handle_image(
+        self,
+        identity: TelegramIdentity,
+        item: dict[str, Any],
+        *,
+        caption: str,
+        update_id: int | None,
+    ) -> HandlerOutcome:
+        """Answer an image + caption with the multimodal cloud model.
+
+        This path deliberately bypasses the tool graph: image turns only answer questions. The
+        image bytes are never stored or logged; only the caption and the answer are recorded.
+        """
+
+        if self._vision is None:
+            await self._reply(identity.chat_id, messages.render("images.unavailable"))
+            return HandlerOutcome(status=STATUS_IGNORED, replied=True, detail="vision_disabled")
+
+        file_id = str(item.get("file_id") or "")
+        if not file_id:
+            await self._reply(identity.chat_id, messages.render("images.unavailable"))
+            return HandlerOutcome(status=STATUS_FAILED, replied=True, detail="image_no_file_id")
+
+        max_bytes = self._settings.max_image_mb * 1024 * 1024
+        try:
+            downloaded = await self._telegram.get_file(file_id=file_id, max_bytes=max_bytes)
+        except AssistantError as exc:
+            _logger.warning("image download failed", extra=exc.as_log_fields())
+            key = (
+                "images.too_large"
+                if "cap" in exc.detail or "above the" in exc.detail
+                else "images.unavailable"
+            )
+            await self._reply(identity.chat_id, messages.render(key, max_mb=self._settings.max_image_mb))
+            return HandlerOutcome(status=STATUS_FAILED, replied=True, detail=exc.code)
+
+        mime = _sniff_image_mime(downloaded.content)
+        if mime is None:
+            await self._reply(identity.chat_id, messages.render("images.unsupported"))
+            return HandlerOutcome(status=STATUS_PROCESSED, replied=True, detail="unsupported_image")
+
+        prompt = caption.strip() or DEFAULT_IMAGE_QUESTION
+        prepared = None
+        owns_turn = False
+        answered = False
+        try:
+            prepared = await self._conversations.prepare(
+                user_id=identity.user_id,
+                chat_id=identity.chat_id,
+                text=f"[imagen] {prompt}",
+            )
+            if self._queue is not None:
+                claim = await self._queue.open_turn(
+                    conversation_id=await self._conversations.conversation_id(
+                        user_id=identity.user_id, chat_id=identity.chat_id
+                    ),
+                    thread_id=prepared.thread_id,
+                    chat_id=identity.chat_id,
+                )
+                if claim.is_busy:
+                    await self._reply(
+                        identity.chat_id, messages.render("busy.previous_turn_in_progress")
+                    )
+                    return HandlerOutcome(
+                        status=STATUS_IGNORED, replied=True, detail="busy_previous_turn"
+                    )
+                owns_turn = True
+
+            prompt_messages = [
+                ChatMessage(role="system", content=VISION_SYSTEM_PROMPT),
+                *prepared.prompt_input[:-1],
+                ChatMessage(role="user", content=prompt, images=(downloaded.content,)),
+            ]
+            result = await self._vision.chat(
+                prompt_messages,
+                tools=None,
+                timeout=self._settings.vision_timeout_seconds,
+            )
+            reply_text = result.content.strip() or messages.render("images.unreadable")
+            await self._reply(identity.chat_id, reply_text)
+            answered = True
+            try:
+                await self._conversations.record(
+                    chat_id=identity.chat_id,
+                    user_text=f"[imagen] {prompt}",
+                    assistant_text=reply_text,
+                    telegram_update_id=update_id,
+                )
+            except AssistantError as exc:  # pragma: no cover - reply already delivered
+                _logger.warning("could not record the image turn", extra=exc.as_log_fields())
+            _logger.info(
+                "vision turn complete",
+                extra={
+                    "model": self._vision.model,
+                    "mime": mime,
+                    "image_bytes": len(downloaded.content),
+                    "duration_ms": result.duration_ms,
+                    "status": "ok",
+                },
+            )
+            return HandlerOutcome(status=STATUS_PROCESSED, replied=True, detail="image_answered")
+        except AssistantError as exc:
+            _logger.warning("vision turn failed", extra=exc.as_log_fields())
+            await self._reply(identity.chat_id, messages.render("images.unavailable"))
+            answered = True
+            return HandlerOutcome(status=STATUS_FAILED, replied=True, detail=exc.code)
+        finally:
             if owns_turn:
                 await self._close_turn(prepared, failed=not answered)
 
@@ -637,6 +768,41 @@ class TelegramHandlers:
         self, chat_id: int, text: str, *, keyboard: dict[str, Any] | None = None
     ) -> None:
         await self._telegram.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
+
+
+def _largest_photo(value: Any) -> dict[str, Any] | None:
+    """Telegram sends several sizes; the largest is the useful one."""
+
+    if not isinstance(value, list):
+        return None
+    photos = [item for item in value if isinstance(item, dict) and item.get("file_id")]
+    if not photos:
+        return None
+
+    def score(item: dict[str, Any]) -> tuple[int, int]:
+        size = item.get("file_size")
+        width = item.get("width")
+        height = item.get("height")
+        return (
+            int(size) if isinstance(size, int) else 0,
+            int(width) * int(height)
+            if isinstance(width, int) and isinstance(height, int)
+            else 0,
+        )
+
+    return max(photos, key=score)
+
+
+def _sniff_image_mime(data: bytes) -> str | None:
+    """Only accept the formats the cloud vision model can read."""
+
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
 
 
 def _text_of(message: dict[str, Any]) -> str | None:

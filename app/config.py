@@ -79,6 +79,11 @@ class Settings(BaseSettings):
     llm_timeout_seconds: float = Field(default=18.0, gt=0)
     llm_max_retries: int = Field(default=1, ge=0)
     llm_think: str | None = "low"
+    # Multimodal model used only for image turns. It is an Ollama **Cloud** model name
+    # (`gemma4:31b` in the cloud catalog); this project never runs a local Ollama.
+    vision_model: str = "gemma4:31b"
+    max_image_mb: int = Field(default=10, gt=0)
+    vision_timeout_seconds: float = Field(default=30.0, gt=0)
 
     # --- Web search -------------------------------------------------------- #
     # Ollama Cloud exposes POST /api/web_search with the same account key as chat. `none`
@@ -286,6 +291,12 @@ class Settings(BaseSettings):
                 f"REQUEST_BUDGET_SECONDS({self.request_budget_seconds}). Lower "
                 "LLM_TIMEOUT_SECONDS or LLM_MAX_RETRIES, or raise REQUEST_BUDGET_SECONDS "
                 "(which must stay below Telegram's 60s webhook deadline)"
+            )
+        if self.vision_timeout_seconds >= self.request_budget_seconds:
+            found.append(
+                "VISION_TIMEOUT_SECONDS must be smaller than REQUEST_BUDGET_SECONDS: the image "
+                "turn also downloads the file and sends the reply inside the same webhook budget "
+                f"({self.vision_timeout_seconds} >= {self.request_budget_seconds})"
             )
 
         # The plan's rule is "https outside development": local development may point at a

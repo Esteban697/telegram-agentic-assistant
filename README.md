@@ -30,6 +30,10 @@ informe final están en [`docs/`](docs/).
 - **Documentos con fuentes.** Acepta PDF, texto plano y Markdown (hasta 20 MB / 200 páginas), los
   indexa por fragmentos y responde citando **el documento y la página** de cada dato. Si los
   pasajes recuperados no responden, lo dice en vez de inventar.
+- **Imágenes.** Envía una foto o una imagen (JPEG, PNG o WebP) con una pregunta en el pie de foto;
+  el modelo multimodal de **Ollama Cloud** (`gemma4:31b`) lee imagen + texto y responde en español.
+  La imagen no se guarda ni se registra. En este primer corte los turnos con imagen no ejecutan
+  herramientas: para crear un recordatorio o un evento, pídelo en un mensaje de texto.
 - **Aprobaciones.** Las acciones con efecto externo se **preparan**, nunca se ejecutan solas. El
   usuario recibe un botón Aprobar / Rechazar; la aprobación caduca y solo vale para los argumentos
   exactos que se mostraron.
@@ -98,8 +102,28 @@ advierte.
 - `Borra el documento contrato.pdf.` — elimina fragmentos, original y fila, por etapas.
 - `¿Está listo el documento que te envié?` — consulta el estado de la ingesta.
 
-Un PDF escaneado sin capa de texto se rechaza con un mensaje claro; las fotos y las notas de voz no
-se procesan.
+Un PDF escaneado sin capa de texto se rechaza con un mensaje claro; las notas de voz y los vídeos
+no se procesan.
+
+### Imágenes
+
+Envía una **foto o una imagen** (JPEG, PNG o WebP) con la pregunta en el pie de foto:
+
+- Foto de una planta + `¿Qué planta es y cómo la cuido?`
+- Foto de un recibo + `¿Cuánto he pagado y por qué?`
+- Foto de un error + `¿Qué significa este mensaje?`
+
+Sin pie de foto, describe la imagen. El turno usa el modelo multimodal **`gemma4:31b` de Ollama
+Cloud** (nunca un Ollama local); la imagen se descarga de Telegram, se envía al modelo junto con el
+texto y la respuesta se devuelve por el chat. Límite: `MAX_IMAGE_MB` (10 MB por defecto).
+
+Privacidad y alcance de este primer corte:
+
+- La imagen **no se guarda** en PostgreSQL/GCS ni se registra en los logs; solo el pie de foto y la
+  respuesta quedan en la transcripción.
+- Los turnos con imagen **no usan herramientas**: el modelo describe o responde sobre la imagen,
+  pero no crea recordatorios ni eventos. Para eso, pídelo en un mensaje de texto.
+- Para una pregunta de seguimiento sobre la misma imagen, vuelve a enviarla: no se conserva.
 
 ### Búsqueda web
 
@@ -274,6 +298,7 @@ sin consumidor.
 | Aplicación | `APP_ENV`, `LOG_LEVEL`, `LOG_CONTENT_DEBUG` |
 | Telegram | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`, `TELEGRAM_ALLOWED_USER_IDS`, `DEV_ALLOW_ANY_USER`, `TELEGRAM_API_BASE_URL`, `MAX_MESSAGE_CHARS`, `MAX_WEBHOOK_BODY_BYTES` |
 | Modelo | `OLLAMA_BASE_URL`, `OLLAMA_API_KEY`, `LLM_MODEL`, `LLM_TIMEOUT_SECONDS`, `LLM_MAX_RETRIES`, `LLM_THINK`, `REQUEST_BUDGET_SECONDS`, `RATE_LIMIT_PER_MINUTE` |
+| Visión | `VISION_MODEL` (Ollama Cloud), `MAX_IMAGE_MB`, `VISION_TIMEOUT_SECONDS` |
 | Búsqueda web | `WEB_SEARCH_PROVIDER`, `WEB_SEARCH_BASE_URL`, `WEB_SEARCH_MAX_RESULTS`, `WEB_SEARCH_TIMEOUT_SECONDS`, `WEB_SEARCH_MAX_CONTENT_CHARS`, `WEB_SEARCH_MAX_TOTAL_CHARS` |
 | Calendario | `GOOGLE_CALENDAR_ENABLED`, `GOOGLE_CALENDAR_ID`, `GOOGLE_OAUTH_CREDENTIALS`, `GOOGLE_CALENDAR_TIMEOUT_SECONDS`, `GOOGLE_CALENDAR_MAX_RESULTS`, `GOOGLE_CALENDAR_MAX_RANGE_DAYS`, `GOOGLE_CALENDAR_MAX_ATTENDEES`, `GOOGLE_CALENDAR_WORKDAY_START_HOUR`, `GOOGLE_CALENDAR_WORKDAY_END_HOUR`, `GOOGLE_CALENDAR_DEFAULT_DURATION_MINUTES` |
 | Persistencia | `STORE_BACKEND`, `DATABASE_URL`, `DATABASE_SYNC_URL`, `DB_POOL_SIZE`, `CHECKPOINTER_POOL_SIZE`, `MIGRATIONS_AUTORUN`, `DEFAULT_TIMEZONE` |
@@ -377,6 +402,9 @@ RUN_LIVE_TESTS=1 uv run pytest -m "eval and live" tests/evals/test_web_search_li
 # Calendario real: OAuth + un calendario de prueba (nunca `primary`)
 GOOGLE_CALENDAR_TEST_ID=<id-del-calendario-de-prueba> \
 RUN_LIVE_TESTS=1 uv run pytest -m "live and not eval" tests/live/test_google_calendar.py
+
+# Visión real: imagen generada + modelo multimodal de Ollama Cloud
+RUN_LIVE_TESTS=1 uv run pytest -m "live and not eval" tests/live/test_vision.py
 ```
 
 Los marcadores `integration`, `eval` y `live` están declarados en `pyproject.toml`; las pruebas que
@@ -503,8 +531,9 @@ comprueba que la revisión que sirve es la última lista.
 - **La búsqueda web depende de Ollama Cloud.** Cada consulta cuenta en la cuenta de Ollama y la
   documentación no publica cuotas ni precios; si el proveedor falla o limita, la herramienta
   devuelve un error y el asistente lo dice. No hay caché ni reintento oculto.
-- **Solo texto y documentos.** No se procesan notas de voz, fotos ni vídeo. Los PDF escaneados sin
-  capa de texto se rechazan.
+- **Imágenes: solo JPEG, PNG o WebP y sin herramientas en ese turno.** La imagen se responde con
+  `gemma4:31b` de Ollama Cloud, no se guarda, y una pregunta de seguimiento exige reenviarla. No se
+  procesan notas de voz ni vídeo. Los PDF escaneados sin capa de texto se rechazan.
 - **El proveedor no respeta `format` para salida estructurada.** El *tool calling* funciona; cuando
   se necesita JSON, el esquema se dicta en el prompt y se valida en el servidor.
 - **"No hay evidencia" es una tasa medida, no una garantía.** Cuando los documentos recuperan

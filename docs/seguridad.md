@@ -127,6 +127,10 @@ La defensa es estructural, porque las instrucciones del prompt no son una fronte
    correos de invitados se tratan como información, nunca como instrucciones. Las escrituras se
    preparan y solo se ejecutan tras aprobación; el prompt ordena ignorar y reportar órdenes
    contenidas en un evento.
+10. **Las imágenes son datos no confiables.** El prompt visual ordena ignorar cualquier instrucción
+    que aparezca en la imagen y decirlo. Se valida el tipo por *magic bytes* (JPEG/PNG/WebP), se
+    limita el tamaño, los bytes no se guardan ni se registran, y el turno con imagen no tiene
+    herramientas: una foto no puede provocar una escritura ni una aprobación.
 
 ## 7. Gestión de secretos
 

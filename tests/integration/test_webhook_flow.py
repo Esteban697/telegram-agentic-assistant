@@ -490,7 +490,7 @@ def test_an_edited_message_is_noticed_not_replayed() -> None:
     assert harness.status_of(7) == "noticed"
 
 
-def test_a_non_text_message_is_answered_explicitly() -> None:
+def test_a_photo_without_vision_is_answered_explicitly() -> None:
     update = {
         "update_id": 8,
         "message": {
@@ -498,6 +498,24 @@ def test_a_non_text_message_is_answered_explicitly() -> None:
             "from": {"id": USER_ID},
             "chat": {"id": CHAT_ID},
             "photo": [{"file_id": "abc", "width": 1, "height": 1}],
+        },
+    }
+
+    with Harness() as harness:
+        harness.post(update)
+
+    assert harness.telegram.sent_texts == [messages.render("images.unavailable")]
+    assert harness.chat_call_count == 0
+
+
+def test_an_unsupported_message_type_is_answered_explicitly() -> None:
+    update = {
+        "update_id": 81,
+        "message": {
+            "message_id": 71,
+            "from": {"id": USER_ID},
+            "chat": {"id": CHAT_ID},
+            "voice": {"file_id": "voice-1", "duration": 2},
         },
     }
 

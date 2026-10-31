@@ -78,6 +78,7 @@ def create_app(
     settings: Settings | None = None,
     *,
     chat_model: ChatModel | None = None,
+    vision_model: ChatModel | None = None,
     telegram_client: TelegramClient | None = None,
     database: Database | None = None,
     checkpointer: Any | None = None,
@@ -270,6 +271,23 @@ def create_app(
             max_retries=resolved.llm_max_retries,
             think=resolved.llm_think,
         )
+        # Image turns use a cloud vision model, never a local Ollama. It is constructed only
+        # when the integration is configured; the handler replies "unavailable" otherwise.
+        vision_client: ChatModel | None = vision_model
+        if (
+            vision_client is None
+            and resolved.vision_model
+            and resolved.api_key
+            and resolved.app_env != "test"
+        ):
+            vision_client = OllamaChatClient(
+                base_url=resolved.ollama_base_url,
+                model=resolved.vision_model,
+                api_key=resolved.api_key,
+                timeout=resolved.vision_timeout_seconds,
+                max_retries=0,
+            )
+        app.state.vision_model = vision_client
         telegram = telegram_client or TelegramClient(
             token=resolved.bot_token,
             base_url=resolved.telegram_api_base_url,
@@ -333,6 +351,7 @@ def create_app(
             registry=registry,
             ingestion=ingestion,
             document_tools=document_tools,
+            vision_model=vision_client,
         )
 
         _logger.info(
@@ -349,6 +368,8 @@ def create_app(
         finally:
             if chat_model is None and isinstance(model, OllamaChatClient):
                 await model.aclose()
+            if vision_model is None and isinstance(vision_client, OllamaChatClient):
+                await vision_client.aclose()
             if telegram_client is None:
                 await telegram.aclose()
             if web_provider is not None:

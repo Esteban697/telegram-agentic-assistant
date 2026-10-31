@@ -86,6 +86,23 @@ contienen tokens, claves, documentos, embeddings ni el contenido de los mensajes
 - **Regla.** No aumentar reintentos ocultos ni convertir `unknown` en `failed`. No registrar
   títulos, descripciones, correos de invitados ni tokens.
 
+## 2.3 Visión: timeout, modelo no disponible o formato no admitido
+
+- **Síntoma.** El bot responde `images.unavailable`, `images.unsupported` o
+  `images.too_large`. Logs: `vision turn complete` (normal) o `vision turn failed` con
+  `error_code` del proveedor. El turno con imagen **no** usa herramientas.
+- **Qué ocurre.** La imagen se descarga de Telegram con el tope `MAX_IMAGE_MB`, se valida por
+  *magic bytes* (JPEG/PNG/WebP) y se envía al modelo multimodal de **Ollama Cloud**
+  (`VISION_MODEL`, por defecto `gemma4:31b`) con `VISION_TIMEOUT_SECONDS`. La respuesta se
+  registra como texto; los bytes de la imagen no se guardan ni se registran.
+- **Respuesta.** Si es `images.unavailable`, comprobar la clave de Ollama Cloud y que
+  `VISION_MODEL` exista en `/api/tags` (es un modelo de la nube, no local). Si es
+  `images.unsupported`, pedir JPEG/PNG/WebP. Si es `images.too_large`, reducir la imagen o subir
+  `MAX_IMAGE_MB` (con cuidado: el webhook tiene 60 s). Un timeout del modelo se reporta como
+  `images.unavailable`; no se reintenta en bucle.
+- **Regla.** No registrar ni almacenar la imagen; no ejecutar herramientas en un turno con imagen.
+  Para crear un recordatorio o un evento a partir de una foto, el usuario debe pedirlo en texto.
+
 ## 3. Telegram: límite de tasa (429)
 
 - **Síntoma.** Un mensaje de respuesta no se entrega. Logs: `telegram rate limited` con
