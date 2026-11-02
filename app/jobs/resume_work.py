@@ -13,17 +13,10 @@ from __future__ import annotations
 import asyncio
 import sys
 
-from app.agent.graph import ChatAgent
-from app.agent.prompts import build_system_prompt
-from app.bot import messages
-from app.bot.telegram_client import TelegramClient
 from app.config import load_settings
 from app.jobs import executor_id, report_line
 from app.logging_config import configure_logging
-from app.services.approvals import ApprovalService
-from app.services.notifications import build_notifier
 from app.services.work_queue import WorkQueue
-from app.storage.checkpointing import build_checkpointer
 from app.storage.postgres import build_database, use_compatible_event_loop
 
 RESUME_BATCH = 10
@@ -39,22 +32,38 @@ async def run() -> dict[str, object]:
     )
 
     database = build_database(settings)
+    queue = WorkQueue(sessions=database.sessions, lease_seconds=RESUME_LEASE_SECONDS)
+
+    resumed: list[dict[str, object]] = []
+    failed: list[dict[str, object]] = []
+
+    items = await queue.claim_due(batch=RESUME_BATCH, executor=executor_id("resume"))
+    if not items:
+        # Nothing queued: exit before importing the agent stack or opening the
+        # checkpointer. This job is scheduled, so an idle tick should cost a
+        # database round-trip rather than a LangGraph import.
+        await database.dispose()
+        return {"resumed": resumed, "failed": failed}
+
+    # Imported here so the idle path above stays cheap.
+    from app.agent.graph import ChatAgent
+    from app.agent.prompts import build_system_prompt
+    from app.bot import messages
+    from app.bot.telegram_client import TelegramClient
+    from app.services.notifications import build_notifier
+    from app.storage.checkpointing import build_checkpointer
+
     telegram = TelegramClient(token=settings.bot_token, base_url=settings.telegram_api_base_url)
     notifier = build_notifier(settings, telegram)
     checkpointer = await build_checkpointer(settings)
-    queue = WorkQueue(sessions=database.sessions, lease_seconds=RESUME_LEASE_SECONDS)
-
     agent = ChatAgent(
         _UnavailableModel(),
         system_prompt=build_system_prompt(),
         budget_seconds=settings.request_budget_seconds,
         checkpointer=checkpointer.saver,
     )
-
-    resumed: list[dict[str, object]] = []
-    failed: list[dict[str, object]] = []
     try:
-        for item in await queue.claim_due(batch=RESUME_BATCH, executor=executor_id("resume")):
+        for item in items:
             thread_id = str(item["thread_id"])
             try:
                 result = await agent.resume(thread_id)

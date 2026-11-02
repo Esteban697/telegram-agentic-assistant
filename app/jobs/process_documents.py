@@ -27,11 +27,8 @@ from typing import Any
 from app.config import load_settings
 from app.errors import AssistantError
 from app.jobs import executor_id, report_line
-from app.llm.embeddings import build_embedding_provider
 from app.logging_config import configure_logging
-from app.services.document_ingestion import DocumentIngestion
 from app.storage import repositories
-from app.storage.gcs import build_object_store, object_key
 from app.storage.postgres import build_database, use_compatible_event_loop
 
 
@@ -63,30 +60,47 @@ async def run(
         )
 
     database = database or build_database(settings)
-    objects = objects if objects is not None else build_object_store(settings)
-    embeddings = embeddings if embeddings is not None else build_embedding_provider(settings)
-    ingestion = DocumentIngestion(
-        sessions=database.sessions,
-        objects=objects,
-        embeddings=embeddings,
-        active_model_name=settings.embed_model,
-        max_upload_mb=settings.max_upload_mb,
-        max_pages=settings.max_pdf_pages,
-        max_ingest_seconds=settings.max_ingest_seconds,
-        chunk_chars=settings.rag_chunk_chars,
-        chunk_overlap=settings.rag_chunk_overlap_chars,
-        chunk_max=settings.rag_chunk_max_chars,
-        chunk_min=settings.rag_chunk_min_chars,
-        # `EMBED_BATCH_SIZE` is the pipeline's own default (16); it is not a `Settings` field, so
-        # the job deliberately inherits the pipeline's value rather than inventing a second one.
-        # No inline deadline: this is the background path (§11.3).
-        deadline_seconds=None,
-    )
-
     limit = settings.document_job_batch_size if batch_size is None else batch_size
     try:
         async with database.sessions() as session:
             documents = await repositories.list_claimable_documents(session, limit=limit)
+
+        if not documents:
+            # Nothing claimable: exit before building the GCS and embedding clients.
+            # This job is scheduled, so an idle tick should cost one query.
+            return {
+                "executor": executor_id("documents"),
+                "claimed": 0,
+                "ready": 0,
+                "failed": 0,
+                "skipped": 0,
+                "results": [],
+            }
+
+        # Imported and built only when there is work, so the idle path stays cheap.
+        from app.llm.embeddings import build_embedding_provider
+        from app.services.document_ingestion import DocumentIngestion
+        from app.storage.gcs import build_object_store, object_key
+
+        objects = objects if objects is not None else build_object_store(settings)
+        embeddings = embeddings if embeddings is not None else build_embedding_provider(settings)
+        ingestion = DocumentIngestion(
+            sessions=database.sessions,
+            objects=objects,
+            embeddings=embeddings,
+            active_model_name=settings.embed_model,
+            max_upload_mb=settings.max_upload_mb,
+            max_pages=settings.max_pdf_pages,
+            max_ingest_seconds=settings.max_ingest_seconds,
+            chunk_chars=settings.rag_chunk_chars,
+            chunk_overlap=settings.rag_chunk_overlap_chars,
+            chunk_max=settings.rag_chunk_max_chars,
+            chunk_min=settings.rag_chunk_min_chars,
+            # `EMBED_BATCH_SIZE` is the pipeline's own default (16); it is not a `Settings` field, so
+            # the job deliberately inherits the pipeline's value rather than inventing a second one.
+            # No inline deadline: this is the background path (§11.3).
+            deadline_seconds=None,
+        )
 
         results: list[dict[str, Any]] = []
         executor = executor_id("documents")
