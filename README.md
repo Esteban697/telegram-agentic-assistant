@@ -6,7 +6,7 @@ huecos libres y eventos, con aprobación para escribir— y puede guardar prefer
 recordatorios, enviar documentos para preguntar por su contenido y preparar acciones externas que
 solo se ejecutan con aprobación explícita.
 
-Está desplegado en Google Cloud: el servicio y los tres jobs corren en Cloud Run, el estado vive en
+Está desplegado en Google Cloud: el servicio y los cuatro jobs corren en Cloud Run, el estado vive en
 PostgreSQL (Supabase), los embeddings se calculan con Vertex AI y el calendario usa OAuth de Google
 con el refresh token en Secret Manager. La documentación de despliegue, operación, seguridad y el
 informe final están en [`docs/`](docs/).
@@ -42,6 +42,10 @@ informe final están en [`docs/`](docs/).
   procesa cada `update_id` una sola vez.
 - **Operación observable.** Logs JSON estructurados, sin secretos ni contenido de mensajes, y
   endpoints separados de liveness y readiness.
+- **Supervisión de gastos.** Un job diario envía por Telegram el gasto del último día, los
+  principales servicios del proyecto, el total de la cuenta y el mes en curso, una vez activada
+  la exportación de facturación a BigQuery. Además hay un presupuesto de 5 EUR/mes con avisos al
+  50/80/100%.
 
 ## Cómo se usa desde Telegram
 
@@ -212,9 +216,10 @@ Secret Manager (`GOOGLE_OAUTH_CREDENTIALS`) y los access tokens solo en memoria.
 `calendar.events` y `calendar.events.freebusy`; no se piden permisos de compartición ni de
 configuración del calendario.
 
-- **Un binario, cuatro comandos**: `uvicorn app.main:app` para el servicio y
-  `python -m app.jobs.dispatch_reminders`, `-m app.jobs.process_documents` y
-  `-m app.jobs.resume_work` para los tres jobs de una sola pasada.
+- **Un binario, cinco comandos**: `uvicorn app.main:app` para el servicio y
+  `python -m app.jobs.dispatch_reminders`, `-m app.jobs.process_documents`,
+  `-m app.jobs.resume_work` y `-m app.jobs.billing_report` para los cuatro jobs de una sola
+  pasada.
 - **El estado no vive en el proceso.** El servicio escala a cero y los jobs son independientes; la
   conversación, la memoria, las tareas y los checkpoints están en PostgreSQL. El checkpointer de
   LangGraph (`AsyncPostgresSaver`) se adjunta al compilar el grafo y usa la misma base de datos.
@@ -299,6 +304,7 @@ sin consumidor.
 | Telegram | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`, `TELEGRAM_ALLOWED_USER_IDS`, `DEV_ALLOW_ANY_USER`, `TELEGRAM_API_BASE_URL`, `MAX_MESSAGE_CHARS`, `MAX_WEBHOOK_BODY_BYTES` |
 | Modelo | `OLLAMA_BASE_URL`, `OLLAMA_API_KEY`, `LLM_MODEL`, `LLM_TIMEOUT_SECONDS`, `LLM_MAX_RETRIES`, `LLM_THINK`, `REQUEST_BUDGET_SECONDS`, `RATE_LIMIT_PER_MINUTE` |
 | Visión | `VISION_MODEL` (Ollama Cloud), `MAX_IMAGE_MB`, `VISION_TIMEOUT_SECONDS` |
+| Informe de gastos | `BILLING_EXPORT_PROJECT`, `BILLING_EXPORT_DATASET`, `BILLING_EXPORT_TABLE`, `BILLING_REPORT_DAYS` |
 | Búsqueda web | `WEB_SEARCH_PROVIDER`, `WEB_SEARCH_BASE_URL`, `WEB_SEARCH_MAX_RESULTS`, `WEB_SEARCH_TIMEOUT_SECONDS`, `WEB_SEARCH_MAX_CONTENT_CHARS`, `WEB_SEARCH_MAX_TOTAL_CHARS` |
 | Calendario | `GOOGLE_CALENDAR_ENABLED`, `GOOGLE_CALENDAR_ID`, `GOOGLE_OAUTH_CREDENTIALS`, `GOOGLE_CALENDAR_TIMEOUT_SECONDS`, `GOOGLE_CALENDAR_MAX_RESULTS`, `GOOGLE_CALENDAR_MAX_RANGE_DAYS`, `GOOGLE_CALENDAR_MAX_ATTENDEES`, `GOOGLE_CALENDAR_WORKDAY_START_HOUR`, `GOOGLE_CALENDAR_WORKDAY_END_HOUR`, `GOOGLE_CALENDAR_DEFAULT_DURATION_MINUTES` |
 | Persistencia | `STORE_BACKEND`, `DATABASE_URL`, `DATABASE_SYNC_URL`, `DB_POOL_SIZE`, `CHECKPOINTER_POOL_SIZE`, `MIGRATIONS_AUTORUN`, `DEFAULT_TIMEZONE` |
@@ -478,9 +484,20 @@ Dos reglas que se comprueban con pruebas, no por convención:
   (`--data-file=`) o del terminal (`--prompt-for-password`), y `scripts/lib/redact.sh` redacta
   valores y formas de credencial.
 
+### Informe diario de gastos
+
+- **Presupuesto:** `TAA assistant monthly (5 EUR)` sobre el proyecto, con avisos al 50/80/100%.
+- **Exportación (una vez):** Billing → **Billing export** → **BigQuery export** → **Detailed usage
+  cost** → proyecto `telegram-assistant-esteban`, dataset `billing_export` (EU). Google añade su
+  cuenta de servicio al dataset automáticamente; no hay API pública para activar el toggle.
+- **Job diario:** `taa-prod-job-billing` se ejecuta a las **08:00 Europe/Madrid** y envía por
+  Telegram el gasto del último día con datos, los servicios principales del proyecto, el total de
+  la cuenta y el mes en curso. Si la tabla de exportación aún no existe, sale en silencio.
+- Los datos de facturación pueden tardar ~24 h; el mensaje indica el último día disponible.
+
 **Estado desplegado:** servicio `taa-prod-api` en Cloud Run
-(`https://taa-prod-api-hzlxaxcstq-ew.a.run.app`, escala a cero, `max-instances=1`), tres Cloud Run
-Jobs, tres schedulers habilitados, cinco secretos con versión fijada y el webhook registrado.
+(`https://taa-prod-api-hzlxaxcstq-ew.a.run.app`, escala a cero, `max-instances=1`), cuatro Cloud Run
+Jobs, cuatro schedulers habilitados, cinco secretos con versión fijada y el webhook registrado.
 Base de datos en Supabase (PostgreSQL 17.11 + pgvector 0.8.2), embeddings en Vertex AI y
 **Google Calendar activo** con OAuth (`calendar.events` + `calendar.events.freebusy`) y el
 calendario `primary`. El script limpia cualquier pin de tráfico que haya dejado una reversión y
@@ -553,6 +570,9 @@ comprueba que la revisión que sirve es la última lista.
 - **Supabase en plan gratuito se pausa tras 7 días de inactividad y no tiene copias.** Para un
   asistente siempre disponible y con restauración se recomienda el plan Pro. La reversión de código
   está ejercitada; la restauración del esquema no, porque no hay copia.
+- **El informe de gastos depende de BigQuery.** La exportación de facturación se activa una vez en
+  la consola y los datos pueden tardar ~24 h; el job diario muestra el último día disponible y no
+  corrige cargos que lleguen después. El presupuesto de 5 EUR avisa por correo al 50/80/100%.
 - **Sin purga automática ni canal de alertas.** La retención es una decisión abierta; los datos se
   conservan hasta que se borran con los comandos o el procedimiento manual.
 - **Las evaluaciones del agente en vivo son estocásticas.** Una de ellas ha fallado en ejecuciones
@@ -576,7 +596,8 @@ app/
   storage/              modelos, repositorios, motores, checkpointer, GCS y almacenes en memoria
   services/             conversación, aprobaciones, ingesta, recordatorios y cola de trabajo
   tools/                memoria, tareas, documentos, restaurantes, búsqueda web, calendario y reloj
-  jobs/                 tres jobs de una sola pasada
+  jobs/                 cuatro jobs de una sola pasada (recordatorios, documentos, reanudación,
+                        informe de gastos)
 migrations/             revisiones de Alembic (0001..0007)
 docs/                   despliegue, operación, seguridad e informe final
 scripts/                despliegue, webhook, auditoría de imagen, presupuesto de conexiones,

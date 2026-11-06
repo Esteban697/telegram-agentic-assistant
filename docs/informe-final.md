@@ -19,9 +19,10 @@ coste / IAM / límites / datos personales de la Fase 6.
 El asistente está **desplegado y funcionando** en `https://taa-prod-api-hzlxaxcstq-ew.a.run.app`:
 un bot privado de Telegram que conversa a través de Ollama Cloud, busca en la web datos actuales,
 consulta y modifica Google Calendar con aprobación, responde sobre imágenes con el modelo
-multimodal `gemma4:31b`, guarda preferencias y recordatorios en PostgreSQL, indexa documentos y
-responde con la página de la que saca cada dato, y prepara acciones externas que solo se ejecutan
-con una aprobación explícita.
+multimodal `gemma4:31b`, envía un resumen diario de gastos desde la exportación de facturación a
+BigQuery, guarda preferencias y recordatorios en PostgreSQL, indexa documentos y responde con la
+página de la que saca cada dato, y prepara acciones externas que solo se ejecutan con una
+aprobación explícita.
 
 Evidencia de extremo a extremo, producida **por el usuario** contra el sistema desplegado:
 
@@ -40,7 +41,7 @@ y la respuesta fue correcta. La primera prueba real expuso dos defectos del mode
 llamada como texto y calculó mal la fecha); se corrigieron en `2f69340` resolviendo días relativos
 y rangos en servidor (ver §7.11).
 
-Infraestructura: Cloud Run (servicio + 3 jobs), 3 schedulers habilitados, 5 secretos con versión
+Infraestructura: Cloud Run (servicio + 4 jobs), 4 schedulers habilitados, 5 secretos con versión
 fijada, webhook registrado sin `last_error_message`, Supabase (PostgreSQL 17.11 + pgvector 0.8.2).
 
 ---
@@ -58,15 +59,15 @@ Telegram ──HTTPS──▶ app/api/telegram_webhook.py
                     app/tools/registry.py (nivel de riesgo + ledger) ──▶ PostgreSQL / GCS / providers
 ```
 
-- **Un binario, cuatro comandos**: `uvicorn app.main:app` (servicio) y los tres jobs
-  `dispatch_reminders`, `process_documents`, `resume_work`.
+- **Un binario, cinco comandos**: `uvicorn app.main:app` (servicio) y los cuatro jobs
+  `dispatch_reminders`, `process_documents`, `resume_work` y `billing_report`.
 - **PostgreSQL** (Supabase, pooler Supavisor en modo sesión, TLS) para todo el estado: conversación,
   memorias, tareas, documentos y chunks, aprobaciones, ledger de herramientas, `work_items` y los
   checkpoints de LangGraph.
 - **Vertex AI** (`gemini-embedding-001`, 768 dimensiones) para embeddings; **Ollama Cloud** para el
   modelo de chat, la búsqueda web y la visión (`gemma4:31b`, solo en turnos con imagen); **Cloud
   Storage** para los originales; **Google Calendar** vía OAuth 2.0 del usuario para la agenda y los
-  eventos.
+  eventos; **BigQuery** para el informe diario de gastos (exportación de facturación, solo lectura).
 
 ---
 
@@ -104,6 +105,7 @@ primera línea del docstring de cada módulo, abreviada.
 | `app/llm/ollama_client.py` | Cliente HTTP de Ollama aislado (timeout, reintentos acotados, sin URLs del token en errores). |
 | `app/llm/web_search.py` | Proveedor de búsqueda web de Ollama Cloud (request acotado, resultados recortados, sin reintentos ocultos). |
 | `app/integrations/google_calendar.py` | OAuth de usuario (refresh cacheado con lock) y cliente REST de Calendar. |
+| `app/jobs/billing_report.py` | Job diario: consulta la exportación de facturación en BigQuery y envía el resumen por Telegram. |
 | `app/tools/calendar.py` | Herramientas de calendario: lecturas de nivel 0 y escrituras de nivel 2 con aprobación. |
 | `app/tools/clock.py` | `get_current_datetime` para resolver fechas relativas. |
 | `app/llm/protocols.py` | Puertos del LLM (`ChatModel`, `EmbeddingProvider`) — capa 0. |
@@ -215,7 +217,7 @@ primera línea del docstring de cada módulo, abreviada.
 
 | Suite | Comando | Resultado real |
 |---|---|---|
-| Unitaria, sin credenciales, sin BD, sin red | `pytest -m "not integration and not live and not eval"` | **519 pasan** |
+| Unitaria, sin credenciales, sin BD, sin red | `pytest -m "not integration and not live and not eval"` | **527 pasan** |
 | Integración contra PostgreSQL | `pytest -m integration` | **135 pasan, 1 se salta** |
 | Evaluaciones deterministas | `pytest -m "eval and not live"` | **23 pasan** |
 | Vertex real | `GOOGLE_CLOUD_PROJECT=telegram-assistant-esteban GOOGLE_CLOUD_REGION=europe-west1 RUN_LIVE_TESTS=1 pytest -m "live and not eval"` | **2 pasan** |
@@ -236,7 +238,8 @@ lo dice con el comando exacto. No hay ningún salto silencioso.
 
 - Servicio `taa-prod-api` en `https://taa-prod-api-hzlxaxcstq-ew.a.run.app`, con escala a cero y
   `max-instances=1`; `/health` y `/readyz` en verde.
-- Tres Cloud Run Jobs (recordatorios, documentos, reanudación), tres Scheduler habilitados.
+- Cuatro Cloud Run Jobs (recordatorios, documentos, reanudación y facturación), cuatro Scheduler
+  habilitados.
 - Cinco secretos en Secret Manager con **versión fijada numéricamente** (nunca `latest`).
 - **Calendario (revisión `00006-krn`):** `GOOGLE_CALENDAR_ENABLED=true`, calendario `primary`,
   secreto `taa-prod-google-oauth-credentials:2`, Calendar API habilitada, y lectura real de
@@ -284,10 +287,10 @@ Los 15 elementos, uno a uno. **Verificado** = hay una ejecución o una prueba co
 
 | # | Elemento | Estado | Evidencia / dependencia |
 |---|---|---|---|
-| 1 | Se puede ejecutar localmente siguiendo el README | **Verificado** | README (setup, `uv sync`, `.env`, `docker`/`uvicorn`) + la suite unitaria corre en una máquina limpia sin credenciales (519) |
+| 1 | Se puede ejecutar localmente siguiendo el README | **Verificado** | README (setup, `uv sync`, `.env`, `docker`/`uvicorn`) + la suite unitaria corre en una máquina limpia sin credenciales (527) |
 | 2 | `.env.example` sin secretos reales | **Verificado** | `.env.example` versionado con valores vacíos; `test_env_example_contains_no_real_looking_secret` |
 | 3 | Migraciones desde una base vacía | **Verificado** | `0001`…`0007` aplicadas al proyecto Supabase nuevo (17.11) y al contenedor local; `scripts/bootstrap_db.py` verifica tablas, `vector` ≥ 0.8, HNSW y una fila activa |
-| 4 | Las pruebas unitarias pasan | **Verificado** | 519 pasan, sin credenciales, sin BD, sin red |
+| 4 | Las pruebas unitarias pasan | **Verificado** | 527 pasan, sin credenciales, sin BD, sin red |
 | 5 | Integración implementada y dependencias documentadas | **Verificado** | 135 pasan, 1 se salta; README documenta el contenedor y `TEST_DATABASE_URL` |
 | 6 | Telegram limitado a usuarios autorizados | **Verificado** | Allow-list + denegación por defecto; `test_authz`, `test_webhook_secret`; en producción una lista vacía **impide arrancar**; desplegado con `TELEGRAM_ALLOWED_USER_IDS` |
 | 7 | El LLM se puede cambiar por configuración | **Verificado** | `LLM_MODEL`; `test_model_name_is_never_hard_coded_outside_configuration`; sonda A10 documentada |
@@ -306,7 +309,7 @@ Los 15 elementos, uno a uno. **Verificado** = hay una ejecución o una prueba co
 
 | # | Entregable | Dónde | Estado |
 |---|---|---|---|
-| 1 | Código fuente funcional y tipado | `app/` (61 módulos, incluidos los `__init__`), con tipos en las fronteras de datos | Entregado |
+| 1 | Código fuente funcional y tipado | `app/` (63 módulos, incluidos los `__init__`), con tipos en las fronteras de datos | Entregado |
 | 2 | `pyproject.toml` con dependencias fijadas y comandos | `pyproject.toml` (pins exactos) + `uv.lock`; comandos de prueba en el README | Entregado |
 | 3 | `Dockerfile` y `.dockerignore` | Imagen multi-etapa, base por digest, no-root; `.dockerignore` con patrones `**/` | Entregado |
 | 4 | Migraciones de base de datos | `migrations/versions/0001`…`0007`; `alembic.ini` | Entregado y aplicado |
@@ -401,6 +404,11 @@ presenten como resueltos (spec §16).
     La imagen no se guarda ni se registra en logs; una pregunta de seguimiento exige reenviarla; el
     turno con imagen no usa herramientas, así que no crea recordatorios ni eventos desde una foto.
     Verificado con una imagen generada y el modelo real (`tests/live/test_vision.py`).
+16. **Informe de gastos: exportación manual y datos con retraso.** El job diario
+    `taa-prod-job-billing` (08:00 Europe/Madrid) lee la exportación detallada de facturación en
+    BigQuery; la exportación solo se activa desde la consola (no hay API) y los datos pueden tardar
+    ~24 h. Si la tabla aún no existe, el job sale en silencio. El presupuesto
+    `TAA assistant monthly (5 EUR)` avisa por correo al 50/80/100%.
 
 ---
 
@@ -434,8 +442,9 @@ de confirmar** (spec §1.4; PLAN.md §12).
 | Recurso | Coste | Disposición |
 |---|---|---|
 | Cloud Run Service | ~0 $ en reposo (`min-instances=0`); por petición y CPU/memoria-segundo | **pendiente de confirmar** la tarifa vigente |
-| Cloud Run Jobs ×3 | fracciones de céntimo por ejecución | **pendiente de confirmar** |
-| Cloud Scheduler ×3 | 0 (nivel gratuito a estas cadencias) | gratis |
+| Cloud Run Jobs ×4 | fracciones de céntimo por ejecución | **pendiente de confirmar** |
+| Cloud Scheduler ×4 | 3 en el nivel gratuito; el cuarto ~0,10 $/mes | ~0,10 $/mes |
+| BigQuery (exportación de facturación e informe) | almacenamiento y consultas diarias mínimas | céntimos/mes (pendiente de confirmar) |
 | Secret Manager | céntimos/mes por secreto y acceso | **pendiente de confirmar** |
 | Artifact Registry | céntimos/mes por GB | **pendiente de confirmar** |
 | Cloud Storage | céntimos/mes por GB y operaciones | **pendiente de confirmar** |
@@ -453,7 +462,8 @@ de confirmar** (spec §1.4; PLAN.md §12).
 | Runtime SA (`taa-prod-runtime`) | `roles/aiplatform.user` | proyecto | es lo mínimo para llamar a Vertex; sin él, todo embedding recibe 403 |
 | Runtime SA | `roles/storage.objectAdmin` | **solo el bucket** | acotado a `taa-prod-documents`; no `storage.admin` |
 | Runtime SA | `roles/secretmanager.secretAccessor` | **por secreto** (los 5) | lectura de exactamente los cinco; sin `secretVersionManager` (rotar es un acto de despliegue) |
-| Scheduler SA (`taa-prod-scheduler`) | `roles/run.invoker` | **por job** (los 3) | lo mínimo para disparar un job |
+| Runtime SA | `roles/bigquery.jobUser` + `roles/bigquery.dataViewer` | proyecto | **solo lectura** para el informe de gastos; sin escritura ni administración |
+| Scheduler SA (`taa-prod-scheduler`) | `roles/run.invoker` | **por job** (los 4) | lo mínimo para disparar un job |
 | Humano (`operator@example.com`) | `roles/owner` | proyecto | es el dueño del proyecto y quien despliega; **no** es la identidad de ejecución |
 
 Comprobado el 2026-10-18 con `gcloud projects get-iam-policy`, `gcloud secrets get-iam-policy` y
@@ -478,7 +488,7 @@ servicio siguió respondiendo `/health` y `/readyz` con 200 después del cambio.
 | Límite | Valor | Consecuencia |
 |---|---|---|
 | Conexiones del pooler (Supavisor, modo sesión) | **14** | `(2 + 1) × 4 + 2 = 14`; `--max-instances=1` es obligatorio; la conexión 15 falla al instante |
-| Procesos concurrentes | 4 (1 servicio + 3 jobs) | incluido en el aritmético |
+| Procesos concurrentes | 4 (1 servicio + 3 jobs con base de datos) | incluido en el aritmético; el job de facturación no abre conexiones |
 | Presupuesto de petición | 45 s | por debajo del plazo de 60 s de Telegram; el turno se entrega a la cola de reanudación |
 | Timeout del modelo | 18 s × (1 + 1 reintento) + margen = 38,25 s | validado al arrancar contra el presupuesto |
 | Ingesta en línea | 27 s (menor entre 30 y 0,6 × 45) | lo que no cabe queda en cola para el job |
@@ -490,6 +500,7 @@ servicio siguió respondiendo `/health` y `/readyz` con 200 después del cambio.
 | Búsqueda web | 5 resultados (máx. 10), 2000 caracteres por resultado, 8000 en total, timeout 10 s | los extractos no desplazan el contexto del turno; cada consulta cuenta en la cuenta de Ollama |
 | Calendario | 50 eventos, 90 días de rango, 20 invitados, 4.000 caracteres de descripción, timeout 10 s | por encima se pide reducir el rango; los eventos son externos y las escrituras exigen aprobación |
 | Imágenes | JPEG/PNG/WebP, 10 MB, timeout 30 s, modelo `gemma4:31b` de Ollama Cloud | la imagen no se guarda; el turno no usa herramientas |
+| Informe de gastos | 32 días de histórico, job diario 08:00 Europe/Madrid | los datos de facturación pueden tardar ~24 h; el job muestra el último día disponible |
 
 ### 9.4 Datos personales: qué se guarda, cuánto y cómo se borra
 
@@ -503,6 +514,7 @@ servicio siguió respondiendo `/health` y `/readyz` con 200 después del cambio.
 | Aprobaciones y ledger de herramientas | `pending_actions`, `tool_invocations` | auditoría y no-duplicación | retención manual |
 | Consultas de búsqueda web | se envían a Ollama Cloud; **no** se persisten ni se registran | responder con datos actuales | no almacenadas; el proveedor aplica su propia política |
 | Imágenes enviadas | se descargan de Telegram y se envían al modelo multimodal; **no** se persisten ni se registran | responder preguntas sobre la imagen | no almacenadas; para un seguimiento hay que reenviarla |
+| Datos de facturación | exportación de BigQuery: importes agregados por proyecto/servicio; **no** hay datos personales | informe diario de gastos | la escribe la cuenta de exportación de Google; el runtime solo lee |
 | Eventos, invitados y descripciones de Calendar | se leen de Google bajo demanda; los argumentos de una escritura aprobada quedan en `pending_actions` (`args_json`, `preview_text`) y el resultado en `result_json` | agenda y reuniones | con la fila de la acción o borrando el evento; nunca en logs |
 | Refresh token de Google | Secret Manager (`taa-prod-google-oauth-credentials`) | acceso al calendario | revocar el acceso en Google y borrar/rotar el secreto |
 | Logs | Cloud Logging | operación | **sin contenido** por defecto (solo ids, herramienta, duración, estado, puntuaciones) |
@@ -519,7 +531,7 @@ mensajes, documentos, embeddings ni secretos; `LOG_CONTENT_DEBUG=false` es el va
 
 ```bash
 # Suite sin credenciales, sin base de datos y sin red
-uv run pytest -m "not integration and not live and not eval"          # 519
+uv run pytest -m "not integration and not live and not eval"          # 527
 
 # Integración contra el contenedor local
 bash scripts/run_local_db.sh

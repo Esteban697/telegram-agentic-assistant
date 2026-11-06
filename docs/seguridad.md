@@ -148,6 +148,10 @@ La defensa es estructural, porque las instrucciones del prompt no son una fronte
 - **La cuenta de servicio por defecto de Compute no tiene roles.** Se le retiró el `roles/editor`
   heredado el 2026-10-18 y se comprobó que no conserva ninguna concesión; ningún recurso la usa
   (servicio y jobs corren con `taa-prod-runtime`).
+- **El informe de gastos solo lee BigQuery.** El runtime tiene `bigquery.jobUser` y
+  `bigquery.dataViewer` a nivel de proyecto (no escritura ni administración); el dataset
+  `billing_export` contiene importes agregados por proyecto/servicio, no datos personales. La
+  exportación la escribe la cuenta gestionada por Google, no el runtime.
 - **Google Calendar usa OAuth del usuario, no una cuenta de servicio.** El refresh token vive en
   el secreto `taa-prod-google-oauth-credentials` (versión fijada, montado como
   `GOOGLE_OAUTH_CREDENTIALS`); el runtime solo tiene `secretAccessor` (lectura) y **no**

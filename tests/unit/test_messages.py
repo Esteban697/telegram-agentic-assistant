@@ -92,6 +92,11 @@ _ALLOWED_PLACEHOLDERS = frozenset(
         "chunks",
         "pages",
         "max_mb",
+        "day",
+        "project",
+        "amount",
+        "currency",
+        "service",
     }
 )
 

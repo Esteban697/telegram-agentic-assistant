@@ -103,6 +103,20 @@ contienen tokens, claves, documentos, embeddings ni el contenido de los mensajes
 - **Regla.** No registrar ni almacenar la imagen; no ejecutar herramientas en un turno con imagen.
   Para crear un recordatorio o un evento a partir de una foto, el usuario debe pedirlo en texto.
 
+## 2.4 Informe de gastos: sin datos o fallo del job
+
+- **Síntoma.** No llega el mensaje diario de gastos. Logs: `billing export table is missing`
+  (`JOB_REPORT` con `status: export_missing`) o `billing report failed` con `status: failed`.
+- **Qué ocurre.** El job lee la exportación detallada de facturación en BigQuery
+  (`billing_export`), agrupa por día/proyecto/servicio y envía el resumen por Telegram. Si la tabla
+  no existe, sale en silencio para no mandar un aviso de configuración todos los días.
+- **Respuesta.** Activar la exportación en **Billing → Billing export → BigQuery export** (una vez;
+  no hay API), comprobar que el runtime SA tiene `bigquery.jobUser` y `bigquery.dataViewer`, y que
+  el dataset `billing_export` existe en EU. Los datos pueden tardar ~24 h; si el job falla, revisar
+  el `JOB_REPORT` y los permisos. El presupuesto de 5 EUR avisa por correo al 50/80/100%.
+- **Regla.** No poner la clave de facturación ni la consulta en logs; el informe solo contiene
+  importes por servicio/proyecto.
+
 ## 3. Telegram: límite de tasa (429)
 
 - **Síntoma.** Un mensaje de respuesta no se entrega. Logs: `telegram rate limited` con

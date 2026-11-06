@@ -85,6 +85,14 @@ class Settings(BaseSettings):
     max_image_mb: int = Field(default=10, gt=0)
     vision_timeout_seconds: float = Field(default=30.0, gt=0)
 
+    # --- Billing report ----------------------------------------------------- #
+    # The daily digest reads the Cloud Billing BigQuery export. The export itself is a one-time
+    # Console setting; these fields only point at it. Empty project = GOOGLE_CLOUD_PROJECT.
+    billing_export_project: str = ""
+    billing_export_dataset: str = "billing_export"
+    billing_export_table: str = ""
+    billing_report_days: int = Field(default=32, ge=1, le=90)
+
     # --- Web search -------------------------------------------------------- #
     # Ollama Cloud exposes POST /api/web_search with the same account key as chat. `none`
     # leaves the tool returning CapabilityUnavailable instead of calling out. Search results

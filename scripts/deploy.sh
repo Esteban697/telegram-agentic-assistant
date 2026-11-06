@@ -67,6 +67,7 @@ SERVICE="${PREFIX}-api"
 JOB_REMINDERS="${PREFIX}-job-reminders"
 JOB_DOCUMENTS="${PREFIX}-job-documents"
 JOB_RESUME="${PREFIX}-job-resume"
+JOB_BILLING="${PREFIX}-job-billing"
 RUNTIME_SA="${PREFIX}-runtime"
 SCHEDULER_SA="${PREFIX}-scheduler"
 BUCKET="${PREFIX}-documents"
@@ -375,7 +376,7 @@ common_secrets_payload() {
 
 if [[ "$DUMP_ENV" -eq 1 ]]; then
   # El entorno exacto que recibe cada componente, en un formato que se puede comprobar.
-  for component in service "$JOB_REMINDERS" "$JOB_DOCUMENTS" "$JOB_RESUME"; do
+  for component in service "$JOB_REMINDERS" "$JOB_DOCUMENTS" "$JOB_RESUME" "$JOB_BILLING"; do
     for entry in "${COMMON_ENV[@]}"; do
       printf 'DUMP %s env %s\n' "$component" "$entry"
     done
@@ -507,7 +508,7 @@ step 1 "Habilitar las APIs necesarias" \
      "gratis por sí mismo; habilita productos facturables de los pasos siguientes"
 # ============================================================================================ #
 note "APIs: run, sqladmin, secretmanager, artifactregistry, cloudscheduler, storage, logging,"
-note "monitoring, aiplatform y calendar-json (Vertex ya está habilitada; habilitar es idempotente)."
+note "monitoring, aiplatform, calendar-json y bigquery (habilitar es idempotente)."
 run "habilitar APIs (idempotente, no crea ningún recurso facturable)" "gratis" \
   gcloud services enable \
     run.googleapis.com \
@@ -520,6 +521,7 @@ run "habilitar APIs (idempotente, no crea ningún recurso facturable)" "gratis" 
     monitoring.googleapis.com \
     aiplatform.googleapis.com \
     calendar-json.googleapis.com \
+    bigquery.googleapis.com \
     --project "$PROJECT"
 
 # ============================================================================================ #
@@ -682,6 +684,18 @@ run "runtime: usuario de Vertex AI (embeddings)" "gratis" \
     --role="roles/aiplatform.user" \
     --condition=None \
     --project "$PROJECT"
+run "runtime: ejecutar consultas de BigQuery (informe de gastos)" "gratis" \
+  gcloud projects add-iam-policy-binding "$PROJECT" \
+    --member="serviceAccount:${RUNTIME_SA_EMAIL}" \
+    --role="roles/bigquery.jobUser" \
+    --condition=None \
+    --project "$PROJECT"
+run "runtime: leer el dataset de facturación" "gratis" \
+  gcloud projects add-iam-policy-binding "$PROJECT" \
+    --member="serviceAccount:${RUNTIME_SA_EMAIL}" \
+    --role="roles/bigquery.dataViewer" \
+    --condition=None \
+    --project "$PROJECT"
 for secret in "$SECRET_BOT_TOKEN" "$SECRET_WEBHOOK" "$SECRET_OLLAMA" "$SECRET_DATABASE_URL" "$SECRET_GOOGLE_OAUTH"; do
   run "runtime: leer el secreto ${secret}" "gratis" \
     gcloud secrets add-iam-policy-binding "$secret" \
@@ -700,7 +714,7 @@ note "min-instances=0 (escala a cero) y cpu-throttling por defecto (solo se paga
 note "petición): es lo que hace segura la decisión 2 del plan."
 note "**max-instances=1 no es una elección de coste**: el pooler de Supabase admite 14 conexiones"
 note "de cliente en modo sesión y el aritmético del paso 0 está calculado para una instancia más"
-note "los tres jobs."
+note "los cuatro jobs."
 note "--allow-unauthenticated SÍ: Telegram no puede enviar credenciales de IAM; la autenticación"
 note "es el secreto del webhook (spec §13)."
 note "gcloud run deploy crea o actualiza: es idempotente por sí solo."
@@ -733,24 +747,28 @@ run "asegurar que el tráfico sirve la revisión recién desplegada" "gratis" \
     --project "$PROJECT"
 
 # ============================================================================================ #
-step 10 "Los tres Cloud Run Jobs" "facturable por ejecución; fracciones de céntimo"
+step 10 "Los cuatro Cloud Run Jobs" "facturable por ejecución; fracciones de céntimo"
 # ============================================================================================ #
-note "Un binario, cuatro comandos (decisión 18): los jobs reutilizan la misma imagen y el mismo"
+note "Un binario, cinco comandos (decisión 18): los jobs reutilizan la misma imagen y el mismo"
 note "entorno que el servicio — si el entorno no valida, no arrancan."
 note "Cada job es de una sola pasada: escanea, reclama con FOR UPDATE SKIP LOCKED, trabaja y"
 note "termina. Ninguno depende de un temporizador en memoria (spec §11, spec §17)."
+note "El job de facturación no abre conexiones a la base: el aritmético del pooler sigue contando"
+note "cuatro procesos con base de datos (servicio + tres jobs)."
 
 declare -A JOB_MODULE=(
   ["$JOB_REMINDERS"]="app.jobs.dispatch_reminders"
   ["$JOB_DOCUMENTS"]="app.jobs.process_documents"
   ["$JOB_RESUME"]="app.jobs.resume_work"
+  ["$JOB_BILLING"]="app.jobs.billing_report"
 )
 declare -A JOB_TIMEOUT=(
   ["$JOB_REMINDERS"]="300"
   ["$JOB_DOCUMENTS"]="900"
   ["$JOB_RESUME"]="300"
+  ["$JOB_BILLING"]="300"
 )
-for job in "$JOB_REMINDERS" "$JOB_DOCUMENTS" "$JOB_RESUME"; do
+for job in "$JOB_REMINDERS" "$JOB_DOCUMENTS" "$JOB_RESUME" "$JOB_BILLING"; do
   run_ensure "crear el job ${job} (si no existe)" "facturable (pendiente de confirmar)" \
     "gcloud run jobs describe ${job}" job_exists \
     gcloud run jobs create "$job" \
@@ -768,7 +786,7 @@ for job in "$JOB_REMINDERS" "$JOB_DOCUMENTS" "$JOB_RESUME"; do
 done
 # `run.invoker` must come **after** the job exists — binding it earlier fails with NOT_FOUND.
 # `add-iam-policy-binding` is idempotent, so a re-run is harmless.
-for job in "$JOB_REMINDERS" "$JOB_DOCUMENTS" "$JOB_RESUME"; do
+for job in "$JOB_REMINDERS" "$JOB_DOCUMENTS" "$JOB_RESUME" "$JOB_BILLING"; do
   run "scheduler: invocar el job ${job}" "gratis" \
     gcloud run jobs add-iam-policy-binding "$job" \
       --member="serviceAccount:${SCHEDULER_SA_EMAIL}" \
@@ -779,7 +797,7 @@ done
 
 # ============================================================================================ #
 step 11 "Cloud Scheduler (dispara los jobs con un token OAuth)" \
-     "3 jobs/mes dentro del nivel gratuito; coste 0 con estas cadencias"
+     "4 jobs/mes: 3 dentro del nivel gratuito; el cuarto ~0,10 $/mes"
 # ============================================================================================ #
 note "El destino es la API de administración de Cloud Run, no una URL secreta (spec §13)."
 note "No existe ningún endpoint interno público: los health endpoints son los únicos otros caminos."
@@ -790,13 +808,18 @@ declare -A SCHEDULE_CRON=(
   ["$JOB_REMINDERS"]="* * * * *"
   ["$JOB_DOCUMENTS"]="*/5 * * * *"
   ["$JOB_RESUME"]="* * * * *"
+  ["$JOB_BILLING"]="0 8 * * *"
 )
-for job in "$JOB_REMINDERS" "$JOB_DOCUMENTS" "$JOB_RESUME"; do
+declare -A SCHEDULE_TIMEZONE=(
+  ["$JOB_BILLING"]="Europe/Madrid"
+)
+for job in "$JOB_REMINDERS" "$JOB_DOCUMENTS" "$JOB_RESUME" "$JOB_BILLING"; do
   tick="${job}-tick"
   run_ensure "crear el schedule ${tick} (si no existe)" "0 (nivel gratuito)" \
     "gcloud scheduler jobs describe ${tick}" schedule_exists \
     gcloud scheduler jobs create http "$tick" \
       --schedule="${SCHEDULE_CRON[$job]}" \
+      --time-zone="${SCHEDULE_TIMEZONE[$job]:-UTC}" \
       --location="$REGION" \
       --uri="https://run.googleapis.com/v2/projects/${PROJECT}/locations/${REGION}/jobs/${job}:run" \
       --http-method=POST \

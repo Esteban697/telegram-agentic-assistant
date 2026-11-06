@@ -13,10 +13,10 @@ cada comando de este documento lleva `--project telegram-assistant-esteban`, y p
 no es una convención que haya que recordar.
 
 > **Estado actual del proyecto (2026-10-19).** **Desplegado y operativo**: el servicio
-> `taa-prod-api` en `https://taa-prod-api-hzlxaxcstq-ew.a.run.app`, los tres Cloud Run Jobs, los tres
-> schedulers habilitados, los cinco secretos con versión fijada y el webhook registrado. La base de
-> datos es **Supabase** (PostgreSQL 17.11 + pgvector 0.8.2, alembic `0007`), ya provisionada y
-> migrada. **Google Calendar está activo** (`GOOGLE_CALENDAR_ENABLED=true`, calendario `primary`,
+> `taa-prod-api` en `https://taa-prod-api-hzlxaxcstq-ew.a.run.app`, los cuatro Cloud Run Jobs, los
+> cuatro schedulers habilitados, los cinco secretos con versión fijada y el webhook registrado. La
+> base de datos es **Supabase** (PostgreSQL 17.11 + pgvector 0.8.2, alembic `0007`), ya provisionada
+> y migrada. **Google Calendar está activo** (`GOOGLE_CALENDAR_ENABLED=true`, calendario `primary`,
 > OAuth con `calendar.events` + `calendar.events.freebusy`). **Cloud SQL no forma parte del
 > despliegue**: la decisión de 2026-10-18 lo sustituyó por Supabase. El estado real de cada criterio
 > de aceptación, con sus pruebas, está en `docs/informe-final.md`; los incidentes, en
@@ -47,7 +47,7 @@ recursos son céntimos o cero a este volumen.
 | **Supabase** (PostgreSQL 17.11 + pgvector 0.8.2) | proyecto del usuario, pooler `aws-0-eu-west-1.pooler.supabase.com:5432` | **Sí — coste fijo mensual** | **pendiente de confirmar**; **recomendado el plan Pro** (el gratuito se pausa y no tiene backups) |
 | Cloud Run Service (webhook) | `taa-prod-api` | Sí, por petición y por CPU/memoria-segundo; 0 en reposo (`min-instances=0`) | pendiente de confirmar |
 | Cloud Run Jobs ×3 | `taa-prod-job-reminders`, `-job-documents`, `-job-resume` | Sí, por ejecución | pendiente de confirmar |
-| Cloud Scheduler ×3 | `<job>-tick` | 3 jobs/mes dentro del nivel gratuito | 0 con estas cadencias |
+| Cloud Scheduler ×4 | `<job>-tick` | 4 jobs/mes: 3 en el nivel gratuito; el cuarto ~0,10 $/mes | ~0,10 $/mes |
 | Artifact Registry | `taa-prod-images` | Sí, por GB almacenado | pendiente de confirmar |
 | Cloud Storage | `taa-prod-documents` | Sí, por GB y operaciones | pendiente de confirmar |
 | Secret Manager | 5 secretos | Sí, por versión y por acceso | pendiente de confirmar |
@@ -83,6 +83,8 @@ es irrelevante aquí: dimensionar contra 60 sobresuscribe el pooler cuatro veces
 `--max-instances=1` **es obligatorio**, no una elección de coste: con más instancias el producto no
 cabe. Los pools desplegados son `DB_POOL_SIZE=2` y `CHECKPOINTER_POOL_SIZE=1`, y se pasan
 explícitamente en `--set-env-vars` (los defectos de la aplicación, 4 y 3, darían 7 × 4 + 2 = 30).
+El job de facturación **no abre conexiones a la base**, así que no suma al aritmético: los cuatro
+procesos que cuentan son el servicio y los tres jobs que usan PostgreSQL.
 
 El **paso 0** comprueba el aritmético contra `TAA_POOLER_MAX_CONNECTIONS` (14 por defecto) con
 `scripts/check_pool_budget.py` y **se niega a seguir** si no cabe, diciendo cuánto puede sumar cada
@@ -189,8 +191,8 @@ bash scripts/deploy.sh --dump-env               # el entorno exacto de cada comp
 | 7 | `storage buckets create` + binding | bucket privado | pendiente de confirmar |
 | 8 | `add-iam-policy-binding` (aiplatform, secretos, jobs) | IAM mínimo | gratis |
 | 9 | `run deploy taa-prod-api` (con `--max-instances=1`) | Cloud Run Service | pendiente de confirmar |
-| 10 | `run jobs create` ×3 | los tres jobs | pendiente de confirmar |
-| 11 | `scheduler jobs create http` ×3 | los tres disparadores | 0 (nivel gratuito) |
+| 10 | `run jobs create` ×4 | los cuatro jobs | pendiente de confirmar |
+| 11 | `scheduler jobs create http` ×4 | los cuatro disparadores | 3 gratis; el cuarto ~0,10 $/mes |
 | 12 | `logging metrics create` | métrica de errores | gratis hasta la franquicia |
 | 13 | `migrate.py upgrade head` | esquema y tablas del checkpointer | sin coste adicional |
 | 14 | resuelve la URL y ejecuta `set_webhook.py --set` | registro del webhook | gratis |
@@ -295,6 +297,24 @@ gcloud run services update taa-prod-api \
 ```
 
 ---
+
+### Informe de gastos (BigQuery)
+
+El job `taa-prod-job-billing` envía cada día a las **08:00 Europe/Madrid** un resumen por Telegram.
+Depende de la **exportación detallada de facturación** a BigQuery, que solo se activa desde la
+consola (no hay API pública para ese toggle):
+
+1. El dataset `billing_export` ya existe en el proyecto `telegram-assistant-esteban`, multirregión
+   **EU** y sin caducidad de tablas.
+2. En **Billing → Billing export → BigQuery export**, activa **Detailed usage cost** y elige el
+   proyecto `telegram-assistant-esteban` y el dataset `billing_export`. Google añade automáticamente
+   `billing-export-bigquery@system.gserviceaccount.com` como propietario del dataset.
+3. La tabla aparece como `gcp_billing_export_resource_v1_<cuenta>` (o la estándar
+   `gcp_billing_export_v1_<cuenta>`); el job la autodetecta. Mientras no exista, el job sale en
+   silencio.
+4. El presupuesto `TAA assistant monthly (5 EUR)` está acotado al proyecto y avisa al 50/80/100%.
+
+Los datos pueden tardar ~24 h en aparecer; el mensaje indica el último día con datos.
 
 ## 5. Migraciones
 
@@ -486,9 +506,11 @@ gcloud run services delete taa-prod-api --region=europe-west1 --project telegram
 gcloud run jobs delete taa-prod-job-reminders --region=europe-west1 --project telegram-assistant-esteban
 gcloud run jobs delete taa-prod-job-documents --region=europe-west1 --project telegram-assistant-esteban
 gcloud run jobs delete taa-prod-job-resume --region=europe-west1 --project telegram-assistant-esteban
+gcloud run jobs delete taa-prod-job-billing --region=europe-west1 --project telegram-assistant-esteban
 gcloud scheduler jobs delete taa-prod-job-reminders-tick --location=europe-west1 --project telegram-assistant-esteban
 gcloud scheduler jobs delete taa-prod-job-documents-tick --location=europe-west1 --project telegram-assistant-esteban
 gcloud scheduler jobs delete taa-prod-job-resume-tick --location=europe-west1 --project telegram-assistant-esteban
+gcloud scheduler jobs delete taa-prod-job-billing-tick --location=europe-west1 --project telegram-assistant-esteban
 
 # Datos y secretos (borrar el bucket se lleva los originales: no hay vuelta atrás).
 # **`rm --recursive`, no `buckets delete`**: el bucket tiene documentos dentro y
@@ -517,6 +539,12 @@ gcloud storage buckets remove-iam-policy-binding gs://taa-prod-documents \
 gcloud projects remove-iam-policy-binding telegram-assistant-esteban \
   --member=serviceAccount:taa-prod-runtime@telegram-assistant-esteban.iam.gserviceaccount.com \
   --role=roles/aiplatform.user --project telegram-assistant-esteban
+gcloud projects remove-iam-policy-binding telegram-assistant-esteban \
+  --member=serviceAccount:taa-prod-runtime@telegram-assistant-esteban.iam.gserviceaccount.com \
+  --role=roles/bigquery.jobUser --project telegram-assistant-esteban
+gcloud projects remove-iam-policy-binding telegram-assistant-esteban \
+  --member=serviceAccount:taa-prod-runtime@telegram-assistant-esteban.iam.gserviceaccount.com \
+  --role=roles/bigquery.dataViewer --project telegram-assistant-esteban
 for secret in taa-prod-telegram-bot-token taa-prod-telegram-webhook-secret \
               taa-prod-ollama-api-key taa-prod-database-url \
               taa-prod-google-oauth-credentials; do
@@ -524,7 +552,7 @@ for secret in taa-prod-telegram-bot-token taa-prod-telegram-webhook-secret \
     --member=serviceAccount:taa-prod-runtime@telegram-assistant-esteban.iam.gserviceaccount.com \
     --role=roles/secretmanager.secretAccessor --project telegram-assistant-esteban
 done
-for job in taa-prod-job-reminders taa-prod-job-documents taa-prod-job-resume; do
+for job in taa-prod-job-reminders taa-prod-job-documents taa-prod-job-resume taa-prod-job-billing; do
   gcloud run jobs remove-iam-policy-binding "$job" \
     --member=serviceAccount:taa-prod-scheduler@telegram-assistant-esteban.iam.gserviceaccount.com \
     --role=roles/run.invoker --region=europe-west1 --project telegram-assistant-esteban

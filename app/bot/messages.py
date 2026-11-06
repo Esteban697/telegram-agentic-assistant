@@ -211,6 +211,13 @@ CATALOGUE: Final[dict[str, str]] = {
     "error.not_available": (
         "El comando {command} todavía no está disponible. Llegará en una fase posterior."
     ),
+    # --- Informe de gastos ------------------------------------------------- #
+    "billing.report.header": "Gastos de Google Cloud — {day}",
+    "billing.report.assistant_line": "Asistente ({project}): {amount} {currency}",
+    "billing.report.service_line": "· {service}: {amount} {currency}",
+    "billing.report.account_line": "Total de la cuenta: {amount} {currency}",
+    "billing.report.month_line": "Mes en curso (asistente): {amount} {currency}",
+    "billing.report.empty": "No hay datos de facturación para el periodo.",
 }
 
 
