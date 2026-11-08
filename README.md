@@ -185,6 +185,7 @@ reservado.
 | `/memory` | Lista las preferencias guardadas |
 | `/forget <clave>` | Borra una preferencia |
 | `/forget all` | Pide confirmación para borrarlas todas |
+| `/gastos` | Resumen de gastos de Google Cloud (ayer, servicios, mes en curso) |
 
 Si se envía un segundo mensaje mientras el primero se está procesando, el bot responde que está
 terminando el anterior y pide reintentar en unos segundos.
@@ -493,6 +494,9 @@ Dos reglas que se comprueban con pruebas, no por convención:
 - **Job diario:** `taa-prod-job-billing` se ejecuta a las **08:00 Europe/Madrid** y envía por
   Telegram el gasto del último día con datos, los servicios principales del proyecto, el total de
   la cuenta y el mes en curso. Si la tabla de exportación aún no existe, sale en silencio.
+- **A demanda:** envía `/gastos` o pregunta en lenguaje natural
+  (`¿Cuánto he gastado esta semana?`); el asistente usa la herramienta `get_cloud_costs` y responde
+  con las cifras reales, no con una búsqueda web.
 - Los datos de facturación pueden tardar ~24 h; el mensaje indica el último día disponible.
 
 **Estado desplegado:** servicio `taa-prod-api` en Cloud Run

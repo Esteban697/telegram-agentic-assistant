@@ -26,6 +26,7 @@ from typing import Any
 from app.agent.graph import ChatAgent
 from app.agent.prompts import DEFAULT_IMAGE_QUESTION, VISION_SYSTEM_PROMPT
 from app.bot import messages
+from app.bot.billing_report import compose_report
 from app.bot.keyboards import (
     approval_keyboard,
     is_approval_callback,
@@ -55,7 +56,7 @@ from app.tools.tasks import ListTasksArgs, TaskTools
 
 _logger = logging.getLogger(__name__)
 
-_KNOWN_COMMANDS = {"start", "help", "reset", "tasks", "memory", "forget"}
+_KNOWN_COMMANDS = {"start", "help", "reset", "tasks", "memory", "forget", "gastos"}
 
 # Mirrors the `memories.key` CHECK constraint (1..128); the handler checks it so the user gets
 # a catalogue message instead of a validation error.
@@ -89,6 +90,7 @@ class TelegramHandlers:
         ingestion: Any | None = None,
         document_tools: Any | None = None,
         vision_model: ChatModel | None = None,
+        billing_service: Any | None = None,
     ) -> None:
         self._settings = settings
         self._telegram = telegram
@@ -102,6 +104,7 @@ class TelegramHandlers:
         self._ingestion = ingestion
         self._documents = document_tools
         self._vision = vision_model
+        self._billing = billing_service
 
     # ------------------------------------------------------------------ #
     # Entry point
@@ -494,6 +497,9 @@ class TelegramHandlers:
         if command == "forget":
             return await self._forget(argument, identity)
 
+        if command == "gastos":
+            return await self._show_costs(identity)
+
         await self._reply(identity.chat_id, messages.render("help"))
         return HandlerOutcome(status=STATUS_PROCESSED, replied=True, detail="unknown_command")
 
@@ -538,6 +544,32 @@ class TelegramHandlers:
             )
             await self._reply(identity.chat_id, "\n".join(lines))
         return HandlerOutcome(status=STATUS_PROCESSED, replied=True, detail="memory_listed")
+
+    async def _show_costs(self, identity: TelegramIdentity) -> HandlerOutcome:
+        if self._billing is None:
+            await self._reply(identity.chat_id, messages.render("error.capability_unavailable"))
+            return HandlerOutcome(
+                status=STATUS_IGNORED, replied=True, detail="billing_disabled"
+            )
+        try:
+            snapshot = await self._billing.fetch_rows()
+        except Exception as exc:  # noqa: BLE001 - a provider failure is a user-facing error
+            _logger.warning(
+                "billing command failed",
+                extra={"error_code": "billing_unavailable", "error_type": type(exc).__name__},
+            )
+            await self._reply(identity.chat_id, messages.render("billing.report.unavailable"))
+            return HandlerOutcome(
+                status=STATUS_FAILED, replied=True, detail="billing_unavailable"
+            )
+        if snapshot is None:
+            await self._reply(identity.chat_id, messages.render("billing.export_missing"))
+            return HandlerOutcome(
+                status=STATUS_IGNORED, replied=True, detail="billing_export_missing"
+            )
+        text = compose_report(snapshot.rows, assistant_project=self._billing.project)
+        await self._reply(identity.chat_id, text)
+        return HandlerOutcome(status=STATUS_PROCESSED, replied=True, detail="billing_report")
 
     async def _forget(self, argument: str, identity: TelegramIdentity) -> HandlerOutcome:
         """`/forget <clave>` deletes one memory; `/forget all [confirm]` needs confirmation.

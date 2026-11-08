@@ -784,6 +784,25 @@ for job in "$JOB_REMINDERS" "$JOB_DOCUMENTS" "$JOB_RESUME" "$JOB_BILLING"; do
       --set-secrets="$(common_secrets_payload)" \
       --project "$PROJECT"
 done
+# **Existing jobs must be updated, not just created.** `run_ensure` above only creates a job
+# when it is missing, so a code-only redeploy would otherwise leave every job on its old image —
+# observed on 2026-11-08 when the billing job kept running the pre-fix code. This update is
+# idempotent and makes the image, command, environment and secrets match the service.
+for job in "$JOB_REMINDERS" "$JOB_DOCUMENTS" "$JOB_RESUME" "$JOB_BILLING"; do
+  run "actualizar el job ${job} (imagen, comando y entorno)" "facturable (pendiente de confirmar)" \
+    gcloud run jobs update "$job" \
+      --image="${IMAGE}:${IMAGE_TAG}" \
+      --region="$REGION" \
+      --command=python \
+      --args="-m,${JOB_MODULE[$job]}" \
+      --tasks=1 \
+      --max-retries=1 \
+      --task-timeout="${JOB_TIMEOUT[$job]}" \
+      --service-account="$RUNTIME_SA_EMAIL" \
+      --set-env-vars="$(common_env_payload)" \
+      --set-secrets="$(common_secrets_payload)" \
+      --project "$PROJECT"
+done
 # `run.invoker` must come **after** the job exists — binding it earlier fails with NOT_FOUND.
 # `add-iam-policy-binding` is idempotent, so a re-run is harmless.
 for job in "$JOB_REMINDERS" "$JOB_DOCUMENTS" "$JOB_RESUME" "$JOB_BILLING"; do

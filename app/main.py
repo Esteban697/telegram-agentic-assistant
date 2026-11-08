@@ -41,6 +41,7 @@ from app.llm.protocols import ChatModel
 from app.llm.web_search import OllamaWebSearchProvider
 from app.logging_config import configure_logging
 from app.services.approvals import ApprovalService
+from app.services.billing import BillingService
 from app.services.conversation import ConversationService
 from app.services.document_ingestion import DocumentIngestion
 
@@ -53,6 +54,8 @@ from app.storage.postgres import Database, build_database, use_compatible_event_
 from app.storage.stores import build_stores
 from app.tools.documents import DocumentTools
 from app.tools.documents import specs as document_specs
+from app.tools.billing import BillingTool
+from app.tools.billing import specs as billing_specs
 from app.tools.calendar import CalendarTools
 from app.tools.calendar import specs as calendar_specs
 from app.tools.clock import ClockTool
@@ -244,6 +247,7 @@ def create_app(
                     *web_specs(WebSearchTool(provider=web_provider)),
                     *restaurant_specs(RestaurantTools()),
                     *document_specs(document_tools),
+                    *billing_specs(BillingTool(service=BillingService(resolved))),
                     *clock_specs(ClockTool(timezone=resolved.default_timezone)),
                     *(
                         calendar_specs(calendar_tools)
@@ -352,6 +356,7 @@ def create_app(
             ingestion=ingestion,
             document_tools=document_tools,
             vision_model=vision_client,
+            billing_service=BillingService(resolved),
         )
 
         _logger.info(

@@ -34,7 +34,8 @@ CATALOGUE: Final[dict[str, str]] = {
         "/tasks — tus recordatorios\n"
         "/memory — tus preferencias guardadas\n"
         "/forget — borra una preferencia (o todas, con confirmación)\n"
-        "/reset — borra el contexto de esta conversación\n\n"
+        "/reset — borra el contexto de esta conversación\n"
+        "/gastos — resumen de gastos de Google Cloud\n\n"
         "Cuando vaya a hacer algo con efecto externo (por ejemplo una reserva), te pediré "
         "aprobación antes de ejecutarlo."
     ),
@@ -218,6 +219,13 @@ CATALOGUE: Final[dict[str, str]] = {
     "billing.report.account_line": "Total de la cuenta: {amount} {currency}",
     "billing.report.month_line": "Mes en curso (asistente): {amount} {currency}",
     "billing.report.empty": "No hay datos de facturación para el periodo.",
+    "billing.export_missing": (
+        "La exportación de facturación a BigQuery todavía no tiene datos. Actívala una vez en "
+        "Billing → Billing export → BigQuery export; después el resumen diario funciona solo."
+    ),
+    "billing.report.unavailable": (
+        "No he podido consultar los gastos ahora mismo. Inténtalo de nuevo en un momento."
+    ),
 }
 
 

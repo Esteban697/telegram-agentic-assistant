@@ -5,10 +5,10 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from app.jobs.billing_report import (
+from app.bot.billing_report import compose_report
+from app.services.billing import (
     BigQueryBillingClient,
     build_query,
-    compose_report,
     parse_query_result,
 )
 
@@ -110,8 +110,16 @@ async def test_resolve_table_prefers_the_detailed_export() -> None:
             200,
             json={
                 "tables": [
-                    {"tableId": "gcp_billing_export_v1_abc"},
-                    {"tableId": "gcp_billing_export_resource_v1_abc"},
+                    {
+                        "tableReference": {
+                            "tableId": "gcp_billing_export_v1_abc"
+                        }
+                    },
+                    {
+                        "tableReference": {
+                            "tableId": "gcp_billing_export_resource_v1_abc"
+                        }
+                    },
                 ]
             },
         )
