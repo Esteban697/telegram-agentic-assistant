@@ -823,10 +823,14 @@ note "No existe ningún endpoint interno público: los health endpoints son los 
 note "El rol exacto que puede invocar un job está en el Apéndice B.6 del plan: el candidato es"
 note "roles/run.invoker y se confirma con 'gcloud scheduler jobs create http --help'."
 
+# Cada ejecución arranca un contenedor (~35-40 s de CPU aunque no haya trabajo). Con los dos
+# jobs a un tick por minuto eso sumaba ~3,3 €/día en total (factura de octubre-noviembre 2026).
+# Valores en producción desde 2026-11-11: reminders necesita precisión (lo ve el usuario),
+# resume es una ruta de recuperación y documents puede ir por horas.
 declare -A SCHEDULE_CRON=(
-  ["$JOB_REMINDERS"]="* * * * *"
-  ["$JOB_DOCUMENTS"]="*/5 * * * *"
-  ["$JOB_RESUME"]="* * * * *"
+  ["$JOB_REMINDERS"]="*/15 * * * *"
+  ["$JOB_DOCUMENTS"]="0 * * * *"
+  ["$JOB_RESUME"]="*/30 * * * *"
   ["$JOB_BILLING"]="0 8 * * *"
 )
 declare -A SCHEDULE_TIMEZONE=(
