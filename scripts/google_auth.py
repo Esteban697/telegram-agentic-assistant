@@ -117,7 +117,8 @@ def _wait_for_callback(
     server: http.server.HTTPServer, *, state: str, timeout: float
 ) -> tuple[str, int]:
     result: dict[str, str] = {"state": state, "code": "", "error": ""}
-    server.result = result  # type: ignore[attr-defined]    server.timeout = timeout
+    server.result = result  # type: ignore[attr-defined]
+    server.timeout = timeout
     thread = threading.Thread(target=server.handle_request, daemon=True)
     thread.start()
     thread.join(timeout + 1)
