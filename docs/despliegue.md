@@ -12,15 +12,16 @@ cada comando de este documento lleva `--project telegram-assistant-esteban`, y p
 `CLOUDSDK_CORE_PROJECT`. Lo comprueba `tests/unit/test_deploy_artifacts.py`, que recorre el script:
 no es una convención que haya que recordar.
 
-> **Estado actual del proyecto (2026-10-19).** **Desplegado y operativo**: el servicio
-> `taa-prod-api` en `https://taa-prod-api-hzlxaxcstq-ew.a.run.app`, los cuatro Cloud Run Jobs, los
-> cuatro schedulers habilitados, los cinco secretos con versión fijada y el webhook registrado. La
-> base de datos es **Supabase** (PostgreSQL 17.11 + pgvector 0.8.2, alembic `0007`), ya provisionada
-> y migrada. **Google Calendar está activo** (`GOOGLE_CALENDAR_ENABLED=true`, calendario `primary`,
-> OAuth con `calendar.events` + `calendar.events.freebusy`). **Cloud SQL no forma parte del
-> despliegue**: la decisión de 2026-10-18 lo sustituyó por Supabase. El estado real de cada criterio
-> de aceptación, con sus pruebas, está en `docs/informe-final.md`; los incidentes, en
-> `docs/operacion.md`; la seguridad, en `docs/seguridad.md`.
+> **Estado actual del proyecto (2026-11-21).** **Desplegado y operativo**: el servicio
+> `taa-prod-api` en `https://taa-prod-api-hzlxaxcstq-ew.a.run.app`, el dispatcher
+> `taa-prod-job-dispatcher`, el job diario `taa-prod-job-billing`, dos schedulers habilitados, cinco
+> secretos regionales con versión fijada y el webhook registrado. La base de datos es **Supabase**
+> (PostgreSQL 17.11 + pgvector 0.8.2, alembic `0007`), ya provisionada y migrada. **Google Calendar
+> está activo** (`GOOGLE_CALENDAR_ENABLED=true`, calendario `primary`, OAuth con
+> `calendar.events` + `calendar.events.freebusy`). **Cloud SQL no forma parte del despliegue**: la
+> decisión de 2026-10-18 lo sustituyó por Supabase. El estado real de cada criterio de aceptación,
+> con sus pruebas, está en `docs/informe-final.md`; los incidentes, en `docs/operacion.md`; la
+> seguridad, en `docs/seguridad.md`.
 >
 > Este runbook y `scripts/deploy.sh` son **idempotentes**: cada creación va precedida de su
 > comprobación, así que volver a ejecutarlos sobre lo que ya existe no hace nada (y no produce el
@@ -46,11 +47,11 @@ recursos son céntimos o cero a este volumen.
 |---|---|---|---|
 | **Supabase** (PostgreSQL 17.11 + pgvector 0.8.2) | proyecto del usuario, pooler `aws-0-eu-west-1.pooler.supabase.com:5432` | **Sí — coste fijo mensual** | **pendiente de confirmar**; **recomendado el plan Pro** (el gratuito se pausa y no tiene backups) |
 | Cloud Run Service (webhook) | `taa-prod-api` | Sí, por petición y por CPU/memoria-segundo; 0 en reposo (`min-instances=0`) | pendiente de confirmar |
-| Cloud Run Jobs ×3 | `taa-prod-job-reminders`, `-job-documents`, `-job-resume` | Sí, por ejecución | pendiente de confirmar |
-| Cloud Scheduler ×4 | `<job>-tick` | 4 jobs/mes: 3 en el nivel gratuito; el cuarto ~0,10 $/mes | ~0,10 $/mes |
+| Cloud Run Jobs ×2 | `taa-prod-job-dispatcher`, `taa-prod-job-billing` | Sí, por ejecución | pendiente de confirmar |
+| Cloud Scheduler ×2 | `taa-prod-job-dispatcher-tick`, `taa-prod-job-billing-tick` | 2 jobs/mes, ambos en el nivel gratuito | 0 |
 | Artifact Registry | `taa-prod-images` | Sí, por GB almacenado | pendiente de confirmar |
 | Cloud Storage | `taa-prod-documents` | Sí, por GB y operaciones | pendiente de confirmar |
-| Secret Manager | 5 secretos | Sí, por versión y por acceso | pendiente de confirmar |
+| Secret Manager | 5 secretos regionales | Sí, por versión y por acceso | pendiente de confirmar |
 | Cloud Logging / métricas | `taa-prod-errors` | Gratis hasta la franquicia | 0–bajo |
 | Vertex AI (embeddings) | — | Sí, por llamada | pendiente de confirmar |
 | Ollama Cloud | — | Sí, por token (cuenta del usuario) | pendiente de confirmar |
@@ -77,14 +78,14 @@ es irrelevante aquí: dimensionar contra 60 sobresuscribe el pooler cuatro veces
 
 ```
 (DB_POOL_SIZE + CHECKPOINTER_POOL_SIZE) × procesos concurrentes + reserva ≤ 14
-(2            + 1                     ) × (1 servicio + 3 jobs = 4)   + 2      = 14  ✔
+(2            + 1                     ) × (servicio + dispatcher + 2 de margen) + 2 = 14  ✔
 ```
 
 `--max-instances=1` **es obligatorio**, no una elección de coste: con más instancias el producto no
 cabe. Los pools desplegados son `DB_POOL_SIZE=2` y `CHECKPOINTER_POOL_SIZE=1`, y se pasan
 explícitamente en `--set-env-vars` (los defectos de la aplicación, 4 y 3, darían 7 × 4 + 2 = 30).
-El job de facturación **no abre conexiones a la base**, así que no suma al aritmético: los cuatro
-procesos que cuentan son el servicio y los tres jobs que usan PostgreSQL.
+El job de facturación **no abre conexiones a la base**, así que no suma al aritmético. El margen de
+dos procesos cubre un job legacy si hiciera falta una reversión durante la transición.
 
 El **paso 0** comprueba el aritmético contra `TAA_POOLER_MAX_CONNECTIONS` (14 por defecto) con
 `scripts/check_pool_budget.py` y **se niega a seguir** si no cabe, diciendo cuánto puede sumar cada
@@ -187,12 +188,12 @@ bash scripts/deploy.sh --dump-env               # el entorno exacto de cada comp
 | 3 | `scripts/audit_image.py --self-test` + `--image` | auditoría de secretos | sin coste |
 | 4 | `artifacts repositories create` + `docker push` | Artifact Registry + imagen | **primera creación facturable**; pendiente de confirmar |
 | 5 | `iam service-accounts create` ×2 | `taa-prod-runtime`, `taa-prod-scheduler` | gratis |
-| 6 | `secrets create` ×5 + `versions add` + resolver versión | 5 secretos | pendiente de confirmar |
+| 6 | `secrets create` ×5 + `versions add` condicional + resolver versión | 5 secretos regionales | pendiente de confirmar |
 | 7 | `storage buckets create` + binding | bucket privado | pendiente de confirmar |
 | 8 | `add-iam-policy-binding` (aiplatform, secretos, jobs) | IAM mínimo | gratis |
 | 9 | `run deploy taa-prod-api` (con `--max-instances=1`) | Cloud Run Service | pendiente de confirmar |
-| 10 | `run jobs create` ×4 | los cuatro jobs | pendiente de confirmar |
-| 11 | `scheduler jobs create http` ×4 | los cuatro disparadores | 3 gratis; el cuarto ~0,10 $/mes |
+| 10 | `run jobs create` ×2 | dispatcher y facturación | pendiente de confirmar |
+| 11 | `scheduler jobs create http` ×2 | dispatcher y facturación | 0 |
 | 12 | `logging metrics create` | métrica de errores | gratis hasta la franquicia |
 | 13 | `migrate.py upgrade head` | esquema y tablas del checkpointer | sin coste adicional |
 | 14 | resuelve la URL y ejecuta `set_webhook.py --set` | registro del webhook | gratis |
@@ -273,7 +274,7 @@ La integración usa OAuth 2.0 de **aplicación instalada** con un refresh token.
 
    Abre el navegador, recibe el redirect en `127.0.0.1`, intercambia el código con PKCE y escribe
    `~/.taa/secrets/google-oauth-credentials` (modo 600). **No imprime** el refresh token.
-5. Despliega: `deploy.sh` crea `taa-prod-google-oauth-credentials`, lo monta como
+5. Despliega: `deploy.sh` crea `taa-prod-google-oauth-credentials-regional`, lo monta como
    `GOOGLE_OAUTH_CREDENTIALS`, añade el binding `secretAccessor` al runtime y pone
    `GOOGLE_CALENDAR_ENABLED=true`. Si el fichero no existe, el paso 0 se niega a desplegar.
 
@@ -284,15 +285,16 @@ despliega. El runtime **no puede escribir** secretos: la rotación es un acto de
 
 Las versiones se **fijan numéricamente** al desplegar (nunca `latest`): una variable con secreto se
 lee una sola vez al arrancar la instancia, así que `latest` congelaría una versión antigua sin
-avisar (Apéndice A.8).
+avisar (Apéndice A.8). `deploy.sh` compara el fichero local con la versión activa y **no añade una
+versión nueva si el contenido es idéntico**; la rotación explícita sigue siendo un acto manual.
 
 ```bash
-gcloud secrets versions add taa-prod-telegram-bot-token \
+gcloud secrets versions add taa-prod-telegram-bot-token-regional \
   --data-file="$HOME/.taa/secrets/telegram-bot-token" \
   --project telegram-assistant-esteban
 
 gcloud run services update taa-prod-api \
-  --update-secrets=TELEGRAM_BOT_TOKEN=taa-prod-telegram-bot-token:2 \
+  --update-secrets=TELEGRAM_BOT_TOKEN=taa-prod-telegram-bot-token-regional:2 \
   --region=europe-west1 --project telegram-assistant-esteban
 ```
 
@@ -300,7 +302,9 @@ gcloud run services update taa-prod-api \
 
 ### Informe de gastos (BigQuery)
 
-El job `taa-prod-job-billing` envía cada día a las **08:00 Europe/Madrid** un resumen por Telegram.
+El job `taa-prod-job-billing` envía cada día a las **12:00 Europe/Madrid** un resumen por Telegram
+del último día completo. La consulta excluye el día en curso: el export se actualiza a lo largo de
+la mañana y una lectura a las 08:00 todavía veía importes parciales.
 Depende de la **exportación detallada de facturación** a BigQuery, que solo se activa desde la
 consola (no hay API pública para ese toggle):
 
@@ -314,7 +318,8 @@ consola (no hay API pública para ese toggle):
    silencio.
 4. El presupuesto `TAA assistant monthly (5 EUR)` está acotado al proyecto y avisa al 50/80/100%.
 
-Los datos pueden tardar ~24 h en aparecer; el mensaje indica el último día con datos.
+Los datos pueden tardar ~24 h en aparecer; el mensaje usa el último día completo y no incluye el
+día en curso.
 
 ## 5. Migraciones
 
@@ -394,15 +399,17 @@ gcloud run services describe taa-prod-api \
   revela DSN, nombre de bucket ni versiones. Si está en 503, Telegram no debe entregar.
 - **Logs.** JSON estructurado, sin contenido de mensajes, documentos, embeddings ni secretos
   (`LOG_CONTENT_DEBUG=false` por defecto). La métrica `taa-prod-errors` cuenta `severity>=ERROR`.
-- **Jobs.** Los tres se disparan por Cloud Scheduler contra la API de administración de Cloud Run con
-  un token OAuth; **no hay endpoints internos** (decisión 11). Cada uno imprime una línea
-  `JOB_REPORT {...}` con sus contadores, que es lo que se lee desde fuera:
+- **Jobs.** El dispatcher y el job de facturación se disparan por Cloud Scheduler contra la API de
+  administración de Cloud Run con un token OAuth; **no hay endpoints internos** (decisión 11).
+  Ambos imprimen una línea `JOB_REPORT {...}` con sus contadores, que es lo que se lee desde fuera:
 
   ```bash
-  gcloud run jobs execute taa-prod-job-reminders --region=europe-west1 --project telegram-assistant-esteban
-  gcloud run jobs execute taa-prod-job-documents --region=europe-west1 --project telegram-assistant-esteban
-  gcloud run jobs execute taa-prod-job-resume    --region=europe-west1 --project telegram-assistant-esteban
+  gcloud run jobs execute taa-prod-job-dispatcher --region=europe-west1 --project telegram-assistant-esteban
+  gcloud run jobs execute taa-prod-job-billing    --region=europe-west1 --project telegram-assistant-esteban
   ```
+
+  Los módulos individuales (`app.jobs.dispatch_reminders`, `process_documents`, `resume_work`)
+  siguen existiendo para ejecuciones manuales, pero no tienen schedule propio.
 
 - **Alertas.** Sin canal de notificación no se crea ninguna política (PLAN.md §13.11): es una decisión
   del usuario. El comando queda impreso en el paso 13 del plan.
@@ -422,11 +429,15 @@ gcloud run services update-traffic taa-prod-api \
   --region=europe-west1 --project telegram-assistant-esteban
 ```
 
-Es instantáneo, no requiere reconstruir la imagen y no toca la base de datos. Los jobs se revierten
-igual, apuntándolos a la imagen anterior:
+Es instantáneo, no requiere reconstruir la imagen y no toca la base de datos. **Excepción:** las
+revisiones creadas antes de la migración a secretos regionales (2026-11-21) montan los nombres
+legacy que ya se retiraron; un cambio de tráfico a una de ellas fallará al arrancar. Para revertir
+código anterior, despliega su imagen con los secretos actuales (`TAA_IMAGE_TAG=<tag>`), no cambies
+el tráfico a una revisión anterior a la migración.
+Los jobs se revierten igual, apuntándolos a la imagen anterior:
 
 ```bash
-gcloud run jobs update taa-prod-job-reminders \
+gcloud run jobs update taa-prod-job-dispatcher \
   --image=europe-west1-docker.pkg.dev/telegram-assistant-esteban/taa-prod-images/taa-prod-app:<TAG-ANTERIOR> \
   --region=europe-west1 --project telegram-assistant-esteban
 ```
@@ -501,27 +512,37 @@ La lista es **completa para lo que el despliegue crea** (pasos 4–12): servicio
 disparadores, bucket, secretos, imagen, cuentas de servicio, métrica y los bindings del paso 8.
 
 ```bash
-# Service, jobs y schedules
+# Service, jobs y schedules activos
 gcloud run services delete taa-prod-api --region=europe-west1 --project telegram-assistant-esteban
-gcloud run jobs delete taa-prod-job-reminders --region=europe-west1 --project telegram-assistant-esteban
-gcloud run jobs delete taa-prod-job-documents --region=europe-west1 --project telegram-assistant-esteban
-gcloud run jobs delete taa-prod-job-resume --region=europe-west1 --project telegram-assistant-esteban
+gcloud run jobs delete taa-prod-job-dispatcher --region=europe-west1 --project telegram-assistant-esteban
 gcloud run jobs delete taa-prod-job-billing --region=europe-west1 --project telegram-assistant-esteban
-gcloud scheduler jobs delete taa-prod-job-reminders-tick --location=europe-west1 --project telegram-assistant-esteban
-gcloud scheduler jobs delete taa-prod-job-documents-tick --location=europe-west1 --project telegram-assistant-esteban
-gcloud scheduler jobs delete taa-prod-job-resume-tick --location=europe-west1 --project telegram-assistant-esteban
+gcloud scheduler jobs delete taa-prod-job-dispatcher-tick --location=europe-west1 --project telegram-assistant-esteban
 gcloud scheduler jobs delete taa-prod-job-billing-tick --location=europe-west1 --project telegram-assistant-esteban
+
+# Jobs/schedules legacy, si siguen presentes durante la ventana de reversión
+for job in taa-prod-job-reminders taa-prod-job-documents taa-prod-job-resume; do
+  gcloud run jobs delete "$job" --region=europe-west1 --project telegram-assistant-esteban --quiet || true
+done
+for tick in taa-prod-job-reminders-tick taa-prod-job-documents-tick taa-prod-job-resume-tick; do
+  gcloud scheduler jobs delete "$tick" --location=europe-west1 --project telegram-assistant-esteban --quiet || true
+done
 
 # Datos y secretos (borrar el bucket se lleva los originales: no hay vuelta atrás).
 # **`rm --recursive`, no `buckets delete`**: el bucket tiene documentos dentro y
 # `buckets delete` se niega a borrar uno que no esté vacío (409 BucketNotEmpty).
 gcloud storage rm --recursive gs://taa-prod-documents --project telegram-assistant-esteban
 gcloud storage buckets delete gs://taa-prod-documents --project telegram-assistant-esteban
-gcloud secrets delete taa-prod-telegram-bot-token --project telegram-assistant-esteban
-gcloud secrets delete taa-prod-telegram-webhook-secret --project telegram-assistant-esteban
-gcloud secrets delete taa-prod-ollama-api-key --project telegram-assistant-esteban
-gcloud secrets delete taa-prod-database-url --project telegram-assistant-esteban
-gcloud secrets delete taa-prod-google-oauth-credentials --project telegram-assistant-esteban
+for secret in taa-prod-telegram-bot-token-regional taa-prod-telegram-webhook-secret-regional \
+              taa-prod-ollama-api-key-regional taa-prod-database-url-regional \
+              taa-prod-google-oauth-credentials-regional; do
+  gcloud secrets delete "$secret" --project telegram-assistant-esteban --quiet
+done
+# Secretos legacy, si aún no se han retirado
+for secret in taa-prod-telegram-bot-token taa-prod-telegram-webhook-secret \
+              taa-prod-ollama-api-key taa-prod-database-url \
+              taa-prod-google-oauth-credentials; do
+  gcloud secrets delete "$secret" --project telegram-assistant-esteban --quiet || true
+done
 
 # Imagen y cuentas de servicio (el repositorio se lleva todas las etiquetas de la imagen)
 gcloud artifacts repositories delete taa-prod-images --location=europe-west1 --project telegram-assistant-esteban
@@ -545,14 +566,14 @@ gcloud projects remove-iam-policy-binding telegram-assistant-esteban \
 gcloud projects remove-iam-policy-binding telegram-assistant-esteban \
   --member=serviceAccount:taa-prod-runtime@telegram-assistant-esteban.iam.gserviceaccount.com \
   --role=roles/bigquery.dataViewer --project telegram-assistant-esteban
-for secret in taa-prod-telegram-bot-token taa-prod-telegram-webhook-secret \
-              taa-prod-ollama-api-key taa-prod-database-url \
-              taa-prod-google-oauth-credentials; do
+for secret in taa-prod-telegram-bot-token-regional taa-prod-telegram-webhook-secret-regional \
+              taa-prod-ollama-api-key-regional taa-prod-database-url-regional \
+              taa-prod-google-oauth-credentials-regional; do
   gcloud secrets remove-iam-policy-binding "$secret" \
     --member=serviceAccount:taa-prod-runtime@telegram-assistant-esteban.iam.gserviceaccount.com \
     --role=roles/secretmanager.secretAccessor --project telegram-assistant-esteban
 done
-for job in taa-prod-job-reminders taa-prod-job-documents taa-prod-job-resume taa-prod-job-billing; do
+for job in taa-prod-job-dispatcher taa-prod-job-billing; do
   gcloud run jobs remove-iam-policy-binding "$job" \
     --member=serviceAccount:taa-prod-scheduler@telegram-assistant-esteban.iam.gserviceaccount.com \
     --role=roles/run.invoker --region=europe-west1 --project telegram-assistant-esteban

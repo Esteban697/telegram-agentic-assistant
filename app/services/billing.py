@@ -38,6 +38,7 @@ def build_query(*, project: str, dataset: str, table: str, days: int) -> str:
           SUM(cost) + {credit_sum} AS net
         FROM `{project}.{dataset}.{table}`
         WHERE DATE(usage_start_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL {days} DAY)
+          AND DATE(usage_start_time) < CURRENT_DATE()
         GROUP BY day, project_id, service, currency
         ORDER BY day DESC, net DESC
     """

@@ -209,7 +209,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    print("\nok: los cuatro componentes pasarían la validación de arranque de la aplicación")
+    print("\nok: todos los componentes pasarían la validación de arranque de la aplicación")
     return 0
 
 

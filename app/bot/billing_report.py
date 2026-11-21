@@ -37,7 +37,13 @@ def compose_report(
     for row in assistant:
         service = str(row.get("service") or "otros")
         by_service[service] = by_service.get(service, 0.0) + net(row)
-    top = sorted(by_service.items(), key=lambda item: item[1], reverse=True)[:3]
+    positive = sorted(
+        ((service, amount) for service, amount in by_service.items() if amount >= 0.0005),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    top = positive[:4]
+    other = sum(amount for _, amount in positive[4:])
 
     current_month = month or datetime.now(UTC).strftime("%Y-%m")
     month_total = sum(
@@ -53,7 +59,7 @@ def compose_report(
             messages.render(
                 "billing.report.assistant_line",
                 project=assistant_project,
-                amount=f"{assistant_total:.2f}",
+                amount=f"{assistant_total:.3f}",
                 currency=currency,
             )
         )
@@ -62,21 +68,29 @@ def compose_report(
                 messages.render(
                     "billing.report.service_line",
                     service=service,
-                    amount=f"{amount:.2f}",
+                    amount=f"{amount:.3f}",
+                    currency=currency,
+                )
+            )
+        if other >= 0.0005:
+            lines.append(
+                messages.render(
+                    "billing.report.other_line",
+                    amount=f"{other:.3f}",
                     currency=currency,
                 )
             )
     lines.append(
         messages.render(
             "billing.report.account_line",
-            amount=f"{account_total:.2f}",
+            amount=f"{account_total:.3f}",
             currency=currency,
         )
     )
     lines.append(
         messages.render(
             "billing.report.month_line",
-            amount=f"{month_total:.2f}",
+            amount=f"{month_total:.3f}",
             currency=currency,
         )
     )

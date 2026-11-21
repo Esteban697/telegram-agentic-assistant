@@ -153,7 +153,7 @@ La defensa es estructural, porque las instrucciones del prompt no son una fronte
   `billing_export` contiene importes agregados por proyecto/servicio, no datos personales. La
   exportación la escribe la cuenta gestionada por Google, no el runtime.
 - **Google Calendar usa OAuth del usuario, no una cuenta de servicio.** El refresh token vive en
-  el secreto `taa-prod-google-oauth-credentials` (versión fijada, montado como
+  el secreto `taa-prod-google-oauth-credentials-regional` (versión fijada, montado como
   `GOOGLE_OAUTH_CREDENTIALS`); el runtime solo tiene `secretAccessor` (lectura) y **no**
   `secretVersionManager`, así que no puede escribir ni rotar el secreto. Los access tokens se
   cachean en memoria, se refrescan con un lock 60 s antes de caducar y nunca se registran. Los

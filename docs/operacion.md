@@ -236,10 +236,11 @@ contienen tokens, claves, documentos, embeddings ni el contenido de los mensajes
   `run_at = ahora + presupuesto`; si el turno muere en cualquier punto, la fila queda pendiente y el
   job reanuda el hilo desde el checkpoint y entrega la respuesta. Un segundo mensaje con un turno en
   curso recibe `busy.previous_turn_in_progress`.
-- **Respuesta.** Ninguna si el job está habilitado (lo está, cada minuto). Si el usuario no recibe la
-  respuesta en ~1–2 minutos, revisar que el schedule `taa-prod-job-resume-tick` esté habilitado y que
-  el job pueda conectar a la base de datos.
-- **Regla.** No desactivar el job de reanudación: es la otra mitad del presupuesto de 45 s.
+- **Respuesta.** Ninguna si el dispatcher está habilitado (lo está; resume cada 30 minutos). Si el
+  usuario no recibe la respuesta en ~15 minutos, revisar que el schedule
+  `taa-prod-job-dispatcher-tick` esté habilitado y que el dispatcher pueda conectar a la base de
+  datos.
+- **Regla.** No desactivar el dispatcher: la reanudación es la otra mitad del presupuesto de 45 s.
 
 ## 12. Salud y comprobaciones rápidas
 

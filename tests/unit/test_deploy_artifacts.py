@@ -787,9 +787,7 @@ def test_the_deployed_environment_passes_the_application_own_validation() -> Non
 
     assert set(components) == {
         "service",
-        "taa-prod-job-reminders",
-        "taa-prod-job-documents",
-        "taa-prod-job-resume",
+        "taa-prod-job-dispatcher",
         "taa-prod-job-billing",
     }, sorted(components)
 
@@ -1224,7 +1222,7 @@ def test_the_resumed_run_uses_the_resolved_version_in_the_argv(
     recorded = marker.read_text(encoding="utf-8")
 
     # The shim answers `secrets versions list` with 7.
-    assert "taa-prod-telegram-bot-token:7" in recorded, (
+    assert "taa-prod-telegram-bot-token-regional:7" in recorded, (
         "the resumed deploy pinned a version that is not the resolved one: "
         f"{[line for line in recorded.splitlines() if 'set-secrets' in line][:1]}"
     )

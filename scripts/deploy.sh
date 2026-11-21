@@ -64,10 +64,13 @@ ENV_NAME="${TAA_ENV:-prod}"
 PREFIX="taa-${ENV_NAME}"
 
 SERVICE="${PREFIX}-api"
+JOB_DISPATCHER="${PREFIX}-job-dispatcher"
+JOB_BILLING="${PREFIX}-job-billing"
+# Legacy jobs are kept only so a re-run can retire their schedules; new deployments do not
+# create or update them.
 JOB_REMINDERS="${PREFIX}-job-reminders"
 JOB_DOCUMENTS="${PREFIX}-job-documents"
 JOB_RESUME="${PREFIX}-job-resume"
-JOB_BILLING="${PREFIX}-job-billing"
 RUNTIME_SA="${PREFIX}-runtime"
 SCHEDULER_SA="${PREFIX}-scheduler"
 BUCKET="${PREFIX}-documents"
@@ -78,11 +81,11 @@ IMAGE_TAG="${TAA_IMAGE_TAG:-$(date -u +%Y%m%d%H%M%S)}"
 # Cinco secretos, aunque `DATABASE_SYNC_URL` y `DATABASE_URL` montan **el mismo** secreto
 # (la DSN es la misma cadena; el driver `postgresql+psycopg` sirve para las dos), así que no hay
 # un secreto "de checkpointer" que nadie lea. El quinto es el JSON de OAuth de Google Calendar.
-SECRET_BOT_TOKEN="${PREFIX}-telegram-bot-token"
-SECRET_WEBHOOK="${PREFIX}-telegram-webhook-secret"
-SECRET_OLLAMA="${PREFIX}-ollama-api-key"
-SECRET_DATABASE_URL="${PREFIX}-database-url"
-SECRET_GOOGLE_OAUTH="${PREFIX}-google-oauth-credentials"
+SECRET_BOT_TOKEN="${PREFIX}-telegram-bot-token-regional"
+SECRET_WEBHOOK="${PREFIX}-telegram-webhook-secret-regional"
+SECRET_OLLAMA="${PREFIX}-ollama-api-key-regional"
+SECRET_DATABASE_URL="${PREFIX}-database-url-regional"
+SECRET_GOOGLE_OAUTH="${PREFIX}-google-oauth-credentials-regional"
 
 # Directorio con los ficheros de valores (modo 600). El script solo usa las **rutas**: ver la
 # regla 4. Ver `docs/despliegue.md` §Secretos para cómo se crean.
@@ -108,7 +111,7 @@ VERSION_GOOGLE_OAUTH="$SECRET_VERSION_DEFAULT"
 # no una espera. Se declara como entrada para que el aritmético no dependa de un número escondido.
 POOLER_MAX_CONNECTIONS="${TAA_POOLER_MAX_CONNECTIONS:-14}"
 # `--max-instances=1` es obligatorio: el pooler no admite más. Los procesos concurrentes son el
-# servicio más los tres jobs cuando se solapan.
+# servicio, el dispatcher y el job de facturación cuando se solapan.
 CONCURRENT_PROCESSES="${TAA_CONCURRENT_PROCESSES:-4}"
 POOL_RESERVE="${TAA_POOL_RESERVE:-2}"
 # Los pools que se despliegan. (2 + 1) x 4 + 2 = 14, exactamente el límite, con la reserva de 2.
@@ -318,6 +321,21 @@ resolve_version() {
   printf '    -> %s\n' "${RESOLVED_VERSION:-<vacío>}"
 }
 
+secret_value_matches() {
+  # Compare the active secret value with the local file without printing either. This keeps a
+  # routine deploy from adding a new billable version every time the script runs.
+  local secret="$1" file="$2" version
+  version="$(gcloud secrets versions list "$secret" \
+    --project "$PROJECT" \
+    --filter='state=ENABLED' \
+    --sort-by=~createTime \
+    --limit=1 \
+    --format='value(name)' 2>/dev/null)" || return 1
+  [[ -n "$version" ]] || return 1
+  cmp -s <(gcloud secrets versions access "$version" \
+    --secret="$secret" --project "$PROJECT" 2>/dev/null) "$file"
+}
+
 RUNTIME_SA_EMAIL="$(sa_email "$RUNTIME_SA")"
 SCHEDULER_SA_EMAIL="$(sa_email "$SCHEDULER_SA")"
 
@@ -327,7 +345,7 @@ SCHEDULER_SA_EMAIL="$(sa_email "$SCHEDULER_SA")"
 # `TELEGRAM_WEBHOOK_SECRET` y el par `DATABASE_URL`/`DATABASE_SYNC_URL`. Los cuatro componentes
 # reciben **el mismo** entorno, construido aquí una sola vez: cuando los artefactos y la
 # aplicación discrepan, lo que no arranca es el servicio (cada petición de Telegram, 502) y los
-# tres jobs (una salida con código 1 cada minuto, para siempre). El paso 0 valida exactamente lo
+# jobs (una salida con código 1 cada ejecución). El paso 0 valida exactamente lo
 # que hay aquí abajo, con la propia validación de la aplicación.
 COMMON_ENV=(
   "APP_ENV=production"
@@ -376,7 +394,7 @@ common_secrets_payload() {
 
 if [[ "$DUMP_ENV" -eq 1 ]]; then
   # El entorno exacto que recibe cada componente, en un formato que se puede comprobar.
-  for component in service "$JOB_REMINDERS" "$JOB_DOCUMENTS" "$JOB_RESUME" "$JOB_BILLING"; do
+  for component in service "$JOB_DISPATCHER" "$JOB_BILLING"; do
     for entry in "${COMMON_ENV[@]}"; do
       printf 'DUMP %s env %s\n' "$component" "$entry"
     done
@@ -585,7 +603,8 @@ for secret in "$SECRET_BOT_TOKEN" "$SECRET_WEBHOOK" "$SECRET_OLLAMA" "$SECRET_DA
   run_ensure "crear el secreto ${secret} (si no existe)" "pendiente de confirmar" \
     "gcloud secrets describe ${secret}" secret_exists \
     gcloud secrets create "$secret" \
-      --replication-policy=automatic \
+      --replication-policy=user-managed \
+      --locations="$REGION" \
       --project "$PROJECT"
 done
 
@@ -597,14 +616,18 @@ declare -A SECRET_FILES=(
   ["$SECRET_GOOGLE_OAUTH"]="${SECRETS_DIR}/google-oauth-credentials"
 )
 for secret in "$SECRET_BOT_TOKEN" "$SECRET_WEBHOOK" "$SECRET_OLLAMA" "$SECRET_DATABASE_URL" "$SECRET_GOOGLE_OAUTH"; do
-  # `versions add` es aditivo y por tanto idempotente en el sentido que importa: añade una versión
-  # nueva y las anteriores siguen existiendo. Reejecutarlo es seguro; lo que **no** se hace es
-  # montar `latest`, porque una versión se congela al arrancar la instancia.
-  run "añadir una versión de ${secret} desde ${SECRET_FILES[$secret]}" \
-      "facturable (pendiente de confirmar)" \
-    gcloud secrets versions add "$secret" \
-      --data-file="${SECRET_FILES[$secret]}" \
-      --project "$PROJECT"
+  # `versions add` is additive: a matching value must not create a new billable version on every
+  # deploy. In print mode the command is shown; in execute mode it only runs when the file differs.
+  if (( APPROVED == 0 )) || ! secret_value_matches "$secret" "${SECRET_FILES[$secret]}"; then
+    run "añadir una versión de ${secret} desde ${SECRET_FILES[$secret]}" \
+        "facturable (pendiente de confirmar)" \
+      gcloud secrets versions add "$secret" \
+        --data-file="${SECRET_FILES[$secret]}" \
+        --project "$PROJECT"
+  else
+    printf '\n  · %s ya coincide con %s; no se añade una versión nueva\n' \
+      "$secret" "${SECRET_FILES[$secret]}"
+  fi
 done
 
 # Las versiones se resuelven aquí y las usan los pasos 11-13. Nunca `latest`.
@@ -612,7 +635,7 @@ done
 # **Siempre, también con `--from-step` por encima del 6.** Una versión por omisión de 1 no es
 # inocua: rota el token (versión 2 nueva, la 1 antigua, ambas habilitadas), reanuda un despliegue
 # fallido en cualquier paso posterior al 6 — que es exactamente lo que este flag existe para
-# hacer — y el servicio y los tres jobs quedan montados sobre la versión **antigua** mientras el
+# hacer — y el servicio y los jobs quedan montados sobre la versión **antigua** mientras el
 # despliegue informa de éxito. Es una lectura gratis y los pasos 11-13 necesitan el número.
 declare -A SECRET_VERSIONS=()
 for secret in "$SECRET_BOT_TOKEN" "$SECRET_WEBHOOK" "$SECRET_OLLAMA" "$SECRET_DATABASE_URL" "$SECRET_GOOGLE_OAUTH"; do
@@ -747,28 +770,25 @@ run "asegurar que el tráfico sirve la revisión recién desplegada" "gratis" \
     --project "$PROJECT"
 
 # ============================================================================================ #
-step 10 "Los cuatro Cloud Run Jobs" "facturable por ejecución; fracciones de céntimo"
+step 10 "Dos Cloud Run Jobs: dispatcher y facturación" "facturable por ejecución; fracciones de céntimo"
 # ============================================================================================ #
-note "Un binario, cinco comandos (decisión 18): los jobs reutilizan la misma imagen y el mismo"
-note "entorno que el servicio — si el entorno no valida, no arrancan."
-note "Cada job es de una sola pasada: escanea, reclama con FOR UPDATE SKIP LOCKED, trabaja y"
-note "termina. Ninguno depende de un temporizador en memoria (spec §11, spec §17)."
-note "El job de facturación no abre conexiones a la base: el aritmético del pooler sigue contando"
-note "cuatro procesos con base de datos (servicio + tres jobs)."
+note "Un binario, tres comandos: el servicio, el dispatcher y el informe de facturación reutilizan"
+note "la misma imagen y el mismo entorno que el servicio — si el entorno no valida, no arrancan."
+note "El dispatcher sustituye los jobs de reminders, resume y documents: un solo contenedor arranca"
+note "cada 15 minutos y ejecuta las colas que toquen. El job de facturación sigue separado porque"
+note "solo corre una vez al día y tiene otra semántica de fallo."
+note "Los jobs antiguos quedan sin schedule; no cuestan mientras no se ejecuten y se pueden borrar"
+note "tras verificar el dispatcher."
 
 declare -A JOB_MODULE=(
-  ["$JOB_REMINDERS"]="app.jobs.dispatch_reminders"
-  ["$JOB_DOCUMENTS"]="app.jobs.process_documents"
-  ["$JOB_RESUME"]="app.jobs.resume_work"
+  ["$JOB_DISPATCHER"]="app.jobs.tick"
   ["$JOB_BILLING"]="app.jobs.billing_report"
 )
 declare -A JOB_TIMEOUT=(
-  ["$JOB_REMINDERS"]="300"
-  ["$JOB_DOCUMENTS"]="900"
-  ["$JOB_RESUME"]="300"
+  ["$JOB_DISPATCHER"]="1800"
   ["$JOB_BILLING"]="300"
 )
-for job in "$JOB_REMINDERS" "$JOB_DOCUMENTS" "$JOB_RESUME" "$JOB_BILLING"; do
+for job in "$JOB_DISPATCHER" "$JOB_BILLING"; do
   run_ensure "crear el job ${job} (si no existe)" "facturable (pendiente de confirmar)" \
     "gcloud run jobs describe ${job}" job_exists \
     gcloud run jobs create "$job" \
@@ -784,11 +804,10 @@ for job in "$JOB_REMINDERS" "$JOB_DOCUMENTS" "$JOB_RESUME" "$JOB_BILLING"; do
       --set-secrets="$(common_secrets_payload)" \
       --project "$PROJECT"
 done
-# **Existing jobs must be updated, not just created.** `run_ensure` above only creates a job
-# when it is missing, so a code-only redeploy would otherwise leave every job on its old image —
-# observed on 2026-11-08 when the billing job kept running the pre-fix code. This update is
-# idempotent and makes the image, command, environment and secrets match the service.
-for job in "$JOB_REMINDERS" "$JOB_DOCUMENTS" "$JOB_RESUME" "$JOB_BILLING"; do
+# **Existing jobs must be updated, not just created.** A code-only redeploy would otherwise leave
+# the dispatcher and billing job on their old image; this update is idempotent and keeps image,
+# command, environment and secrets synchronized with the service.
+for job in "$JOB_DISPATCHER" "$JOB_BILLING"; do
   run "actualizar el job ${job} (imagen, comando y entorno)" "facturable (pendiente de confirmar)" \
     gcloud run jobs update "$job" \
       --image="${IMAGE}:${IMAGE_TAG}" \
@@ -805,7 +824,7 @@ for job in "$JOB_REMINDERS" "$JOB_DOCUMENTS" "$JOB_RESUME" "$JOB_BILLING"; do
 done
 # `run.invoker` must come **after** the job exists — binding it earlier fails with NOT_FOUND.
 # `add-iam-policy-binding` is idempotent, so a re-run is harmless.
-for job in "$JOB_REMINDERS" "$JOB_DOCUMENTS" "$JOB_RESUME" "$JOB_BILLING"; do
+for job in "$JOB_DISPATCHER" "$JOB_BILLING"; do
   run "scheduler: invocar el job ${job}" "gratis" \
     gcloud run jobs add-iam-policy-binding "$job" \
       --member="serviceAccount:${SCHEDULER_SA_EMAIL}" \
@@ -815,28 +834,23 @@ for job in "$JOB_REMINDERS" "$JOB_DOCUMENTS" "$JOB_RESUME" "$JOB_BILLING"; do
 done
 
 # ============================================================================================ #
-step 11 "Cloud Scheduler (dispara los jobs con un token OAuth)" \
-     "4 jobs/mes: 3 dentro del nivel gratuito; el cuarto ~0,10 $/mes"
+step 11 "Cloud Scheduler (dispatcher cada 15 min y facturación diaria)" \
+     "2 schedules/mes: ambos dentro del nivel gratuito"
 # ============================================================================================ #
 note "El destino es la API de administración de Cloud Run, no una URL secreta (spec §13)."
 note "No existe ningún endpoint interno público: los health endpoints son los únicos otros caminos."
-note "El rol exacto que puede invocar un job está en el Apéndice B.6 del plan: el candidato es"
-note "roles/run.invoker y se confirma con 'gcloud scheduler jobs create http --help'."
+note "El dispatcher agrupa reminders/resume/documents; el informe de facturación se ejecuta a las"
+note "12:00 Europe/Madrid, después de que el export de BigQuery haya actualizado el día anterior."
+note "roles/run.invoker es el permiso que necesita el scheduler para invocar cada job."
 
-# Cada ejecución arranca un contenedor (~35-40 s de CPU aunque no haya trabajo). Con los dos
-# jobs a un tick por minuto eso sumaba ~3,3 €/día en total (factura de octubre-noviembre 2026).
-# Valores en producción desde 2026-11-11: reminders necesita precisión (lo ve el usuario),
-# resume es una ruta de recuperación y documents puede ir por horas.
 declare -A SCHEDULE_CRON=(
-  ["$JOB_REMINDERS"]="*/15 * * * *"
-  ["$JOB_DOCUMENTS"]="0 * * * *"
-  ["$JOB_RESUME"]="*/30 * * * *"
-  ["$JOB_BILLING"]="0 8 * * *"
+  ["$JOB_DISPATCHER"]="*/15 * * * *"
+  ["$JOB_BILLING"]="0 12 * * *"
 )
 declare -A SCHEDULE_TIMEZONE=(
   ["$JOB_BILLING"]="Europe/Madrid"
 )
-for job in "$JOB_REMINDERS" "$JOB_DOCUMENTS" "$JOB_RESUME" "$JOB_BILLING"; do
+for job in "$JOB_DISPATCHER" "$JOB_BILLING"; do
   tick="${job}-tick"
   run_ensure "crear el schedule ${tick} (si no existe)" "0 (nivel gratuito)" \
     "gcloud scheduler jobs describe ${tick}" schedule_exists \
@@ -849,6 +863,39 @@ for job in "$JOB_REMINDERS" "$JOB_DOCUMENTS" "$JOB_RESUME" "$JOB_BILLING"; do
       --oauth-service-account-email="$SCHEDULER_SA_EMAIL" \
       --max-retry-attempts=1 \
       --project "$PROJECT"
+done
+# `run_ensure` only creates. Update so an existing billing schedule moves from 08:00 to 12:00 and
+# the dispatcher keeps the intended cadence on re-runs.
+for job in "$JOB_DISPATCHER" "$JOB_BILLING"; do
+  tick="${job}-tick"
+  run "actualizar el schedule ${tick}" "0 (nivel gratuito)" \
+    gcloud scheduler jobs update http "$tick" \
+      --schedule="${SCHEDULE_CRON[$job]}" \
+      --time-zone="${SCHEDULE_TIMEZONE[$job]:-UTC}" \
+      --location="$REGION" \
+      --uri="https://run.googleapis.com/v2/projects/${PROJECT}/locations/${REGION}/jobs/${job}:run" \
+      --http-method=POST \
+      --oauth-service-account-email="$SCHEDULER_SA_EMAIL" \
+      --max-retry-attempts=1 \
+      --project "$PROJECT"
+done
+# Retire the three legacy queue schedules. The jobs themselves are left idle for a rollback window;
+# they do not accrue cost until invoked.
+for legacy_job in "$JOB_REMINDERS" "$JOB_DOCUMENTS" "$JOB_RESUME"; do
+  tick="${legacy_job}-tick"
+  if (( APPROVED == 0 )); then
+    run "retirar el schedule legacy ${tick}" "0" \
+      gcloud scheduler jobs delete "$tick" \
+        --location="$REGION" \
+        --project "$PROJECT" \
+        --quiet
+  elif gcloud scheduler jobs describe "$tick" --location="$REGION" --project "$PROJECT" >/dev/null 2>&1; then
+    run "retirar el schedule legacy ${tick}" "0" \
+      gcloud scheduler jobs delete "$tick" \
+        --location="$REGION" \
+        --project "$PROJECT" \
+        --quiet
+  fi
 done
 
 # ============================================================================================ #

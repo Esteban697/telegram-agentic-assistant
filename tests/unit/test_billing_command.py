@@ -62,7 +62,7 @@ async def test_the_gastos_command_renders_the_report() -> None:
     assert outcome.detail == "billing_report"
     text = telegram.calls[-1].kwargs["text"]
     assert "Gastos de Google Cloud" in text
-    assert "Asistente (telegram-assistant-esteban): 1.00 EUR" in text
+    assert "Asistente (telegram-assistant-esteban): 1.000 EUR" in text
 
 
 async def test_the_gastos_command_explains_a_missing_export() -> None:

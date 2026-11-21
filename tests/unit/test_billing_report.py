@@ -20,6 +20,7 @@ def test_query_selects_daily_net_cost_and_credits() -> None:
     assert "FORMAT_DATE('%Y-%m-%d', DATE(usage_start_time))" in sql
     assert "UNNEST(credits)" in sql
     assert "INTERVAL 8 DAY" in sql
+    assert "DATE(usage_start_time) < CURRENT_DATE()" in sql
 
 
 def test_parse_query_result_maps_schema_fields() -> None:
@@ -93,11 +94,12 @@ def test_compose_report_includes_assistant_top_services_and_account_total() -> N
     )
 
     assert "2026-11-05" in text
-    assert "Asistente (telegram-assistant-esteban): 1.00 EUR" in text
-    assert "Cloud Run: 0.80 EUR" in text
-    assert "Cloud Logging: 0.20 EUR" in text
-    assert "Total de la cuenta: 1.05 EUR" in text
-    assert "Mes en curso (asistente): 2.00 EUR" in text
+    assert "día completo" in text
+    assert "Asistente (telegram-assistant-esteban): 1.000 EUR" in text
+    assert "Cloud Run: 0.800 EUR" in text
+    assert "Cloud Logging: 0.200 EUR" in text
+    assert "Total de la cuenta: 1.050 EUR" in text
+    assert "Mes en curso (asistente): 2.000 EUR" in text
 
 
 def test_compose_report_with_no_rows_is_explicit() -> None:

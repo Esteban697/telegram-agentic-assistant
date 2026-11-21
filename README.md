@@ -6,7 +6,7 @@ huecos libres y eventos, con aprobación para escribir— y puede guardar prefer
 recordatorios, enviar documentos para preguntar por su contenido y preparar acciones externas que
 solo se ejecutan con aprobación explícita.
 
-Está desplegado en Google Cloud: el servicio y los cuatro jobs corren en Cloud Run, el estado vive en
+Está desplegado en Google Cloud: el servicio, el dispatcher y el job de facturación corren en Cloud Run, el estado vive en
 PostgreSQL (Supabase), los embeddings se calculan con Vertex AI y el calendario usa OAuth de Google
 con el refresh token en Secret Manager. La documentación de despliegue, operación, seguridad y el
 informe final están en [`docs/`](docs/).
@@ -217,10 +217,10 @@ Secret Manager (`GOOGLE_OAUTH_CREDENTIALS`) y los access tokens solo en memoria.
 `calendar.events` y `calendar.events.freebusy`; no se piden permisos de compartición ni de
 configuración del calendario.
 
-- **Un binario, cinco comandos**: `uvicorn app.main:app` para el servicio y
-  `python -m app.jobs.dispatch_reminders`, `-m app.jobs.process_documents`,
-  `-m app.jobs.resume_work` y `-m app.jobs.billing_report` para los cuatro jobs de una sola
-  pasada.
+- **Un binario, tres comandos**: `uvicorn app.main:app` para el servicio,
+  `python -m app.jobs.tick` para el dispatcher (recordatorios, reanudación y documentos según el
+  minuto) y `python -m app.jobs.billing_report` para el informe diario. Los módulos individuales
+  de recordatorios, documentos y reanudación siguen disponibles para ejecuciones manuales.
 - **El estado no vive en el proceso.** El servicio escala a cero y los jobs son independientes; la
   conversación, la memoria, las tareas y los checkpoints están en PostgreSQL. El checkpointer de
   LangGraph (`AsyncPostgresSaver`) se adjunta al compilar el grafo y usa la misma base de datos.
@@ -474,7 +474,7 @@ bash scripts/deploy.sh --yes-i-have-approval    # ejecuta, tras aprobar el coste
    ```
 
    Escribe `~/.taa/secrets/google-oauth-credentials` (modo 600) sin imprimir el refresh token.
-5. Despliega: el script crea el secreto `taa-prod-google-oauth-credentials`, lo monta como
+5. Despliega: el script crea el secreto `taa-prod-google-oauth-credentials-regional`, lo monta como
    `GOOGLE_OAUTH_CREDENTIALS`, habilita la Calendar API y pone `GOOGLE_CALENDAR_ENABLED=true`.
 
 Dos reglas que se comprueban con pruebas, no por convención:
@@ -491,17 +491,20 @@ Dos reglas que se comprueban con pruebas, no por convención:
 - **Exportación (una vez):** Billing → **Billing export** → **BigQuery export** → **Detailed usage
   cost** → proyecto `telegram-assistant-esteban`, dataset `billing_export` (EU). Google añade su
   cuenta de servicio al dataset automáticamente; no hay API pública para activar el toggle.
-- **Job diario:** `taa-prod-job-billing` se ejecuta a las **08:00 Europe/Madrid** y envía por
-  Telegram el gasto del último día con datos, los servicios principales del proyecto, el total de
-  la cuenta y el mes en curso. Si la tabla de exportación aún no existe, sale en silencio.
+- **Job diario:** `taa-prod-job-billing` se ejecuta a las **12:00 Europe/Madrid** (después de que
+  el export haya actualizado el día anterior) y envía por Telegram el gasto del día completo
+  anterior, los servicios principales del proyecto, el total de la cuenta y el mes en curso. Si
+  la tabla de exportación aún no existe, sale en silencio.
 - **A demanda:** envía `/gastos` o pregunta en lenguaje natural
   (`¿Cuánto he gastado esta semana?`); el asistente usa la herramienta `get_cloud_costs` y responde
   con las cifras reales, no con una búsqueda web.
-- Los datos de facturación pueden tardar ~24 h; el mensaje indica el último día disponible.
+- Los datos de facturación pueden tardar ~24 h; el mensaje usa el último día completo y no incluye
+  el día en curso.
 
 **Estado desplegado:** servicio `taa-prod-api` en Cloud Run
-(`https://taa-prod-api-hzlxaxcstq-ew.a.run.app`, escala a cero, `max-instances=1`), cuatro Cloud Run
-Jobs, cuatro schedulers habilitados, cinco secretos con versión fijada y el webhook registrado.
+(`https://taa-prod-api-hzlxaxcstq-ew.a.run.app`, escala a cero, `max-instances=1`), el dispatcher
+`taa-prod-job-dispatcher`, el job diario `taa-prod-job-billing`, dos schedulers habilitados, cinco
+secretos regionales con versión fijada y el webhook registrado.
 Base de datos en Supabase (PostgreSQL 17.11 + pgvector 0.8.2), embeddings en Vertex AI y
 **Google Calendar activo** con OAuth (`calendar.events` + `calendar.events.freebusy`) y el
 calendario `primary`. El script limpia cualquier pin de tráfico que haya dejado una reversión y
@@ -600,7 +603,8 @@ app/
   storage/              modelos, repositorios, motores, checkpointer, GCS y almacenes en memoria
   services/             conversación, aprobaciones, ingesta, recordatorios y cola de trabajo
   tools/                memoria, tareas, documentos, restaurantes, búsqueda web, calendario y reloj
-  jobs/                 cuatro jobs de una sola pasada (recordatorios, documentos, reanudación,
+  jobs/                 dispatcher consolidado, facturación y módulos de una sola pasada
+                        (recordatorios, documentos, reanudación)
                         informe de gastos)
 migrations/             revisiones de Alembic (0001..0007)
 docs/                   despliegue, operación, seguridad e informe final
