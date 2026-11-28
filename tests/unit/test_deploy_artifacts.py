@@ -789,6 +789,7 @@ def test_the_deployed_environment_passes_the_application_own_validation() -> Non
         "service",
         "taa-prod-job-dispatcher",
         "taa-prod-job-billing",
+        "taa-prod-job-morning",
     }, sorted(components)
 
     problems = validate_components(dump)

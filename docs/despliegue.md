@@ -14,7 +14,8 @@ no es una convención que haya que recordar.
 
 > **Estado actual del proyecto (2026-11-21).** **Desplegado y operativo**: el servicio
 > `taa-prod-api` en `https://taa-prod-api-hzlxaxcstq-ew.a.run.app`, el dispatcher
-> `taa-prod-job-dispatcher`, el job diario `taa-prod-job-billing`, dos schedulers habilitados, cinco
+> `taa-prod-job-dispatcher`, los jobs diarios `taa-prod-job-billing` y `taa-prod-job-morning`, tres
+> schedulers habilitados, cinco
 > secretos regionales con versión fijada y el webhook registrado. La base de datos es **Supabase**
 > (PostgreSQL 17.11 + pgvector 0.8.2, alembic `0007`), ya provisionada y migrada. **Google Calendar
 > está activo** (`GOOGLE_CALENDAR_ENABLED=true`, calendario `primary`, OAuth con
@@ -47,8 +48,8 @@ recursos son céntimos o cero a este volumen.
 |---|---|---|---|
 | **Supabase** (PostgreSQL 17.11 + pgvector 0.8.2) | proyecto del usuario, pooler `aws-0-eu-west-1.pooler.supabase.com:5432` | **Sí — coste fijo mensual** | **pendiente de confirmar**; **recomendado el plan Pro** (el gratuito se pausa y no tiene backups) |
 | Cloud Run Service (webhook) | `taa-prod-api` | Sí, por petición y por CPU/memoria-segundo; 0 en reposo (`min-instances=0`) | pendiente de confirmar |
-| Cloud Run Jobs ×2 | `taa-prod-job-dispatcher`, `taa-prod-job-billing` | Sí, por ejecución | pendiente de confirmar |
-| Cloud Scheduler ×2 | `taa-prod-job-dispatcher-tick`, `taa-prod-job-billing-tick` | 2 jobs/mes, ambos en el nivel gratuito | 0 |
+| Cloud Run Jobs ×3 | `taa-prod-job-dispatcher`, `taa-prod-job-billing`, `taa-prod-job-morning` | Sí, por ejecución | pendiente de confirmar |
+| Cloud Scheduler ×3 | `taa-prod-job-dispatcher-tick`, `taa-prod-job-billing-tick`, `taa-prod-job-morning-tick` | 3 jobs/mes: el nivel gratuito cubre 3 por cuenta de facturación | 0 |
 | Artifact Registry | `taa-prod-images` | Sí, por GB almacenado | pendiente de confirmar |
 | Cloud Storage | `taa-prod-documents` | Sí, por GB y operaciones | pendiente de confirmar |
 | Secret Manager | 5 secretos regionales | Sí, por versión y por acceso | pendiente de confirmar |
@@ -321,6 +322,27 @@ consola (no hay API pública para ese toggle):
 Los datos pueden tardar ~24 h en aparecer; el mensaje usa el último día completo y no incluye el
 día en curso.
 
+### Resumen de la mañana (07:30)
+
+`taa-prod-job-morning` compone un único mensaje con la agenda del día, los recordatorios que aún no
+han saltado, el tiempo y el gasto del asistente de ayer. Sus dependencias son todas opcionales por
+diseño:
+
+| Sección | Fuente | Si falla |
+|---|---|---|
+| Agenda | Google Calendar (el mismo OAuth del §4) | una frase, nunca un día vacío |
+| Recordatorios | tabla `tasks`, estado `pending` | la sección lo dice |
+| Tiempo | Open-Meteo (**sin clave ni cuenta**) | la sección se omite |
+| Gasto | BigQuery (`billing_export`) | la sección se omite |
+
+- **Activar/desactivar:** `MORNING_BRIEF_ENABLED` en `COMMON_ENV` de `deploy.sh`. Con `false` el
+  job sale con `{"status":"disabled"}` y no envía nada, sin tocar el scheduler.
+- **Ubicación del tiempo:** `MORNING_BRIEF_LATITUDE`, `MORNING_BRIEF_LONGITUDE` y
+  `MORNING_BRIEF_CITY` (por defecto Madrid). `problems()` rechaza coordenadas fuera de rango cuando
+  el resumen está activo.
+- **Prueba manual:**
+  `gcloud run jobs execute taa-prod-job-morning --region=europe-west1 --project telegram-assistant-esteban`.
+
 ## 5. Migraciones
 
 Nunca automáticas al arrancar en producción (`MIGRATIONS_AUTORUN=false`): un arranque de la
@@ -406,6 +428,7 @@ gcloud run services describe taa-prod-api \
   ```bash
   gcloud run jobs execute taa-prod-job-dispatcher --region=europe-west1 --project telegram-assistant-esteban
   gcloud run jobs execute taa-prod-job-billing    --region=europe-west1 --project telegram-assistant-esteban
+  gcloud run jobs execute taa-prod-job-morning    --region=europe-west1 --project telegram-assistant-esteban
   ```
 
   Los módulos individuales (`app.jobs.dispatch_reminders`, `process_documents`, `resume_work`)
@@ -516,8 +539,10 @@ disparadores, bucket, secretos, imagen, cuentas de servicio, métrica y los bind
 gcloud run services delete taa-prod-api --region=europe-west1 --project telegram-assistant-esteban
 gcloud run jobs delete taa-prod-job-dispatcher --region=europe-west1 --project telegram-assistant-esteban
 gcloud run jobs delete taa-prod-job-billing --region=europe-west1 --project telegram-assistant-esteban
+gcloud run jobs delete taa-prod-job-morning --region=europe-west1 --project telegram-assistant-esteban
 gcloud scheduler jobs delete taa-prod-job-dispatcher-tick --location=europe-west1 --project telegram-assistant-esteban
 gcloud scheduler jobs delete taa-prod-job-billing-tick --location=europe-west1 --project telegram-assistant-esteban
+gcloud scheduler jobs delete taa-prod-job-morning-tick --location=europe-west1 --project telegram-assistant-esteban
 
 # Jobs/schedules legacy, si siguen presentes durante la ventana de reversión
 for job in taa-prod-job-reminders taa-prod-job-documents taa-prod-job-resume; do
@@ -573,7 +598,7 @@ for secret in taa-prod-telegram-bot-token-regional taa-prod-telegram-webhook-sec
     --member=serviceAccount:taa-prod-runtime@telegram-assistant-esteban.iam.gserviceaccount.com \
     --role=roles/secretmanager.secretAccessor --project telegram-assistant-esteban
 done
-for job in taa-prod-job-dispatcher taa-prod-job-billing; do
+for job in taa-prod-job-dispatcher taa-prod-job-billing taa-prod-job-morning; do
   gcloud run jobs remove-iam-policy-binding "$job" \
     --member=serviceAccount:taa-prod-scheduler@telegram-assistant-esteban.iam.gserviceaccount.com \
     --role=roles/run.invoker --region=europe-west1 --project telegram-assistant-esteban

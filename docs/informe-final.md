@@ -41,7 +41,7 @@ y la respuesta fue correcta. La primera prueba real expuso dos defectos del mode
 llamada como texto y calculó mal la fecha); se corrigieron en `2f69340` resolviendo días relativos
 y rangos en servidor (ver §7.11).
 
-Infraestructura: Cloud Run (servicio + 4 jobs), 4 schedulers habilitados, 5 secretos con versión
+Infraestructura: Cloud Run (servicio + 3 jobs), 3 schedulers habilitados, 5 secretos con versión
 fijada, webhook registrado sin `last_error_message`, Supabase (PostgreSQL 17.11 + pgvector 0.8.2).
 
 ---
@@ -59,8 +59,9 @@ Telegram ──HTTPS──▶ app/api/telegram_webhook.py
                     app/tools/registry.py (nivel de riesgo + ledger) ──▶ PostgreSQL / GCS / providers
 ```
 
-- **Un binario, cinco comandos**: `uvicorn app.main:app` (servicio) y los cuatro jobs
-  `dispatch_reminders`, `process_documents`, `resume_work` y `billing_report`.
+- **Un binario, cuatro comandos**: `uvicorn app.main:app` (servicio), el dispatcher
+  (`app.jobs.tick`, que agrupa reminders/resume/documents), el informe de facturación y el resumen
+  matinal.
 - **PostgreSQL** (Supabase, pooler Supavisor en modo sesión, TLS) para todo el estado: conversación,
   memorias, tareas, documentos y chunks, aprobaciones, ledger de herramientas, `work_items` y los
   checkpoints de LangGraph.
@@ -405,7 +406,7 @@ presenten como resueltos (spec §16).
     turno con imagen no usa herramientas, así que no crea recordatorios ni eventos desde una foto.
     Verificado con una imagen generada y el modelo real (`tests/live/test_vision.py`).
 16. **Informe de gastos: exportación manual y datos con retraso.** El job diario
-    `taa-prod-job-billing` (08:00 Europe/Madrid) lee la exportación detallada de facturación en
+    `taa-prod-job-billing` (12:00 Europe/Madrid) lee la exportación detallada de facturación en
     BigQuery; la exportación solo se activa desde la consola (no hay API) y los datos pueden tardar
     ~24 h. Si la tabla aún no existe, el job sale en silencio. El presupuesto
     `TAA assistant monthly (5 EUR)` avisa por correo al 50/80/100%. **Verificado:** la tabla
@@ -416,8 +417,13 @@ presenten como resueltos (spec §16).
     export ya existía. Corregido en `app/services/billing.py`; una prueba fija la forma real.
 18. **Un deploy de código no actualizaba los jobs.** `run_ensure` solo **crea** el job si falta,
     así que el job de facturación siguió ejecutando la imagen anterior tras el primer redeploy.
-    `deploy.sh` ahora ejecuta `gcloud run jobs update` para los cuatro jobs tras crearlos; la
+    `deploy.sh` ahora ejecuta `gcloud run jobs update` para los tres jobs tras crearlos; la
     imagen, el comando y el entorno quedan sincronizados.
+19. **Resumen matinal (07:30).** Un tercer job diario compone agenda del día, recordatorios aún
+    pendientes, tiempo (Open-Meteo, sin clave) y gasto del asistente de ayer en un único mensaje.
+    Cada sección degrada por separado y `JOB_REPORT` informa de cuáles se enviaron; una autorización
+    de Calendar caducada aparece como una frase, no como un día vacío. Cubierto por
+    `tests/unit/test_morning_brief.py` (composición, cliente de tiempo y normalización de eventos).
 
 ---
 
@@ -509,7 +515,7 @@ servicio siguió respondiendo `/health` y `/readyz` con 200 después del cambio.
 | Búsqueda web | 5 resultados (máx. 10), 2000 caracteres por resultado, 8000 en total, timeout 10 s | los extractos no desplazan el contexto del turno; cada consulta cuenta en la cuenta de Ollama |
 | Calendario | 50 eventos, 90 días de rango, 20 invitados, 4.000 caracteres de descripción, timeout 10 s | por encima se pide reducir el rango; los eventos son externos y las escrituras exigen aprobación |
 | Imágenes | JPEG/PNG/WebP, 10 MB, timeout 30 s, modelo `gemma4:31b` de Ollama Cloud | la imagen no se guarda; el turno no usa herramientas |
-| Informe de gastos | 32 días de histórico, job diario 08:00 Europe/Madrid | los datos de facturación pueden tardar ~24 h; el job muestra el último día disponible |
+| Informe de gastos | 32 días de histórico, job diario 12:00 Europe/Madrid | los datos de facturación pueden tardar ~24 h; el job muestra el último día disponible |
 
 ### 9.4 Datos personales: qué se guarda, cuánto y cómo se borra
 

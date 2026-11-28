@@ -97,6 +97,20 @@ _ALLOWED_PLACEHOLDERS = frozenset(
         "amount",
         "currency",
         "service",
+        # Morning brief
+        "weekday",
+        "month",
+        "year",
+        "time",
+        "summary",
+        "location",
+        "city",
+        "temperature",
+        "apparent",
+        "minimum",
+        "maximum",
+        "precipitation",
+        "description",
     }
 )
 

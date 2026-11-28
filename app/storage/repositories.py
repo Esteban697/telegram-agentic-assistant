@@ -456,6 +456,29 @@ async def list_tasks(
     return list((await session.execute(statement)).scalars())
 
 
+async def list_tasks_due_between(
+    session: AsyncSession, *, user_id: int, start: datetime, end: datetime, limit: int = 50
+) -> list[Task]:
+    """Pending tasks due in ``[start, end)``, for the morning brief.
+
+    "Still pending" is the right filter: the dispatcher advances a delivered reminder out of the
+    pending state, so this returns exactly the reminders that have not fired yet today.
+    """
+
+    statement = (
+        sa.select(Task)
+        .where(
+            Task.user_id == user_id,
+            Task.state == "pending",
+            Task.due_at >= start,
+            Task.due_at < end,
+        )
+        .order_by(Task.due_at.asc())
+        .limit(limit)
+    )
+    return list((await session.execute(statement)).scalars())
+
+
 async def get_task(session: AsyncSession, *, user_id: int, task_id: uuid.UUID) -> Task | None:
     result = await session.execute(
         sa.select(Task).where(Task.id == task_id, Task.user_id == user_id)

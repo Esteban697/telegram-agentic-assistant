@@ -227,7 +227,95 @@ CATALOGUE: Final[dict[str, str]] = {
     "billing.report.unavailable": (
         "No he podido consultar los gastos ahora mismo. Inténtalo de nuevo en un momento."
     ),
+    # --- Resumen de la mañana ---------------------------------------------- #
+    "brief.header": "Buenos días. Hoy es {weekday} {day} de {month} de {year}.",
+    "brief.agenda.title": "Agenda de hoy ({count}):",
+    "brief.agenda.item": "· {time} {summary}",
+    "brief.agenda.item_location": "· {time} {summary} — {location}",
+    "brief.agenda.item_all_day": "· todo el día {summary}",
+    "brief.agenda.untitled": "(sin título)",
+    "brief.agenda.empty": "Agenda: no tienes eventos hoy.",
+    "brief.agenda.auth": (
+        "Agenda: no puedo acceder al calendario porque la autorización de Google ha caducado."
+    ),
+    "brief.agenda.unavailable": "Agenda: el calendario no está disponible ahora mismo.",
+    "brief.reminders.title": "Recordatorios de hoy ({count}):",
+    "brief.reminders.item": "· {time} {title}",
+    "brief.reminders.empty": "Recordatorios: ninguno pendiente para hoy.",
+    "brief.reminders.unavailable": "Recordatorios: no he podido consultarlos ahora mismo.",
+    "brief.weather.line": (
+        "Tiempo en {city}: {temperature} °C (sensación {apparent} °C), "
+        "mín {minimum} / máx {maximum}, lluvia {precipitation}%."
+    ),
+    "brief.weather.simple": "Tiempo en {city}: {temperature} °C, {description}.",
+    "brief.weather.temperature": "Tiempo en {city}: {temperature} °C.",
+    "brief.spend.line": "Gasto de ayer: {amount} {currency}.",
 }
+
+# Spanish calendar data for the brief. It lives here, next to the templates that use it, because
+# `test_messages` asserts that every user-facing Spanish literal comes from this module.
+WEEKDAYS_ES: Final[tuple[str, ...]] = (
+    "lunes",
+    "martes",
+    "miércoles",
+    "jueves",
+    "viernes",
+    "sábado",
+    "domingo",
+)
+MONTHS_ES: Final[tuple[str, ...]] = (
+    "enero",
+    "febrero",
+    "marzo",
+    "abril",
+    "mayo",
+    "junio",
+    "julio",
+    "agosto",
+    "septiembre",
+    "octubre",
+    "noviembre",
+    "diciembre",
+)
+# WMO 4677 codes as returned by Open-Meteo. Only the codes a daily brief can plausibly meet.
+WEATHER_CODES_ES: Final[dict[int, str]] = {
+    0: "despejado",
+    1: "mayormente despejado",
+    2: "parcialmente nublado",
+    3: "nublado",
+    45: "niebla",
+    48: "niebla helada",
+    51: "llovizna ligera",
+    53: "llovizna",
+    55: "llovizna intensa",
+    56: "llovizna helada",
+    57: "llovizna helada intensa",
+    61: "lluvia ligera",
+    63: "lluvia",
+    65: "lluvia intensa",
+    66: "lluvia helada",
+    67: "lluvia helada intensa",
+    71: "nieve ligera",
+    73: "nieve",
+    75: "nieve intensa",
+    77: "granos de nieve",
+    80: "chubascos ligeros",
+    81: "chubascos",
+    82: "chubascos fuertes",
+    85: "chubascos de nieve",
+    86: "chubascos de nieve fuertes",
+    95: "tormenta",
+    96: "tormenta con granizo",
+    99: "tormenta con granizo fuerte",
+}
+
+
+def weather_description(code: int | None) -> str | None:
+    """Spanish description for a WMO code, or ``None`` for an unknown one."""
+
+    if code is None:
+        return None
+    return WEATHER_CODES_ES.get(code)
 
 
 def render(message_key: str, **params: object) -> str:

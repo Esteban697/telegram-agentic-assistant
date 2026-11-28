@@ -66,6 +66,7 @@ PREFIX="taa-${ENV_NAME}"
 SERVICE="${PREFIX}-api"
 JOB_DISPATCHER="${PREFIX}-job-dispatcher"
 JOB_BILLING="${PREFIX}-job-billing"
+JOB_MORNING="${PREFIX}-job-morning"
 # Legacy jobs are kept only so a re-run can retire their schedules; new deployments do not
 # create or update them.
 JOB_REMINDERS="${PREFIX}-job-reminders"
@@ -367,6 +368,9 @@ COMMON_ENV=(
   # file, so a deploy cannot silently ship the integration disabled.
   "GOOGLE_CALENDAR_ENABLED=true"
   "GOOGLE_CALENDAR_ID=primary"
+  # El resumen matinal se activa aquí; sus coordenadas usan el valor por defecto de Madrid. Un
+  # `false` deja el job inerte sin tocar el scheduler.
+  "MORNING_BRIEF_ENABLED=true"
 )
 
 common_env_payload() {
@@ -394,7 +398,7 @@ common_secrets_payload() {
 
 if [[ "$DUMP_ENV" -eq 1 ]]; then
   # El entorno exacto que recibe cada componente, en un formato que se puede comprobar.
-  for component in service "$JOB_DISPATCHER" "$JOB_BILLING"; do
+  for component in service "$JOB_DISPATCHER" "$JOB_BILLING" "$JOB_MORNING"; do
     for entry in "${COMMON_ENV[@]}"; do
       printf 'DUMP %s env %s\n' "$component" "$entry"
     done
@@ -770,25 +774,29 @@ run "asegurar que el tráfico sirve la revisión recién desplegada" "gratis" \
     --project "$PROJECT"
 
 # ============================================================================================ #
-step 10 "Dos Cloud Run Jobs: dispatcher y facturación" "facturable por ejecución; fracciones de céntimo"
+step 10 "Tres Cloud Run Jobs: dispatcher, facturación y resumen matinal" "facturable por ejecución; fracciones de céntimo"
 # ============================================================================================ #
-note "Un binario, tres comandos: el servicio, el dispatcher y el informe de facturación reutilizan"
-note "la misma imagen y el mismo entorno que el servicio — si el entorno no valida, no arrancan."
+note "Un binario, cuatro comandos: el servicio, el dispatcher, el informe de facturación y el"
+note "resumen matinal reutilizan la misma imagen y el mismo entorno que el servicio — si el"
+note "entorno no valida, no arrancan."
 note "El dispatcher sustituye los jobs de reminders, resume y documents: un solo contenedor arranca"
-note "cada 15 minutos y ejecuta las colas que toquen. El job de facturación sigue separado porque"
-note "solo corre una vez al día y tiene otra semántica de fallo."
+note "cada 15 minutos y ejecuta las colas que toquen. Los otros dos corren una vez al día y tienen"
+note "otra semántica de fallo: el informe de facturación lee BigQuery y el resumen matinal compone"
+note "agenda, recordatorios, tiempo y gasto."
 note "Los jobs antiguos quedan sin schedule; no cuestan mientras no se ejecuten y se pueden borrar"
 note "tras verificar el dispatcher."
 
 declare -A JOB_MODULE=(
   ["$JOB_DISPATCHER"]="app.jobs.tick"
   ["$JOB_BILLING"]="app.jobs.billing_report"
+  ["$JOB_MORNING"]="app.jobs.morning_brief"
 )
 declare -A JOB_TIMEOUT=(
   ["$JOB_DISPATCHER"]="1800"
   ["$JOB_BILLING"]="300"
+  ["$JOB_MORNING"]="300"
 )
-for job in "$JOB_DISPATCHER" "$JOB_BILLING"; do
+for job in "$JOB_DISPATCHER" "$JOB_BILLING" "$JOB_MORNING"; do
   run_ensure "crear el job ${job} (si no existe)" "facturable (pendiente de confirmar)" \
     "gcloud run jobs describe ${job}" job_exists \
     gcloud run jobs create "$job" \
@@ -807,7 +815,7 @@ done
 # **Existing jobs must be updated, not just created.** A code-only redeploy would otherwise leave
 # the dispatcher and billing job on their old image; this update is idempotent and keeps image,
 # command, environment and secrets synchronized with the service.
-for job in "$JOB_DISPATCHER" "$JOB_BILLING"; do
+for job in "$JOB_DISPATCHER" "$JOB_BILLING" "$JOB_MORNING"; do
   run "actualizar el job ${job} (imagen, comando y entorno)" "facturable (pendiente de confirmar)" \
     gcloud run jobs update "$job" \
       --image="${IMAGE}:${IMAGE_TAG}" \
@@ -824,7 +832,7 @@ for job in "$JOB_DISPATCHER" "$JOB_BILLING"; do
 done
 # `run.invoker` must come **after** the job exists — binding it earlier fails with NOT_FOUND.
 # `add-iam-policy-binding` is idempotent, so a re-run is harmless.
-for job in "$JOB_DISPATCHER" "$JOB_BILLING"; do
+for job in "$JOB_DISPATCHER" "$JOB_BILLING" "$JOB_MORNING"; do
   run "scheduler: invocar el job ${job}" "gratis" \
     gcloud run jobs add-iam-policy-binding "$job" \
       --member="serviceAccount:${SCHEDULER_SA_EMAIL}" \
@@ -834,23 +842,26 @@ for job in "$JOB_DISPATCHER" "$JOB_BILLING"; do
 done
 
 # ============================================================================================ #
-step 11 "Cloud Scheduler (dispatcher cada 15 min y facturación diaria)" \
-     "2 schedules/mes: ambos dentro del nivel gratuito"
+step 11 "Cloud Scheduler (dispatcher cada 15 min, facturación y resumen matinal diarios)" \
+     "3 schedules: el nivel gratuito cubre 3 por cuenta de facturación"
 # ============================================================================================ #
 note "El destino es la API de administración de Cloud Run, no una URL secreta (spec §13)."
 note "No existe ningún endpoint interno público: los health endpoints son los únicos otros caminos."
 note "El dispatcher agrupa reminders/resume/documents; el informe de facturación se ejecuta a las"
 note "12:00 Europe/Madrid, después de que el export de BigQuery haya actualizado el día anterior."
+note "El resumen matinal se envía a las 07:30 Europe/Madrid, antes de que empiece la jornada."
 note "roles/run.invoker es el permiso que necesita el scheduler para invocar cada job."
 
 declare -A SCHEDULE_CRON=(
   ["$JOB_DISPATCHER"]="*/15 * * * *"
   ["$JOB_BILLING"]="0 12 * * *"
+  ["$JOB_MORNING"]="30 7 * * *"
 )
 declare -A SCHEDULE_TIMEZONE=(
   ["$JOB_BILLING"]="Europe/Madrid"
+  ["$JOB_MORNING"]="Europe/Madrid"
 )
-for job in "$JOB_DISPATCHER" "$JOB_BILLING"; do
+for job in "$JOB_DISPATCHER" "$JOB_BILLING" "$JOB_MORNING"; do
   tick="${job}-tick"
   run_ensure "crear el schedule ${tick} (si no existe)" "0 (nivel gratuito)" \
     "gcloud scheduler jobs describe ${tick}" schedule_exists \
@@ -866,7 +877,7 @@ for job in "$JOB_DISPATCHER" "$JOB_BILLING"; do
 done
 # `run_ensure` only creates. Update so an existing billing schedule moves from 08:00 to 12:00 and
 # the dispatcher keeps the intended cadence on re-runs.
-for job in "$JOB_DISPATCHER" "$JOB_BILLING"; do
+for job in "$JOB_DISPATCHER" "$JOB_BILLING" "$JOB_MORNING"; do
   tick="${job}-tick"
   run "actualizar el schedule ${tick}" "0 (nivel gratuito)" \
     gcloud scheduler jobs update http "$tick" \

@@ -117,6 +117,24 @@ contienen tokens, claves, documentos, embeddings ni el contenido de los mensajes
 - **Regla.** No poner la clave de facturación ni la consulta en logs; el informe solo contiene
   importes por servicio/proyecto.
 
+## 2.5 Resumen matinal: no llega o llega incompleto
+
+- **Síntoma.** No llega el mensaje de las 07:30, o llega sin alguna sección. El `JOB_REPORT`
+  indica qué se envió: `{"status":"sent","agenda":N,"calendar":"ok|disabled|auth|unavailable",
+  "reminders":N|null,"weather":true|false,"spend":true|false}`.
+- **Qué ocurre.** `taa-prod-job-morning` compone cuatro secciones independientes y cada una degrada
+  sola: `calendar: auth` es el refresh token de Google caducado (en **Testing** caduca a los 7 días);
+  `reminders: null` es un fallo de base de datos; `weather: false` o `spend: false` son terceros
+  (Open-Meteo, BigQuery) caídos o sin datos. `calendar: disabled` significa que la integración no
+  está configurada, y entonces la sección se omite a propósito.
+- **Respuesta.** Para `auth`: reejecutar `scripts/google_auth.py`, añadir la versión al secreto y
+  actualizar el servicio (§2.2). Para `disabled`: `MORNING_BRIEF_ENABLED=true` en el entorno. Si no
+  llega **nada**, comprobar el schedule `taa-prod-job-morning-tick` y el binding `run.invoker` del
+  scheduler; ejecutarlo a mano tarda segundos
+  (`gcloud run jobs execute taa-prod-job-morning --region=europe-west1 --project telegram-assistant-esteban`).
+- **Regla.** El resumen solo lee: no ejecuta herramientas, no escribe en la base de datos y no
+  registra títulos de eventos ni recordatorios en logs.
+
 ## 3. Telegram: límite de tasa (429)
 
 - **Síntoma.** Un mensaje de respuesta no se entrega. Logs: `telegram rate limited` con

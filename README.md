@@ -46,6 +46,9 @@ informe final están en [`docs/`](docs/).
   principales servicios del proyecto, el total de la cuenta y el mes en curso, una vez activada
   la exportación de facturación a BigQuery. Además hay un presupuesto de 5 EUR/mes con avisos al
   50/80/100%.
+- **Resumen de la mañana.** A las 07:30 el asistente escribe primero: agenda del día, recordatorios
+  pendientes, tiempo y gasto de ayer. Cada sección degrada por su cuenta, así que un fallo del
+  calendario o del tiempo no deja el mensaje vacío.
 
 ## Cómo se usa desde Telegram
 
@@ -501,10 +504,23 @@ Dos reglas que se comprueban con pruebas, no por convención:
 - Los datos de facturación pueden tardar ~24 h; el mensaje usa el último día completo y no incluye
   el día en curso.
 
+### Resumen de la mañana
+
+- **Job diario:** `taa-prod-job-morning` se ejecuta a las **07:30 Europe/Madrid** y envía un único
+  mensaje con cuatro secciones independientes: la agenda del día, los recordatorios que aún no han
+  saltado, el tiempo (Open-Meteo, sin clave ni cuenta) y el gasto del asistente de ayer.
+- **Cada sección degrada sola:** si el calendario no está configurado se omite; si la autorización
+  de Google caducó, el mensaje lo dice en lugar de presentar un día sin reuniones; si el tiempo o
+  BigQuery fallan, el resumen llega igual. `JOB_REPORT` indica qué se envió (`agenda`, `calendar`,
+  `reminders`, `weather`, `spend`).
+- **Desactivarlo** sin tocar el scheduler: `MORNING_BRIEF_ENABLED=false` en el despliegue; el job
+  sale con `{"status":"disabled"}`.
+- Para ejecutarlo a mano: `MORNING_BRIEF_ENABLED=true python -m app.jobs.morning_brief`.
+
 **Estado desplegado:** servicio `taa-prod-api` en Cloud Run
 (`https://taa-prod-api-hzlxaxcstq-ew.a.run.app`, escala a cero, `max-instances=1`), el dispatcher
-`taa-prod-job-dispatcher`, el job diario `taa-prod-job-billing`, dos schedulers habilitados, cinco
-secretos regionales con versión fijada y el webhook registrado.
+`taa-prod-job-dispatcher`, los jobs diarios `taa-prod-job-billing` y `taa-prod-job-morning`, tres
+schedulers habilitados, cinco secretos regionales con versión fijada y el webhook registrado.
 Base de datos en Supabase (PostgreSQL 17.11 + pgvector 0.8.2), embeddings en Vertex AI y
 **Google Calendar activo** con OAuth (`calendar.events` + `calendar.events.freebusy`) y el
 calendario `primary`. El script limpia cualquier pin de tráfico que haya dejado una reversión y

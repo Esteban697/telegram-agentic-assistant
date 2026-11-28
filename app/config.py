@@ -93,6 +93,16 @@ class Settings(BaseSettings):
     billing_export_table: str = ""
     billing_report_days: int = Field(default=32, ge=1, le=90)
 
+    # --- Morning brief ------------------------------------------------------ #
+    # The 07:30 digest: today's agenda, reminders still due, weather and yesterday's spend.
+    # Disabled by default so the job is inert unless a deploy turns it on. The coordinates are
+    # Madrid's; Open-Meteo needs no key, so the brief adds no new secret to rotate.
+    morning_brief_enabled: bool = False
+    morning_brief_latitude: float = 40.4168
+    morning_brief_longitude: float = -3.7038
+    morning_brief_city: str = "Madrid"
+    morning_brief_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
+
     # --- Web search -------------------------------------------------------- #
     # Ollama Cloud exposes POST /api/web_search with the same account key as chat. `none`
     # leaves the tool returning CapabilityUnavailable instead of calling out. Search results
@@ -363,6 +373,22 @@ class Settings(BaseSettings):
                     "GOOGLE_CALENDAR_WORKDAY_START_HOUR must be smaller than "
                     "GOOGLE_CALENDAR_WORKDAY_END_HOUR"
                 )
+
+        if self.morning_brief_enabled:
+            # A wrong coordinate is not an error the job can recover from: it would silently
+            # report the weather of the ocean. Refuse at startup instead.
+            if not -90.0 <= self.morning_brief_latitude <= 90.0:
+                found.append(
+                    "MORNING_BRIEF_LATITUDE must be between -90 and 90 "
+                    f"(got {self.morning_brief_latitude})"
+                )
+            if not -180.0 <= self.morning_brief_longitude <= 180.0:
+                found.append(
+                    "MORNING_BRIEF_LONGITUDE must be between -180 and 180 "
+                    f"(got {self.morning_brief_longitude})"
+                )
+            if not self.morning_brief_city.strip():
+                found.append("MORNING_BRIEF_CITY must not be empty when the brief is enabled")
 
         if self.default_timezone:
             try:
